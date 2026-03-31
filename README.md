@@ -8,7 +8,7 @@ Way Proxy 是一个**轻量级**、**高性能**的 HTTP/SOCKS5 转 WebSocket �
 
 本项目包含两个语言的实现版本，它们具有相同的功能和参数用法：
 - 🐍 **Pyway**: 基于 Python `asyncio` 实现的异步高性能版本 (当前最新: v2.6.2g)。
-- 🐹 **Goway**: 基于 Go 语言实现的高并发、低延迟编译型版本 (当前最新: v1.0.8a)。
+- 🐹 **Goway**: 基于 Go 语言实现的高并发、低延迟编译型版本 (当前最新: v1.0.9a)。
 
 ---
 
@@ -63,7 +63,7 @@ Goway 提供更好的多线程性能与极低的运行内存。
 3. **编译并运行**:
    ```bash
    cd goway
-   go build -o goway goway1.0.8a.go
+   go build -o goway goway1.0.9a.go
    ./goway -p :8080
    ```
 

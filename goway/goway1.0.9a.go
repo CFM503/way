@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"net/url"
 	"os"
@@ -24,7 +25,7 @@ import (
 )
 
 const (
-	Version        = "1.0.8a"
+	Version        = "1.0.9a"
 	MaxWSFrameSize = 16 * 1024 * 1024 // 16MB
 	// MaxHeaderSize increased to accommodate some large headers, but pyway limits to 8192
 	MaxHeaderSize = 8192
@@ -222,7 +223,9 @@ func createWSFrame(data []byte, opcode byte, masked bool) []byte {
 	header := getWSHeader(len(data), opcode, masked)
 	if masked {
 		maskKey := make([]byte, 4)
-		rand.Read(maskKey)
+		if _, err := rand.Read(maskKey); err != nil {
+			return nil
+		}
 		header = append(header, maskKey...)
 
 		payload := make([]byte, len(data))
@@ -242,9 +245,13 @@ func writeWSFrame(w io.Writer, data []byte, opcode byte, masked bool) error {
 	header := getWSHeader(len(data), opcode, masked)
 	if masked {
 		maskKey := make([]byte, 4)
-		rand.Read(maskKey)
+		if _, err := rand.Read(maskKey); err != nil {
+			return err
+		}
 		header = append(header, maskKey...)
-		w.Write(header)
+		if _, err := w.Write(header); err != nil {
+			return err
+		}
 
 		// In-place mask of data
 		for i := 0; i < len(data); i++ {
@@ -258,7 +265,9 @@ func writeWSFrame(w io.Writer, data []byte, opcode byte, masked bool) error {
 	netbs[0] = header
 	netbs[1] = data
 	// If w is a net.Buffers, we could use that, but simple Write is fine for now
-	w.Write(header)
+	if _, err := w.Write(header); err != nil {
+		return err
+	}
 	_, err := w.Write(data)
 	return err
 }
@@ -275,15 +284,25 @@ func optimizeSocket(conn net.Conn, cfg *Config) {
 		return
 	}
 	if !cfg.NoTcpNoDelay {
-		tcpConn.SetNoDelay(true)
+		if err := tcpConn.SetNoDelay(true); err != nil {
+			logDebug("SetNoDelay failed: %v", err)
+		}
 	}
 	if !cfg.NoTcpKeepAlive {
-		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		if err := tcpConn.SetKeepAlive(true); err != nil {
+			logDebug("SetKeepAlive failed: %v", err)
+		}
+		if err := tcpConn.SetKeepAlivePeriod(30 * time.Second); err != nil {
+			logDebug("SetKeepAlivePeriod failed: %v", err)
+		}
 	}
 	if cfg.SocketBuffer > 0 {
-		tcpConn.SetReadBuffer(cfg.SocketBuffer * 1024)
-		tcpConn.SetWriteBuffer(cfg.SocketBuffer * 1024)
+		if err := tcpConn.SetReadBuffer(cfg.SocketBuffer * 1024); err != nil {
+			logDebug("SetReadBuffer failed: %v", err)
+		}
+		if err := tcpConn.SetWriteBuffer(cfg.SocketBuffer * 1024); err != nil {
+			logDebug("SetWriteBuffer failed: %v", err)
+		}
 	}
 }
 
@@ -427,7 +446,11 @@ func main() {
 			portStr = parts[1]
 		}
 	}
-	port, _ := strconv.Atoi(portStr)
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		fmt.Printf("Error: invalid port '%s'\n", portStr)
+		os.Exit(1)
+	}
 	cfg.ProxyHost = host
 	cfg.ProxyPort = port
 
@@ -579,7 +602,9 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 	}
 
 	acc := computeAcceptKey(wsKey)
-	wsConn.Write([]byte(fmt.Sprintf("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", acc)))
+	if _, err := wsConn.Write([]byte(fmt.Sprintf("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", acc))); err != nil {
+		return
+	}
 
 	// 2. Read Auth Frame
 	authData, err := readWSFrame(br, wsConn)
@@ -771,7 +796,10 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		// Assuming we read enough to parse headers.
 		// We'll revert to reading a chunk.
 		restBuf := make([]byte, 8192)
-		n, _ := localConn.Read(restBuf)
+		n, readErr := localConn.Read(restBuf)
+		if readErr != nil && n == 0 {
+			return
+		}
 		fullData := append(buf, restBuf[:n]...) // Prepend the first byte
 
 		initialPayload = fullData // For HTTP, we might forward the payload if it's not CONNECT
@@ -793,7 +821,10 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		if method == "CONNECT" {
 			// CONNECT host:port HTTP/1.1
 			if strings.Contains(urlPart, ":") {
-				h, p, _ := net.SplitHostPort(urlPart)
+				h, p, splitErr := net.SplitHostPort(urlPart)
+				if splitErr != nil {
+					return
+				}
 				targetHost = h
 				targetPort = p
 			}
@@ -803,7 +834,10 @@ func handleClient(localConn net.Conn, cfg *Config) {
 			u, err := url.Parse(urlPart)
 			if err == nil && u.Host != "" {
 				if strings.Contains(u.Host, ":") {
-					h, p, _ := net.SplitHostPort(u.Host)
+					h, p, splitErr := net.SplitHostPort(u.Host)
+					if splitErr != nil {
+						return
+					}
 					targetHost = h
 					targetPort = p
 				} else {
@@ -816,7 +850,10 @@ func handleClient(localConn net.Conn, cfg *Config) {
 					if strings.HasPrefix(strings.ToLower(l), "host:") {
 						val := strings.TrimSpace(strings.Split(l, ":")[1])
 						if strings.Contains(val, ":") {
-							h, p, _ := net.SplitHostPort(val)
+							h, p, splitErr := net.SplitHostPort(val)
+							if splitErr != nil {
+								return
+							}
 							targetHost = h
 							targetPort = p
 						} else {
@@ -835,17 +872,18 @@ func handleClient(localConn net.Conn, cfg *Config) {
 	}
 
 	// Local Network Interception Check
-	if isLocalTarget(targetHost) {
-		if cfg.BlockLocal {
-			logWarn("[CLIENT] Blocked local traffic attempt: %s:%s", targetHost, targetPort)
-			return // Drop connection entirely
-		}
+	if cfg.BlockLocal && isLocalTarget(targetHost) {
+		logWarn("[CLIENT] Blocked local traffic attempt: %s:%s", targetHost, targetPort)
+		return
 	}
 
 	// 2. Connect Upstream WS
-	wsURL, _ := url.Parse(cfg.Upstream)
+	wsURL, err := url.Parse(cfg.Upstream)
+	if err != nil {
+		logError("Invalid upstream URL: %v", err)
+		return
+	}
 	var wsConn net.Conn
-	var err error
 
 	wsHost := wsURL.Hostname()
 	wsPort := wsURL.Port()
@@ -891,7 +929,9 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		path = "/"
 	}
 	wsKey := make([]byte, 16)
-	rand.Read(wsKey)
+	if _, err := rand.Read(wsKey); err != nil {
+		return
+	}
 	wsKeyStr := base64.StdEncoding.EncodeToString(wsKey)
 
 	hostHeader := wsHost
@@ -936,13 +976,19 @@ func handleClient(localConn net.Conn, cfg *Config) {
 	// 3. Send Target Info (Auth Frame)
 	targetPayload := []byte(fmt.Sprintf("%s:%s\n", targetHost, targetPort))
 	// Random padding 1-40 spaces
-	padLen := 10 // Using fixed for now but adding random requires math/rand
+	n, err := rand.Int(rand.Reader, big.NewInt(40))
+	if err != nil {
+		return
+	}
+	padLen := 1 + int(n.Int64())
 	targetPayload = append(targetPayload, []byte(strings.Repeat(" ", padLen))...)
 
 	if cfg.Crypto != nil {
 		targetPayload = cfg.Crypto.Transform(targetPayload)
 	}
-	wsConn.Write(createWSFrame(targetPayload, 0x2, true))
+	if _, err := wsConn.Write(createWSFrame(targetPayload, 0x2, true)); err != nil {
+		return
+	}
 
 	// 4. Wait for OK
 	okFrame, err := readWSFrame(br, wsConn)
