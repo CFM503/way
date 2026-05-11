@@ -1,7 +1,8 @@
 # Compiled binaries
 *.exe
-goway/goway-*-amd64
-goway/goway-*-arm7
+goway/goway*-linux-*
+goway/goway*-arm*
+goway/goway*-windows-*
 
 # Python cache
 __pycache__/
