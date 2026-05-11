@@ -1,0 +1,11 @@
+# Compiled binaries
+*.exe
+goway/goway-*-amd64
+goway/goway-*-arm7
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Claude
+CLAUDE.MD
