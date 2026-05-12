@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	Version        = "1.1.6a"
+	Version        = "1.1.7a"
 	MaxWSFrameSize = 16 * 1024 * 1024 // 16MB
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -692,14 +692,16 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 	}
 
 	var wsKey string
-	for _, line := range bytes.Split(headerBytes, []byte(CRLF)) {
-		if len(line) > 18 && asciiToLower(line[0]) == 's' &&
-			indexFold(line[:18], "sec-websocket-key:") == 0 {
-			val := strings.TrimSpace(string(line[18:]))
-			if val != "" {
-				wsKey = val
-			}
-			break
+	if idx := indexFold(headerBytes, "sec-websocket-key:"); idx >= 0 {
+		start := idx + 19
+		end := bytes.Index(headerBytes[start:], []byte("\r\n"))
+		if end < 0 {
+			end = len(headerBytes)
+		} else {
+			end += start
+		}
+		if val := strings.TrimSpace(string(headerBytes[start:end])); val != "" {
+			wsKey = val
 		}
 	}
 
@@ -1091,7 +1093,9 @@ func handleClient(localConn net.Conn, cfg *Config) {
 
 	targetPayload := []byte(fmt.Sprintf("%s:%s\n", targetHost, targetPort))
 	padLen := 1 + mrand.Intn(40)
-	targetPayload = append(targetPayload, []byte(strings.Repeat(" ", padLen))...)
+	for i := 0; i < padLen; i++ {
+		targetPayload = append(targetPayload, ' ')
+	}
 
 	if cfg.Crypto != nil {
 		cfg.Crypto.TransformInPlace(targetPayload)

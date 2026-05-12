@@ -15,7 +15,7 @@ import time
 from typing import Optional, Tuple
 from dataclasses import dataclass
 
-VERSION = "2.6.9G"
+VERSION = "2.7.0G"
 CRLF = b"\r\n"
 CRLFCRLF = b"\r\n\r\n"
 MAX_WS_FRAME_SIZE = 10 * 1024 * 1024  # [Security] Limit WS frame to 10MB
@@ -537,8 +537,11 @@ async def _handle_server_impl(reader: asyncio.StreamReader, writer: asyncio.Stre
             logger.warning("[Security] Header too large, dropping connection.")
             return
 
-        headers = data.lower().split(CRLF)
-        ws_key_line = next((h for h in headers if h.startswith(b'sec-websocket-key:')), None)
+        headers = data.split(CRLF)
+        ws_key_line = next(
+            (h for h in headers
+             if len(h) > 19 and h[:19].lower() == b'sec-websocket-key:'),
+            None)
 
         if not ws_key_line:
             writer.write(b'HTTP/1.1 400 Bad Request\r\n\r\n')
