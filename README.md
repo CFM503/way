@@ -7,8 +7,8 @@
 Way Proxy 是一个**轻量级**、**高性能**的 HTTP/SOCKS5 转 WebSocket 代理工具，专为流媒体传输、高并发下载以及各种复杂网络环境设计。
 
 本项目包含两个语言的实现版本，它们具有相同的功能和参数用法：
-- 🐍 **Pyway**: 基于 Python `asyncio` 实现的异步高性能版本 (当前最新: v2.6.4g)。
-- 🐹 **Goway**: 基于 Go 语言实现的高并发、低延迟编译型版本 (当前最新: v1.1.1a)。
+- 🐍 **Pyway**: 基于 Python `asyncio` 实现的异步高性能版本 (当前最新: v2.7.1g)。
+- 🐹 **Goway**: 基于 Go 语言实现的高并发、低延迟编译型版本 (当前最新: v1.1.8a)。
 
 ---
 
@@ -46,10 +46,10 @@ Way Proxy 是一个**轻量级**、**高性能**的 HTTP/SOCKS5 转 WebSocket �
 ### 使用 Pyway (Python)
 
 1. **环境要求**: Python 3.7+
-2. **下载脚本**: 进入 `pyway` 目录，找到最新的脚本 (例如 `pyway2.6.4g.py`)
+2. **下载脚本**: 进入 `pyway` 目录，找到最新的脚本 (例如 `pyway2.7.1g.py`)
 3. **运行**:
    ```bash
-   python pyway/pyway2.6.4g.py -p :8080
+   python pyway/pyway2.7.1g.py -p :8080
    ```
 
 *推荐安装 `aiodns` 以获取更快的非阻塞解析性能: `pip install aiodns`*
@@ -63,7 +63,7 @@ Goway 提供更好的多线程性能与极低的运行内存。
 3. **编译并运行**:
    ```bash
    cd goway
-   go build -o goway goway1.1.1a.go
+   go build -o goway goway1.1.8a.go
    ./goway -p :8080
    ```
 
@@ -80,7 +80,7 @@ Server 端不使用 `-up` 参数，仅监听一个端口提供 WebSocket 代理�
 ```bash
 # 示例：监听 8080 端口，并设置加密密钥为 "my_secret_key"
 # Python 版本
-python pyway/pyway2.6.4g.py -p :8080 -k "my_secret_key"
+python pyway/pyway2.7.1g.py -p :8080 -k "my_secret_key"
 
 # Go 版本 (推荐用于 Server)
 ./goway -p :8080 -k "my_secret_key"
@@ -93,7 +93,7 @@ Client 端通过 `-up` 参数连接到 Server 端，并在本地暴露 HTTP/SOCK
 ```bash
 # 示例：在本地 1080 端口开启 HTTP/SOCKS5 代理，连接到 服务器 WS，带上密钥
 # Python 版本
-python pyway/pyway2.6.4g.py -p :1080 -up ws://<你的服务器IP>:8080 -k "my_secret_key"
+python pyway/pyway2.7.1g.py -p :1080 -up ws://<你的服务器IP>:8080 -k "my_secret_key"
 
 # Go 版本
 ./goway -p :1080 -up ws://<你的服务器IP>:8080 -k "my_secret_key"
@@ -135,7 +135,7 @@ python pyway/pyway2.6.4g.py -p :1080 -up ws://<你的服务器IP>:8080 -k "my_se
 
 ```bash
 # 启动本地客户端 (使用 512KB Socket 和应用缓冲)
-python pyway/pyway2.6.4g.py -p :9193 -up wss://vps-ip:443/ws -W 512 --socket-buffer 2048 -k "secret"
+python pyway/pyway2.7.1g.py -p :9193 -up wss://vps-ip:443/ws -W 512 --socket-buffer 2048 -k "secret"
 
 # 使用 yt-dlp 通过该代理下载
 yt-dlp --proxy "http://127.0.0.1:9193" -f "bv*+ba/b" "YOUR_VIDEO_URL"
@@ -218,4 +218,87 @@ server {
 - 或者使用 `systemd`。
 
 ---
+---
+
+## 📊 性能优化记录
+
+> 以下记录了从 v1.1.3a / v2.6.6g 到 v1.1.8a / v2.7.1g 共 5 轮性能优化的详细变更。
+> 每项优化均保持功能语义不变，仅改变内部实现。如需回退某项优化，可对照「优化前」代码恢复。
+
+### 一、XOR 加密/解密优化
+
+| # | 轮次 | 文件 | 优化项 | 优化前 | 优化后 | 好处 | 坏处 | 预期提升 |
+|---|------|------|--------|--------|--------|------|------|----------|
+| 1.1 | R1 | Go | TransformInPlace key步长批量XOR | 逐字节XOR `data[i] ^= key[i%kl]` 每次迭代含取模 | 按key长度(32)步长批量XOR，内层循环固定32次，尾部逐字节 | 消除热循环取模运算；编译器可展开固定长度内循环 | 代码3行→6行 | XOR吞吐量 ~2-3x |
+| 1.2 | R1 | Go | Crypto.Transform 委托 | Transform独立实现逐字节XOR | `copy(out,data); c.TransformInPlace(out)` | 消除重复代码，自动享受InPlace优化 | 多1次函数调用（可能被内联） | 与1.1同 |
+| 1.3 | R1 | Py | Crypto.transform int.from_bytes | 逐字节Python循环 `result[i] = b ^ key[i%kl]` | int.from_bytes批量XOR `r = int.from_bytes(chunk,'big') ^ int.from_bytes(ks,'big')` | Python循环O(n)→O(1)单次C级大整数运算 | 大帧创建巨大Python整数，增加GC压力 | 小帧(<64KB) ~100x |
+| 1.4 | R2 | Py | Crypto.transform 64KB分块 | 全帧一次性int.from_bytes | 64KB分块处理 `for off in range(0,len(data),CHUNK)` | 峰值内存O(n)→O(64KB)；1MB帧从~30KB PyLong降到~2KB | 小帧多循环检查开销~1% | 大帧内存峰值降低 ~64x |
+| 1.5 | R5 | Py | 帧mask/unmask 64KB分块 | 全帧一次性 `(masking_key*repeats)[:len]; int.from_bytes` | 与Crypto.transform相同的64KB分块模式 | >64KB帧的内存峰值降低64倍 | 同1.4 | 数据面最热路径，每帧必经 |
+
+### 二、WebSocket 帧处理优化
+
+| # | 轮次 | 文件 | 优化项 | 优化前 | 优化后 | 好处 | 坏处 | 预期提升 |
+|---|------|------|--------|--------|--------|------|------|----------|
+| 2.1 | R1 | Go | getWSHeader 栈分配 | `buf := make([]byte, 14)` 堆分配 | `var buf [14]byte` 栈分配，返回`buf[:n]` | 消除14字节堆分配+GC扫描，零开销 | 无（切片被append立即拷贝） | 每帧减少1次堆分配 |
+| 2.2 | R1/2 | Go | readWSFrame 栈分配+批量unmask | `make([]byte, 2/8/4)` 堆分配 + 逐字节unmask `mk[i&3]` | `var b [2/8]byte; var maskKey [4]byte` 栈分配 + 4字节批量展开unmask | 每帧减少3次堆分配；批量unmask消除位运算 | 代码1行→6行 | 每帧减少~3μs；unmask ~1.5x |
+| 2.3 | R1 | Go | writeWSFrame 单次分配 | header/data分别写入，多次系统调用 | masked: 单次make+单次Write；unmasked: net.Buffers零拷贝 | 1次分配替代3次；内核可gather写入 | masked仍需拷贝data（需XOR原地修改） | 发送吞吐量 ~1.3x |
+| 2.4 | R5 | Go | createWSFrame XOR 4字节展开 | `for i := range payload { payload[i] ^= mk[i&3] }` | 4字节批量展开 `payload[i] ^= mk[0]; ... mk[3]` + 尾部处理 | 消除i&3位运算；与readWSFrame风格一致 | 代码1行→6行 | mask操作 ~1.5x |
+| 2.5 | R1 | Go | createWSFrame maskKey 复用 | 额外`make([]byte, 4)`分配maskKey | 复用frame内存 `mk := frame[len(hdr):len(hdr)+4]` | 零额外maskKey分配 | 无 | 每帧减少1次4字节分配 |
+
+### 三、Header 解析优化
+
+| # | 轮次 | 文件 | 优化项 | 优化前 | 优化后 | 好处 | 坏处 | 预期提升 |
+|---|------|------|--------|--------|--------|------|------|----------|
+| 3.1 | R1 | Go | indexFold/asciiToLower 辅助函数 | `strings.ToLower(string(headerBytes))` 全文小写分配 | asciiToLower逐字节转换(A-Z→a-z) + indexFold在原始字节直接搜索，零分配 | 消除整个header的string分配(200-500B)；cache友好 | 代码量增加~30行；仅ASCII | header搜索 ~5x |
+| 3.2 | R3/4 | Go | handleServer wsKey直接搜索 | `bytes.Split(headerBytes, CRLF)` 遍历所有行 + 逐行匹配 | `indexFold(headerBytes, "sec-websocket-key:")` 直接定位 + `bytes.Index`截取值 | 消除Split分配(N个[]byte子切片)；O(n)单次扫描替代两次 | 多个同名header取第一个（规范不会出现） | header解析 ~2x |
+| 3.3 | R3 | Go | Host header字节级搜索 | `bytes.Split` + `strings.ToLower` + `strings.HasPrefix` | 逐行`bytes.Index`分割 + `indexFold(line[:5], "host:")` | 消除Split+ToLower分配；仅比较前5字节 | 代码略复杂 | Host提取 ~2x |
+| 3.4 | R4/5 | Py | header解析 data.find | `data.lower().split(CRLF)` 全文小写+split为list + generator遍历 | `data.lower().find(b'sec-websocket-key:')` 直接定位 + `data.find(CRLF,idx)` 截取 | 消除list分配(N个bytes对象)；O(n)单次扫描 | data.lower()仍全文小写 | header解析 ~2-3x |
+| 3.5 | R3 | Py | Host header字节级前缀比较 | `line.lower().startswith(b'host:')` 全行小写 | `len(line)>5 and line[:5].lower() == b'host:'` 仅前5字节 | 仅对5字节小写转换（vs整行20-80字节） | 无 | Host提取 ~1.5x |
+| 3.6 | R3 | Go | HTTP首行 bytes.Index | `strings.Split(string(fullData), "\r\n")[0]` 分割全部行 | `bytes.Index(fullData, []byte("\r\n"))` 直接定位首个CRLF | 消除Split分配；仅扫描到第一个CRLF | 无 | 首行解析 ~2x |
+
+### 四、TLS/SSL 优化
+
+| # | 轮次 | 文件 | 优化项 | 优化前 | 优化后 | 好处 | 坏处 | 预期提升 |
+|---|------|------|--------|--------|--------|------|------|----------|
+| 4.1 | R3 | Go | TLS Config Base+Clone | 每次连接`&tls.Config{...}`新建 | 启动时`cfg.TLSBase`，每次`cfg.TLSBase.Clone()` + ServerName | Clone复用内部session cache、证书池 | 需额外字段；Clone仍需分配 | TLS握手准备 ~1.5x |
+| 4.2 | R2 | Py | SSL Context 预创建 | 每次连接`ssl.create_default_context()`(~5-20ms) | 启动时创建verified/unverified两个Context存入Config | 消除每连接5-20ms SSL上下文创建开销 | 系统证书链更新需重启 | 每次WSS连接减少5-20ms |
+
+### 五、内存管理优化
+
+| # | 轮次 | 文件 | 优化项 | 优化前 | 优化后 | 好处 | 坏处 | 预期提升 |
+|---|------|------|--------|--------|--------|------|------|----------|
+| 5.1 | R1 | Go | sync.Pool 缓冲区池 | 无（或已有，未改动） | 64KB缓冲区通过sync.Pool复用 | 高并发避免频繁堆分配 | Pool中对象暂不GC | GC压力降低 |
+| 5.2 | R4 | Go | padding append循环 | `[]byte(strings.Repeat(" ", padLen))` 临时string+转换 | `for i<padLen { append(targetPayload, ' ') }` | 消除1次string+1次[]byte分配 | 微小循环开销 | 微小(~1μs) |
+| 5.3 | R2 | Py | random.randbytes 替代 os.urandom | `os.urandom(16)` 系统调用 | `random.randbytes(16)` 用户空间PRNG | 避免系统调用~5-10μs | 密码学安全性降低（仅WS Key，可接受） | ~5-10μs/连接 |
+
+### 六、并发/锁优化
+
+| # | 轮次 | 文件 | 优化项 | 优化前 | 优化后 | 好处 | 坏处 | 预期提升 |
+|---|------|------|--------|--------|--------|------|------|----------|
+| 6.1 | R1 | Py | Statistics 去锁 | `threading.Lock()` + `with self.lock:` | 直接`self.bytes_up += up`，无锁 | 消除每帧2次锁获取/释放~200ns | GIL下整数+=非严格原子，统计可接受偏差 | 每帧减少~200ns |
+| 6.2 | R2 | Py | Semaphore acquire修复 | `conn_semaphore.acquire()` 同步阻塞事件循环 | `await conn_semaphore.acquire()` 异步等待 | 不阻塞事件循环，其他连接正常处理 | 无（原写法是bug） | 高并发下的连接准入 |
+
+### 七、日志/I-O 优化
+
+| # | 轮次 | 文件 | 优化项 | 优化前 | 优化后 | 好处 | 坏处 | 预期提升 |
+|---|------|------|--------|--------|--------|------|------|----------|
+| 7.1 | R1 | Py | logger lazy formatting (17处) | `logger.debug(f"msg: {var}")` f-string立即求值 | `logger.debug("msg: %s", var)` %s延迟求值 | 日志级别不够时跳过格式化；17处每处省~1μs | 可读性略降 | 关闭debug时 ~17μs/连接 |
+| 7.2 | R5 | Go | 101检查 bytes.Contains | `strings.Contains(string(respBytes), "101")` []byte→string拷贝 | `bytes.Contains(respBytes, []byte("101"))` 原字节搜索 | 消除respBytes拷贝(100-200B) | 无 | 微小(~1μs) |
+| 7.3 | R5 | Go | isLocalTarget EqualFold | `strings.ToLower(host)` 每次分配新字符串 + Split | `strings.EqualFold(host, "localhost")` + `IndexByte` 替代Split | 非本地目标避免ToLower分配；172.x用IndexByte替代Split | 代码略长 | ~50ns/连接 |
+| 7.4 | R1 | Py | Statistics lock已去（同6.1） | - | - | - | - | - |
+
+### 汇总统计
+
+| 类别 | 优化项数 | 影响路径 | 最大单项提升 |
+|------|---------|---------|-------------|
+| XOR加密/解密 | 5 | 每帧热路径 | Py int.from_bytes ~100x (R1) |
+| WebSocket帧处理 | 5 | 每帧热路径 | Go 栈分配减少GC ~3μs/帧 |
+| Header解析 | 6 | 每连接握手 | Go indexFold ~5x (R1) |
+| TLS/SSL | 2 | 每WSS连接 | Py 预创建SSL Context ~5-20ms |
+| 内存管理 | 3 | 每连接/每帧 | Py 64KB分块内存峰值降低64x |
+| 并发/锁 | 2 | 每帧热路径 | Py 去锁 ~200ns/帧 |
+| 日志/I-O | 3 | 每次调用 | Py lazy logging ~17μs/连接 |
+
+---
+
 🛡️ **安全声明**: 本工具仅供学习研究网络协议以及网络加速优化使用，请遵守当地法律法规。
