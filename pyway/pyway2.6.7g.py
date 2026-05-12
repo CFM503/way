@@ -15,7 +15,7 @@ import time
 from typing import Optional, Tuple
 from dataclasses import dataclass
 
-VERSION = "2.6.6G"
+VERSION = "2.6.7G"
 CRLF = b"\r\n"
 CRLFCRLF = b"\r\n\r\n"
 MAX_WS_FRAME_SIZE = 10 * 1024 * 1024  # [Security] Limit WS frame to 10MB
@@ -36,15 +36,12 @@ class Statistics:
         self.active_conns = 0
         self.bytes_up = 0
         self.bytes_down = 0
-        self.lock = asyncio.Lock()
 
-    async def add_conn(self):
-        async with self.lock:
-            self.active_conns += 1
+    def add_conn(self):
+        self.active_conns += 1
 
-    async def remove_conn(self):
-        async with self.lock:
-            self.active_conns -= 1
+    def remove_conn(self):
+        self.active_conns -= 1
 
     def add_bytes(self, up=0, down=0):
         # Acceptable drift for display purposes — lock would hurt throughput
@@ -63,12 +60,12 @@ class Crypto:
     def transform(self, data: bytes) -> bytes:
         if not data:
             return data
-        out = bytearray(data)
-        kb = self.key_bytes
         kl = self.key_len
-        for i in range(len(out)):
-            out[i] ^= kb[i % kl]
-        return bytes(out)
+        kb = self.key_bytes
+        repeats = len(data) // kl + 1
+        key_stream = (kb * repeats)[:len(data)]
+        result = int.from_bytes(data, 'big') ^ int.from_bytes(key_stream, 'big')
+        return result.to_bytes(len(data), 'big')
 
 
 @dataclass
@@ -141,7 +138,7 @@ def custom_exception_handler(loop, context):
     if isinstance(exception, RuntimeError) and "coroutine ignored" in str(exception):
         return
 
-    logger.debug(f"Loop exception: {context}")
+    logger.debug("Loop exception: %s", context)
 
 
 def parse_host_port(address: str, default_port: int = 80) -> Tuple[str, str]:
@@ -200,7 +197,7 @@ def optimize_socket(writer: asyncio.StreamWriter, config: Config, connection_typ
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, buffer_bytes)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, buffer_bytes)
     except Exception as e:
-        logger.debug(f"[{connection_type}] Socket optimization error: {e}")
+        logger.debug("[%s] Socket optimization error: %s", connection_type, e)
 
 
 async def safe_close_streamwriter(w: Optional[asyncio.StreamWriter]):
@@ -240,10 +237,10 @@ def create_ws_frame(data: bytes, opcode: int = 0x2, masked: bool = False) -> byt
         mask_int = random.getrandbits(32)
         masking_key = mask_int.to_bytes(4, 'big')
         header.extend(masking_key)
-        payload_arr = bytearray(data)
-        for i in range(len(data)):
-            payload_arr[i] ^= masking_key[i % 4]
-        return bytes(header) + payload_arr
+        repeats = len(data) // 4 + 1
+        key_stream = (masking_key * repeats)[:len(data)]
+        result = int.from_bytes(data, 'big') ^ int.from_bytes(key_stream, 'big')
+        return bytes(header) + result.to_bytes(len(data), 'big')
 
     return bytes(header) + data
 
@@ -262,18 +259,17 @@ async def read_ws_frame(reader: asyncio.StreamReader, writer: Optional[asyncio.S
                 payload_len = struct.unpack('!Q', await reader.readexactly(8))[0]
 
             if payload_len > MAX_WS_FRAME_SIZE:
-                logger.error(f"Frame too large: {payload_len}")
+                logger.error("Frame too large: %s", payload_len)
                 return None
 
             masking_key = await reader.readexactly(4) if masked else None
             payload = await reader.readexactly(payload_len)
 
             if masked and masking_key:
-                ba = bytearray(payload)
-                mk = masking_key
-                for i in range(payload_len):
-                    ba[i] ^= mk[i & 3]
-                payload = bytes(ba)
+                repeats = payload_len // 4 + 1
+                key_stream = (masking_key * repeats)[:payload_len]
+                result = int.from_bytes(payload, 'big') ^ int.from_bytes(key_stream, 'big')
+                payload = result.to_bytes(payload_len, 'big')
 
             if opcode in [0x0, 0x1, 0x2]:  # Text, Binary, Continuation
                 return payload
@@ -291,7 +287,7 @@ async def read_ws_frame(reader: asyncio.StreamReader, writer: Optional[asyncio.S
     except (asyncio.IncompleteReadError, ConnectionResetError):
         return None
     except Exception as e:
-        logger.debug(f"Read frame error: {e}")
+        logger.debug("Read frame error: %s", e)
         return None
 
 
@@ -299,7 +295,7 @@ async def ws_forward(ws_reader: asyncio.StreamReader, ws_writer: asyncio.StreamW
                       tcp_reader: asyncio.StreamReader, tcp_writer: asyncio.StreamWriter,
                       client_side: bool, config: Config):
 
-    await stats.add_conn()
+    stats.add_conn()
 
     async def transfer(reader, writer, is_ws_out: bool):
         pending = 0
@@ -350,7 +346,7 @@ async def ws_forward(ws_reader: asyncio.StreamReader, ws_writer: asyncio.StreamW
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.debug(f"Transfer error: {e}")
+            logger.debug("Transfer error: %s", e)
         finally:
             try:
                 if pending > 0 and not writer.is_closing():
@@ -368,7 +364,7 @@ async def ws_forward(ws_reader: asyncio.StreamReader, ws_writer: asyncio.StreamW
         for task in pending:
             task.cancel()
     finally:
-        await stats.remove_conn()
+        stats.remove_conn()
         await safe_close_streamwriter(ws_writer)
         await safe_close_streamwriter(tcp_writer)
 
@@ -412,7 +408,7 @@ async def connect_to_upstream(target: str, config: Config) -> Tuple[asyncio.Stre
             ssl_context.check_hostname = True
             ssl_context.verify_mode = ssl.CERT_REQUIRED
 
-    logger.debug(f"Connecting to upstream {server_host}:{server_port} (SSL: {use_ssl})")
+    logger.debug("Connecting to upstream %s:%s (SSL: %s)", server_host, server_port, use_ssl)
 
     sni_hostname = sanitize_header(config.fakehost.split(':')[0] if config.fakehost else server_host)
 
@@ -513,7 +509,7 @@ async def handle_server(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     global conn_semaphore
     if conn_semaphore:
         if conn_semaphore.locked():
-            logger.warning(f"Max connections reached. Dropping {writer.get_extra_info('peername')}")
+            logger.warning("Max connections reached. Dropping %s", writer.get_extra_info('peername'))
             writer.close()
             return
         conn_semaphore.acquire()
@@ -524,7 +520,7 @@ async def handle_server(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             timeout=config.connection_timeout
         )
     except Exception as e:
-        logger.debug(f"Server handler error: {e}")
+        logger.debug("Server handler error: %s", e)
     finally:
         if conn_semaphore:
             conn_semaphore.release()
@@ -566,7 +562,7 @@ async def _handle_server_impl(reader: asyncio.StreamReader, writer: asyncio.Stre
             auth_data = config.crypto.transform(auth_data)
 
         if not auth_data:
-            logger.warning(f"[Security] Empty auth data from {writer.get_extra_info('peername')}")
+            logger.warning("[Security] Empty auth data from %s", writer.get_extra_info('peername'))
             return
 
         clean_auth = auth_data.decode(errors='ignore').strip()
@@ -576,10 +572,10 @@ async def _handle_server_impl(reader: asyncio.StreamReader, writer: asyncio.Stre
             target_str = clean_auth.split(maxsplit=1)[0]
             target_host, target_port = parse_host_port(target_str)
         except Exception:
-            logger.warning(f"[Security] Malformed target format: {clean_auth[:50]}")
+            logger.warning("[Security] Malformed target format: %s", clean_auth[:50])
             return
 
-        logger.info(f"[SERVER] Connect -> {target_host}:{target_port}")
+        logger.info("[SERVER] Connect -> %s:%s", target_host, target_port)
         # Force IPv4 to prevent IPv6 routing issues on some VPS
         target_reader, target_writer = await asyncio.open_connection(
             target_host, int(target_port), limit=config.stream_limit, family=socket.AF_INET
@@ -628,14 +624,14 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         conn_semaphore.acquire()
 
     peername = writer.get_extra_info('peername')
-    logger.info(f"[CLIENT] Connection from {peername}")
+    logger.info("[CLIENT] Connection from %s", peername)
     try:
         await asyncio.wait_for(
             _handle_client_impl(reader, writer, config),
             timeout=config.connection_timeout
         )
     except Exception as e:
-        logger.debug(f"Client handler error: {e}")
+        logger.debug("Client handler error: %s", e)
     finally:
         if conn_semaphore:
             conn_semaphore.release()
@@ -658,9 +654,9 @@ async def _handle_client_impl(reader: asyncio.StreamReader, writer: asyncio.Stre
         if initial_byte == b'\x05':
             is_socks5 = True
             target_host, target_port = await socks5_negotiate(reader, writer)
-            logger.info(f"[CLIENT] SOCKS5 -> {target_host}:{target_port}")
+            logger.info("[CLIENT] SOCKS5 -> %s:%s", target_host, target_port)
         elif initial_byte == b'\x16':
-            logger.error(f"[CLIENT] HTTPS Handshake detected! Please use HTTP/SOCKS5 proxy.")
+            logger.error("[CLIENT] HTTPS Handshake detected! Please use HTTP/SOCKS5 proxy.")
             return
         else:
             # HTTP Proxy
@@ -673,7 +669,7 @@ async def _handle_client_impl(reader: asyncio.StreamReader, writer: asyncio.Stre
             try:
                 request_line = request_line_data.decode('utf-8').strip()
                 method, target, _ = request_line.split(' ', 2)
-                logger.info(f"[CLIENT] {method} {target}")
+                logger.info("[CLIENT] %s %s", method, target)
             except:
                 return
 
@@ -701,7 +697,7 @@ async def _handle_client_impl(reader: asyncio.StreamReader, writer: asyncio.Stre
             return
 
         if config.block_local and is_local_target(target_host):
-            logger.warning(f"[CLIENT] Blocked local traffic attempt: {target_host}:{target_port}")
+            logger.warning("[CLIENT] Blocked local traffic attempt: %s:%s", target_host, target_port)
             return
 
         try:
@@ -709,7 +705,7 @@ async def _handle_client_impl(reader: asyncio.StreamReader, writer: asyncio.Stre
                 connect_to_upstream(f"{target_host}:{target_port}", config), timeout=30.0
             )
         except Exception as e:
-            logger.error(f"[CLIENT] Upstream Fail: {e}")
+            logger.error("[CLIENT] Upstream Fail: %s", e)
             if is_socks5:
                 writer.write(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
             else:
@@ -772,7 +768,7 @@ async def main_async(config: Config):
             limit=MAX_HEADER_SIZE
         )
     except OSError as e:
-        logger.error(f"Could not bind to {config.proxy_host}:{config.proxy_port} - {e}")
+        logger.error("Could not bind to %s:%s - %s", config.proxy_host, config.proxy_port, e)
         sys.exit(1)
 
     addrs = ', '.join(str(s.getsockname()) for s in server.sockets)
@@ -885,7 +881,7 @@ def main():
     sticky_ua = random.choice(ua_pool)
 
     # [Fix] stream_limit must accommodate MAX_WS_FRAME_SIZE
-    stream_limit = max(buf * 16, MAX_WS_FRAME_SIZE + 1048576)
+    stream_limit = max(buf * 4, MAX_WS_FRAME_SIZE + 65536)
 
     config = Config(
         proxy_host=args.p.rsplit(':', 1)[0] or '0.0.0.0',

@@ -13,7 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/big"
+	mrand "math/rand"
 	"net"
 	"net/url"
 	"os"
@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	Version        = "1.1.3a"
+	Version        = "1.1.4a"
 	MaxWSFrameSize = 16 * 1024 * 1024 // 16MB
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -105,8 +105,16 @@ func (c *Crypto) TransformInPlace(data []byte) {
 	if c == nil || len(data) == 0 {
 		return
 	}
-	for i := 0; i < len(data); i++ {
-		data[i] ^= c.keyBytes[i%c.keyLen]
+	key := c.keyBytes
+	kl := c.keyLen
+	i := 0
+	for ; i+kl <= len(data); i += kl {
+		for j := 0; j < kl; j++ {
+			data[i+j] ^= key[j]
+		}
+	}
+	for ; i < len(data); i++ {
+		data[i] ^= key[i%kl]
 	}
 }
 
@@ -221,19 +229,11 @@ var acceptLangPool = []string{
 }
 
 func pickUA() string {
-	n, err := rand.Int(rand.Reader, big.NewInt(int64(len(uaPool))))
-	if err != nil {
-		return uaPool[0]
-	}
-	return uaPool[n.Int64()]
+	return uaPool[mrand.Intn(len(uaPool))]
 }
 
 func pickAcceptLang() string {
-	n, err := rand.Int(rand.Reader, big.NewInt(int64(len(acceptLangPool))))
-	if err != nil {
-		return acceptLangPool[0]
-	}
-	return acceptLangPool[n.Int64()]
+	return acceptLangPool[mrand.Intn(len(acceptLangPool))]
 }
 
 // --- Header Sanitization ---
@@ -250,29 +250,25 @@ func sanitizeHeader(value string) string {
 // --- WebSocket Framing ---
 
 func getWSHeader(dataLen int, opcode byte, masked bool) []byte {
-	header := make([]byte, 0, 14)
-	finBit := byte(0b10000000)
-	header = append(header, finBit|opcode)
-
+	var buf [14]byte
+	buf[0] = 0b10000000 | opcode
 	maskBit := byte(0)
 	if masked {
 		maskBit = 128
 	}
-
+	n := 2
 	if dataLen < 126 {
-		header = append(header, byte(dataLen)|maskBit)
+		buf[1] = byte(dataLen) | maskBit
 	} else if dataLen < 65536 {
-		header = append(header, 126|maskBit)
-		b := make([]byte, 2)
-		binary.BigEndian.PutUint16(b, uint16(dataLen))
-		header = append(header, b...)
+		buf[1] = 126 | maskBit
+		binary.BigEndian.PutUint16(buf[2:4], uint16(dataLen))
+		n = 4
 	} else {
-		header = append(header, 127|maskBit)
-		b := make([]byte, 8)
-		binary.BigEndian.PutUint64(b, uint64(dataLen))
-		header = append(header, b...)
+		buf[1] = 127 | maskBit
+		binary.BigEndian.PutUint64(buf[2:10], uint64(dataLen))
+		n = 10
 	}
-	return header
+	return buf[:n]
 }
 
 func createWSFrame(data []byte, opcode byte, masked bool) []byte {
@@ -298,23 +294,18 @@ func writeWSFrame(w io.Writer, data []byte, opcode byte, masked bool) error {
 		maskKey := make([]byte, 4)
 		rand.Read(maskKey)
 		header = append(header, maskKey...)
-		// Copy data to avoid mutating caller's slice
-		payload := make([]byte, len(data))
-		copy(payload, data)
-		for i := 0; i < len(payload); i++ {
-			payload[i] ^= maskKey[i&3]
+		frame := make([]byte, len(header)+len(data))
+		copy(frame, header)
+		copy(frame[len(header):], data)
+		for i := len(header); i < len(frame); i++ {
+			frame[i] ^= maskKey[(i-len(header))&3]
 		}
-		if _, err := w.Write(header); err != nil {
-			return err
-		}
-		_, err := w.Write(payload)
+		_, err := w.Write(frame)
 		return err
 	}
 
-	if _, err := w.Write(header); err != nil {
-		return err
-	}
-	_, err := w.Write(data)
+	bufs := net.Buffers{header, data}
+	_, err := bufs.WriteTo(w)
 	return err
 }
 
@@ -369,7 +360,7 @@ func setReadDeadline(conn net.Conn, timeoutSec int) {
 }
 
 func readUntilCRLFCRLF(br *bufio.Reader) ([]byte, error) {
-	var res []byte
+	res := make([]byte, 0, 512)
 	for {
 		line, err := br.ReadBytes('\n')
 		if err != nil {
@@ -391,8 +382,8 @@ func readUntilCRLFCRLF(br *bufio.Reader) ([]byte, error) {
 
 func readWSFrame(r io.Reader, w io.Writer) ([]byte, error) {
 	for {
-		head := make([]byte, 2)
-		if _, err := io.ReadFull(r, head); err != nil {
+		var head [2]byte
+		if _, err := io.ReadFull(r, head[:]); err != nil {
 			return nil, err
 		}
 
@@ -717,7 +708,7 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 	}
 
 	if cfg.Crypto != nil {
-		authData = cfg.Crypto.Transform(authData)
+		cfg.Crypto.TransformInPlace(authData)
 	}
 
 	targetStr := strings.TrimSpace(string(authData))
@@ -739,7 +730,7 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 
 	ok := []byte("OK\n")
 	if cfg.Crypto != nil {
-		ok = cfg.Crypto.Transform(ok)
+		cfg.Crypto.TransformInPlace(ok)
 	}
 	if _, err := wsConn.Write(createWSFrame(ok, 0x2, false)); err != nil {
 		return
@@ -1049,11 +1040,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 
 	// Fisher-Yates shuffle
 	for i := len(headers) - 1; i > 0; i-- {
-		jBig, err := rand.Int(rand.Reader, big.NewInt(int64(i+1)))
-		if err != nil {
-			continue
-		}
-		j := int(jBig.Int64())
+		j := mrand.Intn(i + 1)
 		headers[i], headers[j] = headers[j], headers[i]
 	}
 
@@ -1082,15 +1069,11 @@ func handleClient(localConn net.Conn, cfg *Config) {
 	}
 
 	targetPayload := []byte(fmt.Sprintf("%s:%s\n", targetHost, targetPort))
-	n, err := rand.Int(rand.Reader, big.NewInt(40))
-	if err != nil {
-		return
-	}
-	padLen := 1 + int(n.Int64())
+	padLen := 1 + mrand.Intn(40)
 	targetPayload = append(targetPayload, []byte(strings.Repeat(" ", padLen))...)
 
 	if cfg.Crypto != nil {
-		targetPayload = cfg.Crypto.Transform(targetPayload)
+		cfg.Crypto.TransformInPlace(targetPayload)
 	}
 	if _, err := wsConn.Write(createWSFrame(targetPayload, 0x2, true)); err != nil {
 		return
@@ -1103,7 +1086,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		return
 	}
 	if cfg.Crypto != nil {
-		okFrame = cfg.Crypto.Transform(okFrame)
+		cfg.Crypto.TransformInPlace(okFrame)
 	}
 	if !strings.HasPrefix(string(okFrame), "OK") {
 		logError("Auth rejected by server")
