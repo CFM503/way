@@ -15,7 +15,7 @@ import time
 from typing import Optional, Tuple
 from dataclasses import dataclass
 
-VERSION = "2.7.0G"
+VERSION = "2.7.1G"
 CRLF = b"\r\n"
 CRLFCRLF = b"\r\n\r\n"
 MAX_WS_FRAME_SIZE = 10 * 1024 * 1024  # [Security] Limit WS frame to 10MB
@@ -245,10 +245,17 @@ def create_ws_frame(data: bytes, opcode: int = 0x2, masked: bool = False) -> byt
         mask_int = random.getrandbits(32)
         masking_key = mask_int.to_bytes(4, 'big')
         header.extend(masking_key)
-        repeats = len(data) // 4 + 1
-        key_stream = (masking_key * repeats)[:len(data)]
-        result = int.from_bytes(data, 'big') ^ int.from_bytes(key_stream, 'big')
-        return bytes(header) + result.to_bytes(len(data), 'big')
+        dl = len(data)
+        CHUNK = 65536
+        out = bytearray(dl)
+        for off in range(0, dl, CHUNK):
+            chunk = data[off:off + CHUNK]
+            cs = len(chunk)
+            repeats = cs // 4 + 1
+            ks = (masking_key * repeats)[:cs]
+            r = int.from_bytes(chunk, 'big') ^ int.from_bytes(ks, 'big')
+            out[off:off + cs] = r.to_bytes(cs, 'big')
+        return bytes(header) + bytes(out)
 
     return bytes(header) + data
 
@@ -274,10 +281,16 @@ async def read_ws_frame(reader: asyncio.StreamReader, writer: Optional[asyncio.S
             payload = await reader.readexactly(payload_len)
 
             if masked and masking_key:
-                repeats = payload_len // 4 + 1
-                key_stream = (masking_key * repeats)[:payload_len]
-                result = int.from_bytes(payload, 'big') ^ int.from_bytes(key_stream, 'big')
-                payload = result.to_bytes(payload_len, 'big')
+                CHUNK = 65536
+                out = bytearray(payload_len)
+                for off in range(0, payload_len, CHUNK):
+                    chunk = payload[off:off + CHUNK]
+                    cs = len(chunk)
+                    repeats = cs // 4 + 1
+                    ks = (masking_key * repeats)[:cs]
+                    r = int.from_bytes(chunk, 'big') ^ int.from_bytes(ks, 'big')
+                    out[off:off + cs] = r.to_bytes(cs, 'big')
+                payload = bytes(out)
 
             if opcode in [0x0, 0x1, 0x2]:  # Text, Binary, Continuation
                 return payload
@@ -537,11 +550,13 @@ async def _handle_server_impl(reader: asyncio.StreamReader, writer: asyncio.Stre
             logger.warning("[Security] Header too large, dropping connection.")
             return
 
-        headers = data.split(CRLF)
-        ws_key_line = next(
-            (h for h in headers
-             if len(h) > 19 and h[:19].lower() == b'sec-websocket-key:'),
-            None)
+        idx = data.lower().find(b'sec-websocket-key:')
+        ws_key_line = None
+        if idx >= 0:
+            end = data.find(CRLF, idx)
+            if end < 0:
+                end = len(data)
+            ws_key_line = data[idx:end]
 
         if not ws_key_line:
             writer.write(b'HTTP/1.1 400 Bad Request\r\n\r\n')

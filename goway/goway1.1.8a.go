@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	Version        = "1.1.7a"
+	Version        = "1.1.8a"
 	MaxWSFrameSize = 16 * 1024 * 1024 // 16MB
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -281,7 +281,14 @@ func createWSFrame(data []byte, opcode byte, masked bool) []byte {
 		rand.Read(mk)
 		payload := frame[len(hdr)+4:]
 		copy(payload, data)
-		for i := range payload {
+		i := 0
+		for ; i+4 <= len(payload); i += 4 {
+			payload[i] ^= mk[0]
+			payload[i+1] ^= mk[1]
+			payload[i+2] ^= mk[2]
+			payload[i+3] ^= mk[3]
+		}
+		for ; i < len(payload); i++ {
 			payload[i] ^= mk[i&3]
 		}
 		return frame
@@ -798,17 +805,17 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 }
 
 func isLocalTarget(host string) bool {
-	h := strings.ToLower(host)
-	if h == "localhost" || h == "127.0.0.1" || h == "::1" || h == "[::1]" || h == "0.0.0.0" {
+	if strings.EqualFold(host, "localhost") ||
+		host == "127.0.0.1" || host == "::1" || host == "[::1]" || host == "0.0.0.0" {
 		return true
 	}
+	h := strings.ToLower(host)
 	if strings.HasPrefix(h, "192.168.") || strings.HasPrefix(h, "10.") {
 		return true
 	}
 	if strings.HasPrefix(h, "172.") {
-		parts := strings.Split(h, ".")
-		if len(parts) >= 2 {
-			if b, err := strconv.Atoi(parts[1]); err == nil && b >= 16 && b <= 31 {
+		if dot := strings.IndexByte(h[4:], '.'); dot >= 0 {
+			if b, err := strconv.Atoi(h[4 : 4+dot]); err == nil && b >= 16 && b <= 31 {
 				return true
 			}
 		}
@@ -1086,7 +1093,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		logError("Handshake read failed: %v", err)
 		return
 	}
-	if !strings.Contains(string(respBytes), "101") {
+	if !bytes.Contains(respBytes, []byte("101")) {
 		logError("Handshake failed status: %s", string(respBytes))
 		return
 	}
