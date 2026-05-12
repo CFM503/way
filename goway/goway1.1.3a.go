@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	Version        = "1.1.1a"
+	Version        = "1.1.3a"
 	MaxWSFrameSize = 16 * 1024 * 1024 // 16MB
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -276,34 +276,38 @@ func getWSHeader(dataLen int, opcode byte, masked bool) []byte {
 }
 
 func createWSFrame(data []byte, opcode byte, masked bool) []byte {
-	header := getWSHeader(len(data), opcode, masked)
+	hdr := getWSHeader(len(data), opcode, masked)
 	if masked {
-		maskKey := make([]byte, 4)
-		rand.Read(maskKey) // On error, maskKey stays zero — still well-formed
-		header = append(header, maskKey...)
-
-		payload := make([]byte, len(data))
-		for i := 0; i < len(data); i++ {
-			payload[i] = data[i] ^ maskKey[i&3]
+		frame := make([]byte, len(hdr)+4+len(data))
+		copy(frame, hdr)
+		mk := frame[len(hdr) : len(hdr)+4]
+		rand.Read(mk)
+		payload := frame[len(hdr)+4:]
+		copy(payload, data)
+		for i := range payload {
+			payload[i] ^= mk[i&3]
 		}
-		return append(header, payload...)
+		return frame
 	}
-	return append(header, data...)
+	return append(hdr, data...)
 }
 
 func writeWSFrame(w io.Writer, data []byte, opcode byte, masked bool) error {
 	header := getWSHeader(len(data), opcode, masked)
 	if masked {
 		maskKey := make([]byte, 4)
-		rand.Read(maskKey) // On error, maskKey stays zero — still well-formed
+		rand.Read(maskKey)
 		header = append(header, maskKey...)
+		// Copy data to avoid mutating caller's slice
+		payload := make([]byte, len(data))
+		copy(payload, data)
+		for i := 0; i < len(payload); i++ {
+			payload[i] ^= maskKey[i&3]
+		}
 		if _, err := w.Write(header); err != nil {
 			return err
 		}
-		for i := 0; i < len(data); i++ {
-			data[i] ^= maskKey[i&3]
-		}
-		_, err := w.Write(data)
+		_, err := w.Write(payload)
 		return err
 	}
 
@@ -372,10 +376,13 @@ func readUntilCRLFCRLF(br *bufio.Reader) ([]byte, error) {
 			return nil, err
 		}
 		res = append(res, line...)
-		if strings.HasSuffix(string(res), CRLFCRLF) {
+		n := len(res)
+		if n >= 4 &&
+			res[n-4] == '\r' && res[n-3] == '\n' &&
+			res[n-2] == '\r' && res[n-1] == '\n' {
 			break
 		}
-		if len(res) > MaxHeaderSize {
+		if n > MaxHeaderSize {
 			return nil, errors.New("header too large")
 		}
 	}
@@ -685,9 +692,9 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 	var wsKey string
 	for _, line := range strings.Split(headerStr, "\r\n") {
 		if strings.HasPrefix(strings.ToLower(line), "sec-websocket-key:") {
-			parts := strings.Split(line, ":")
-			if len(parts) > 1 {
-				wsKey = strings.TrimSpace(parts[1])
+			_, val, ok := strings.Cut(line, ":")
+			if ok {
+				wsKey = strings.TrimSpace(val)
 			}
 		}
 	}
@@ -1042,18 +1049,24 @@ func handleClient(localConn net.Conn, cfg *Config) {
 
 	// Fisher-Yates shuffle
 	for i := len(headers) - 1; i > 0; i-- {
-		jBig, _ := rand.Int(rand.Reader, big.NewInt(int64(i+1)))
+		jBig, err := rand.Int(rand.Reader, big.NewInt(int64(i+1)))
+		if err != nil {
+			continue
+		}
 		j := int(jBig.Int64())
 		headers[i], headers[j] = headers[j], headers[i]
 	}
 
-	handshake := reqLine
+	var handshakeBuf strings.Builder
+	handshakeBuf.Grow(len(reqLine) + len(headers)*80 + 2)
+	handshakeBuf.WriteString(reqLine)
 	for _, h := range headers {
-		handshake += h + "\r\n"
+		handshakeBuf.WriteString(h)
+		handshakeBuf.WriteString("\r\n")
 	}
-	handshake += "\r\n"
+	handshakeBuf.WriteString("\r\n")
 
-	if _, err := wsConn.Write([]byte(handshake)); err != nil {
+	if _, err := wsConn.Write([]byte(handshakeBuf.String())); err != nil {
 		return
 	}
 

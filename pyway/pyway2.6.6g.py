@@ -15,10 +15,9 @@ import time
 from typing import Optional, Tuple
 from dataclasses import dataclass
 
-VERSION = "2.6.2G"
+VERSION = "2.6.6G"
 CRLF = b"\r\n"
 CRLFCRLF = b"\r\n\r\n"
-MAX_WS_FRAME_SIZE = 16 * 1024 * 1024  # 16MB Limit
 MAX_WS_FRAME_SIZE = 10 * 1024 * 1024  # [Security] Limit WS frame to 10MB
 MAX_HEADER_SIZE = 8192  # [Security] Limit header size to 8KB
 
@@ -39,14 +38,16 @@ class Statistics:
         self.bytes_down = 0
         self.lock = asyncio.Lock()
 
-    def add_conn(self):
-        self.active_conns += 1
+    async def add_conn(self):
+        async with self.lock:
+            self.active_conns += 1
 
-    def remove_conn(self):
-        self.active_conns -= 1
+    async def remove_conn(self):
+        async with self.lock:
+            self.active_conns -= 1
 
     def add_bytes(self, up=0, down=0):
-        # Atomic enough for display purposes without lock overhead in tight loops
+        # Acceptable drift for display purposes — lock would hurt throughput
         if up: self.bytes_up += up
         if down: self.bytes_down += down
 
@@ -62,7 +63,12 @@ class Crypto:
     def transform(self, data: bytes) -> bytes:
         if not data:
             return data
-        return bytes(b ^ self.key_bytes[i % self.key_len] for i, b in enumerate(data))
+        out = bytearray(data)
+        kb = self.key_bytes
+        kl = self.key_len
+        for i in range(len(out)):
+            out[i] ^= kb[i % kl]
+        return bytes(out)
 
 
 @dataclass
@@ -84,6 +90,7 @@ class Config:
     ssl_verify: bool = False
     max_connections: int = 1000  # [Security] DoS Protection
     block_local: bool = False
+    allow_open: bool = False
 
 
 class ColoredFormatter(logging.Formatter):
@@ -123,40 +130,34 @@ logger = setup_logger('pyway', logging.INFO)
 def custom_exception_handler(loop, context):
     message = context.get("message", "")
     exception = context.get("exception")
-    
-    # Filter harmless asyncio noise
+
     if message and "Task was destroyed but it is pending!" in message:
         return
-        
-    if isinstance(exception, (ConnectionResetError, BrokenPipeError, 
+
+    if isinstance(exception, (ConnectionResetError, BrokenPipeError,
                               asyncio.CancelledError, ConnectionAbortedError, OSError)):
         return
-        
-    # [Optimize] Less aggressive filtering for RuntimeError to catch real bugs
+
     if isinstance(exception, RuntimeError) and "coroutine ignored" in str(exception):
         return
-        
+
     logger.debug(f"Loop exception: {context}")
 
 
 def parse_host_port(address: str, default_port: int = 80) -> Tuple[str, str]:
-    # [Optimize] More robust parsing
     address = address.strip()
     if not address:
         return "", str(default_port)
-        
+
     if address.startswith("["):
-        # IPv6: [::1]:80 or [::1]
         if "]:" in address:
             host_part, port_part = address.rsplit(':', 1)
             return host_part.strip('[]'), port_part
         else:
             return address.strip('[]'), str(default_port)
     elif ':' in address:
-        # IPv4 or Hostname with port
         if address.count(':') > 1:
-            # Assume plain IPv6 without brackets? ambiguous, but treat as host
-             return address, str(default_port)
+            return address, str(default_port)
         host, port = address.rsplit(':', 1)
         return host, port
     else:
@@ -218,9 +219,9 @@ def get_ws_header(data_len: int, opcode: int = 0x2, masked: bool = False) -> byt
     header = bytearray()
     fin_bit = 0b10000000
     header.append(fin_bit | opcode)
-    
+
     mask_bit = 128 if masked else 0
-    
+
     if data_len < 126:
         header.append(data_len | mask_bit)
     elif data_len < 65536:
@@ -233,9 +234,8 @@ def get_ws_header(data_len: int, opcode: int = 0x2, masked: bool = False) -> byt
 
 
 def create_ws_frame(data: bytes, opcode: int = 0x2, masked: bool = False) -> bytes:
-    # Used for handshake/control frames where we don't need zero-copy optimization
     header = get_ws_header(len(data), opcode, masked)
-    
+
     if masked:
         mask_int = random.getrandbits(32)
         masking_key = mask_int.to_bytes(4, 'big')
@@ -244,7 +244,7 @@ def create_ws_frame(data: bytes, opcode: int = 0x2, masked: bool = False) -> byt
         for i in range(len(data)):
             payload_arr[i] ^= masking_key[i % 4]
         return bytes(header) + payload_arr
-        
+
     return bytes(header) + data
 
 
@@ -255,27 +255,31 @@ async def read_ws_frame(reader: asyncio.StreamReader, writer: Optional[asyncio.S
             opcode = header[0] & 0b00001111
             masked = bool(header[1] & 0b10000000)
             payload_len = header[1] & 0b01111111
-            
+
             if payload_len == 126:
                 payload_len = struct.unpack('!H', await reader.readexactly(2))[0]
             elif payload_len == 127:
                 payload_len = struct.unpack('!Q', await reader.readexactly(8))[0]
-            
+
             if payload_len > MAX_WS_FRAME_SIZE:
                 logger.error(f"Frame too large: {payload_len}")
                 return None
-            
+
             masking_key = await reader.readexactly(4) if masked else None
             payload = await reader.readexactly(payload_len)
-            
+
             if masked and masking_key:
-                payload = bytes(payload[i] ^ masking_key[i % 4] for i in range(payload_len))
-            
+                ba = bytearray(payload)
+                mk = masking_key
+                for i in range(payload_len):
+                    ba[i] ^= mk[i & 3]
+                payload = bytes(ba)
+
             if opcode in [0x0, 0x1, 0x2]:  # Text, Binary, Continuation
                 return payload
             elif opcode == 0x9:  # Ping
                 if writer and not writer.is_closing():
-                    writer.write(create_ws_frame(payload, opcode=0xA, masked=True)) 
+                    writer.write(create_ws_frame(payload, opcode=0xA, masked=True))
                     await writer.drain()
                 continue
             elif opcode == 0xA:  # Pong
@@ -294,60 +298,59 @@ async def read_ws_frame(reader: asyncio.StreamReader, writer: Optional[asyncio.S
 async def ws_forward(ws_reader: asyncio.StreamReader, ws_writer: asyncio.StreamWriter,
                       tcp_reader: asyncio.StreamReader, tcp_writer: asyncio.StreamWriter,
                       client_side: bool, config: Config):
-    # [Optimize] Use asyncio.wait to prevent zombie connections
-    
-    stats.add_conn()
+
+    await stats.add_conn()
 
     async def transfer(reader, writer, is_ws_out: bool):
         pending = 0
         try:
             while True:
                 if is_ws_out:
-                    # TCP -> WebSocket (Data going UP/DOWN depending on perspective)
-                    data = await reader.read(config.buffer_size)
+                    # TCP -> WebSocket
+                    try:
+                        data = await asyncio.wait_for(reader.read(config.buffer_size), timeout=config.connection_timeout)
+                    except asyncio.TimeoutError:
+                        break  # Idle connection timeout
                     if not data: break
                     if writer.is_closing(): break
-                    
-                    # [Optimize] Zero-copy for unmasked frames
-                    # Note: Client always masks, Server does not. 
-                    # If client_side=True (we are the client), we MUST mask.
+
                     should_mask = client_side
-                    
+
                     if not should_mask:
-                        # Direct write: Header then Payload
                         header = get_ws_header(len(data), opcode=0x2, masked=False)
-                        writer.write(header)
-                        writer.write(data)
+                        writer.write(header + data)
                     else:
-                        # Masking still requires copy/alloc loop
                         writer.write(create_ws_frame(data, opcode=0x2, masked=True))
-                        
+
                     if client_side:
                         stats.add_bytes(up=len(data))
                     else:
-                        # If we are server, tcp->ws is downstream data
                         stats.add_bytes(down=len(data))
-                        
+
                 else:
                     # WebSocket -> TCP
-                    data = await read_ws_frame(reader, writer=writer)
-                    if data is None or writer.is_closing(): break 
-                    if not data: continue 
+                    try:
+                        data = await asyncio.wait_for(read_ws_frame(reader, writer=writer), timeout=config.connection_timeout)
+                    except asyncio.TimeoutError:
+                        break  # Idle connection timeout
+                    if data is None or writer.is_closing(): break
+                    if not data: continue
                     writer.write(data)
-                    
+
                     if client_side:
-                         stats.add_bytes(down=len(data))
+                        stats.add_bytes(down=len(data))
                     else:
-                         stats.add_bytes(up=len(data))
-                
+                        stats.add_bytes(up=len(data))
+
                 pending += len(data)
-                
-                # Dynamic drain threshold? For now fixed.
+
                 if pending >= config.drain_threshold:
                     await writer.drain()
                     pending = 0
-        except Exception:
-             pass
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.debug(f"Transfer error: {e}")
         finally:
             try:
                 if pending > 0 and not writer.is_closing():
@@ -356,17 +359,16 @@ async def ws_forward(ws_reader: asyncio.StreamReader, ws_writer: asyncio.StreamW
 
     task_ws_to_tcp = asyncio.create_task(transfer(ws_reader, tcp_writer, is_ws_out=False))
     task_tcp_to_ws = asyncio.create_task(transfer(tcp_reader, ws_writer, is_ws_out=True))
-    
+
     try:
-        # Wait for EITHER task to finish. If one finishes (e.g. connection closed), cancel the other.
         done, pending = await asyncio.wait(
-            [task_ws_to_tcp, task_tcp_to_ws], 
+            [task_ws_to_tcp, task_tcp_to_ws],
             return_when=asyncio.FIRST_COMPLETED
         )
         for task in pending:
             task.cancel()
     finally:
-        stats.remove_conn()
+        await stats.remove_conn()
         await safe_close_streamwriter(ws_writer)
         await safe_close_streamwriter(tcp_writer)
 
@@ -375,7 +377,7 @@ async def connect_to_upstream(target: str, config: Config) -> Tuple[asyncio.Stre
     upstream_parts = urllib.parse.urlparse(config.upstream)
     server_host = upstream_parts.hostname
     server_port = upstream_parts.port
-    
+
     # Retry/Fallback parsing for certain formats
     if not server_host:
         try:
@@ -388,7 +390,7 @@ async def connect_to_upstream(target: str, config: Config) -> Tuple[asyncio.Stre
             server_port = p2.port
             upstream_parts = p2
         except: pass
-            
+
     if not server_host:
         raise ValueError(f"Invalid upstream: {config.upstream}")
 
@@ -409,54 +411,72 @@ async def connect_to_upstream(target: str, config: Config) -> Tuple[asyncio.Stre
         else:
             ssl_context.check_hostname = True
             ssl_context.verify_mode = ssl.CERT_REQUIRED
-        
+
     logger.debug(f"Connecting to upstream {server_host}:{server_port} (SSL: {use_ssl})")
-    
-    sni_hostname = config.fakehost.split(':')[0] if config.fakehost else server_host
+
+    sni_hostname = sanitize_header(config.fakehost.split(':')[0] if config.fakehost else server_host)
 
     server_reader, server_writer = await asyncio.open_connection(
-        server_host, server_port, 
-        limit=config.stream_limit, 
+        server_host, server_port,
+        limit=config.stream_limit,
         ssl=ssl_context,
         server_hostname=sni_hostname if use_ssl else None
     )
 
     optimize_socket(server_writer, config, "WebSocket Tunnel")
-    
+
     handshake_host = config.fakehost if config.fakehost else (
-        server_host if (use_ssl and server_port == 443) or (not use_ssl and server_port == 80) 
+        server_host if (use_ssl and server_port == 443) or (not use_ssl and server_port == 80)
         else f"{server_host}:{server_port}"
     )
 
     handshake_path = upstream_parts.path or "/"
     ws_key = base64.b64encode(os.urandom(16)).decode()
     protocol_scheme = "https" if use_ssl else "http"
-    
+
     # [Security] Sanitize inputs
     handshake_host = sanitize_header(handshake_host)
     safe_user_agent = sanitize_header(config.user_agent)
-    
-    handshake = (
-        f"GET {handshake_path} HTTP/1.1\r\n"
-        f"Host: {handshake_host}\r\n"
-        f"Connection: Upgrade\r\n"
-        f"Pragma: no-cache\r\n"
-        f"Cache-Control: no-cache\r\n"
-        f"User-Agent: {safe_user_agent}\r\n"
-        f"Upgrade: websocket\r\n"
-        f"Origin: {protocol_scheme}://{sni_hostname}\r\n"
-        f"Sec-WebSocket-Version: 13\r\n"
-        f"Sec-WebSocket-Key: {ws_key}\r\n"
-        f"Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n\r\n"
-    ).encode()
+
+    # Randomize header order to avoid fixed fingerprint
+    accept_lang = random.choice([
+        "en-US,en;q=0.9",
+        "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+        "en-GB,en;q=0.9,en-US;q=0.8",
+        "zh-CN,zh;q=0.9,en;q=0.8",
+        "en-US,en;q=0.9,ja;q=0.8",
+    ])
+    accept_enc = "gzip, deflate, br, zstd"
+    sec_fetch = "websocket"
+
+    # Build handshake with randomized header order
+    remaining = [
+        f"Host: {handshake_host}",
+        f"Connection: Upgrade",
+        f"Pragma: no-cache",
+        f"Cache-Control: no-cache",
+        f"User-Agent: {safe_user_agent}",
+        f"Upgrade: websocket",
+        f"Origin: {protocol_scheme}://{sni_hostname}",
+        f"Sec-WebSocket-Version: 13",
+        f"Sec-WebSocket-Key: {ws_key}",
+        f"Accept-Language: {accept_lang}",
+        f"Accept-Encoding: {accept_enc}",
+        f"Sec-Fetch-Dest: {sec_fetch}",
+        f"Sec-Fetch-Mode: websocket",
+        f"Sec-Fetch-Site: cross-site",
+    ]
+    # Randomly include permessage-deflate extension (~67% chance) to reduce fingerprint
+    if random.random() < 0.67:
+        remaining.append(f"Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits")
+    random.shuffle(remaining)
+    handshake = (f"GET {handshake_path} HTTP/1.1\r\n"
+                 + "\r\n".join(remaining) + "\r\n\r\n").encode()
 
     server_writer.write(handshake)
     await server_writer.drain()
-    
+
     try:
-        # [Security] Fixed header size limit to prevent memory exhaustion
-        # We catch header size issues via the stream_limit set on open_connection
-        # but also set a timeout
         response_data = await asyncio.wait_for(server_reader.readuntil(CRLFCRLF), timeout=10.0)
     except asyncio.TimeoutError:
         raise ConnectionError("Upstream handshake timed out")
@@ -465,7 +485,7 @@ async def connect_to_upstream(target: str, config: Config) -> Tuple[asyncio.Stre
 
     if b"HTTP/1.1 101" not in response_data and b"HTTP/1.0 101" not in response_data:
         raise ConnectionError(f"Handshake failed: {response_data.decode(errors='ignore')[:100]}")
-        
+
     payload = bytearray(f"{target}\n".encode())
     payload.extend(b' ' * random.randint(1, 40))
 
@@ -473,13 +493,13 @@ async def connect_to_upstream(target: str, config: Config) -> Tuple[asyncio.Stre
         payload = config.crypto.transform(bytes(payload))
     server_writer.write(create_ws_frame(bytes(payload), opcode=0x2, masked=True))
     await server_writer.drain()
-    
+
     confirmation = await read_ws_frame(server_reader)
     if confirmation is None:
         raise ConnectionError("Server closed connection")
     if config.crypto:
         confirmation = config.crypto.transform(confirmation)
-    
+
     if not confirmation.startswith(b"OK"):
         raise ConnectionError(f"Server rejected")
     return server_reader, server_writer
@@ -492,16 +512,15 @@ conn_semaphore: Optional[asyncio.Semaphore] = None
 async def handle_server(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, config: Config):
     global conn_semaphore
     if conn_semaphore:
-        try:
-            await asyncio.wait_for(conn_semaphore.acquire(), timeout=5.0)
-        except asyncio.TimeoutError:
+        if conn_semaphore.locked():
             logger.warning(f"Max connections reached. Dropping {writer.get_extra_info('peername')}")
             writer.close()
             return
+        conn_semaphore.acquire()
 
     try:
         await asyncio.wait_for(
-            _handle_server_impl(reader, writer, config), 
+            _handle_server_impl(reader, writer, config),
             timeout=config.connection_timeout
         )
     except Exception as e:
@@ -524,12 +543,12 @@ async def _handle_server_impl(reader: asyncio.StreamReader, writer: asyncio.Stre
 
         headers = data.lower().split(CRLF)
         ws_key_line = next((h for h in headers if h.startswith(b'sec-websocket-key:')), None)
-        
+
         if not ws_key_line:
             writer.write(b'HTTP/1.1 400 Bad Request\r\n\r\n')
             await writer.drain()
             return
-            
+
         key_val = ws_key_line.split(b':', 1)[1].strip()
         accept_key = base64.b64encode(hashlib.sha1(key_val + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
         writer.write(
@@ -537,21 +556,21 @@ async def _handle_server_impl(reader: asyncio.StreamReader, writer: asyncio.Stre
             b"Connection: Upgrade\r\nSec-WebSocket-Accept: " + accept_key + CRLFCRLF
         )
         await writer.drain()
-        
+
         auth_data = await read_ws_frame(reader)
         if auth_data is None:
             return
-        
+
         # [Security] Auth Check
-        if config.crypto: 
+        if config.crypto:
             auth_data = config.crypto.transform(auth_data)
-        
-        if not auth_data: 
-             logger.warning(f"[Security] Empty auth data from {writer.get_extra_info('peername')}")
-             return
-            
+
+        if not auth_data:
+            logger.warning(f"[Security] Empty auth data from {writer.get_extra_info('peername')}")
+            return
+
         clean_auth = auth_data.decode(errors='ignore').strip()
-        
+
         # [Fix] IPv6 Support
         try:
             target_str = clean_auth.split(maxsplit=1)[0]
@@ -559,19 +578,19 @@ async def _handle_server_impl(reader: asyncio.StreamReader, writer: asyncio.Stre
         except Exception:
             logger.warning(f"[Security] Malformed target format: {clean_auth[:50]}")
             return
-        
+
         logger.info(f"[SERVER] Connect -> {target_host}:{target_port}")
         # Force IPv4 to prevent IPv6 routing issues on some VPS
         target_reader, target_writer = await asyncio.open_connection(
             target_host, int(target_port), limit=config.stream_limit, family=socket.AF_INET
         )
-        
+
         ok_payload = b"OK\n"
         if config.crypto:
             ok_payload = config.crypto.transform(ok_payload)
         writer.write(create_ws_frame(ok_payload, opcode=0x2, masked=False))
         await writer.drain()
-        
+
         await ws_forward(reader, writer, target_reader, target_writer, client_side=False, config=config)
     finally:
         await safe_close_streamwriter(target_writer)
@@ -582,11 +601,11 @@ async def socks5_negotiate(reader: asyncio.StreamReader, writer: asyncio.StreamW
     await reader.readexactly(nmethods)
     writer.write(b'\x05\x00')
     await writer.drain()
-    
+
     ver, cmd, rsv, atyp = await reader.readexactly(4)
     if ver != 5 or cmd != 1:
         raise ConnectionError("Invalid SOCKS5")
-    
+
     if atyp == 1:
         target_host = socket.inet_ntop(socket.AF_INET, await reader.readexactly(4))
     elif atyp == 3:
@@ -595,7 +614,7 @@ async def socks5_negotiate(reader: asyncio.StreamReader, writer: asyncio.StreamW
         target_host = socket.inet_ntop(socket.AF_INET6, await reader.readexactly(16))
     else:
         raise ConnectionError(f"Unsupported ATYP: {atyp}")
-        
+
     target_port = str(struct.unpack('!H', await reader.readexactly(2))[0])
     return target_host, target_port
 
@@ -603,17 +622,16 @@ async def socks5_negotiate(reader: asyncio.StreamReader, writer: asyncio.StreamW
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, config: Config):
     global conn_semaphore
     if conn_semaphore:
-        try:
-            await asyncio.wait_for(conn_semaphore.acquire(), timeout=5.0)
-        except asyncio.TimeoutError:
+        if conn_semaphore.locked():
             writer.close()
             return
+        conn_semaphore.acquire()
 
     peername = writer.get_extra_info('peername')
     logger.info(f"[CLIENT] Connection from {peername}")
     try:
         await asyncio.wait_for(
-            _handle_client_impl(reader, writer, config), 
+            _handle_client_impl(reader, writer, config),
             timeout=config.connection_timeout
         )
     except Exception as e:
@@ -636,7 +654,7 @@ async def _handle_client_impl(reader: asyncio.StreamReader, writer: asyncio.Stre
             return
 
         target_host, target_port, full_initial_request = "", "", b""
-        
+
         if initial_byte == b'\x05':
             is_socks5 = True
             target_host, target_port = await socks5_negotiate(reader, writer)
@@ -650,7 +668,7 @@ async def _handle_client_impl(reader: asyncio.StreamReader, writer: asyncio.Stre
                 rest_of_line = await asyncio.wait_for(reader.readuntil(CRLF), timeout=10.0)
             except asyncio.LimitOverrunError:
                 return
-                
+
             request_line_data = initial_byte + rest_of_line
             try:
                 request_line = request_line_data.decode('utf-8').strip()
@@ -681,11 +699,11 @@ async def _handle_client_impl(reader: asyncio.StreamReader, writer: asyncio.Stre
 
         if not target_host:
             return
-            
+
         if config.block_local and is_local_target(target_host):
             logger.warning(f"[CLIENT] Blocked local traffic attempt: {target_host}:{target_port}")
             return
-        
+
         try:
             server_reader, server_writer = await asyncio.wait_for(
                 connect_to_upstream(f"{target_host}:{target_port}", config), timeout=30.0
@@ -702,7 +720,7 @@ async def _handle_client_impl(reader: asyncio.StreamReader, writer: asyncio.Stre
         if is_socks5:
             writer.write(b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00')
             await writer.drain()
-        elif not full_initial_request: 
+        elif not full_initial_request:
             writer.write(b'HTTP/1.1 200 Connection Established\r\n\r\n')
             await writer.drain()
         else:
@@ -722,14 +740,13 @@ async def monitor_stats():
             await asyncio.sleep(3)
             current_up = stats.bytes_up
             current_down = stats.bytes_down
-            
-            # Calculate speed in MB/s
+
             up_speed = (current_up - last_up) / 3 / 1024 / 1024
             down_speed = (current_down - last_down) / 3 / 1024 / 1024
-            
+
             last_up = current_up
             last_down = current_down
-            
+
             msg = (f"\r{ANSI_GREY}[STATS] Conns: {stats.active_conns} | "
                    f"Up: {up_speed:.2f} MB/s | Down: {down_speed:.2f} MB/s{ANSI_RESET}")
             sys.stdout.write(msg)
@@ -745,16 +762,14 @@ async def main_async(config: Config):
     loop = asyncio.get_running_loop()
     loop.set_exception_handler(custom_exception_handler)
     handler = handle_server if config.upstream is None else handle_client
-    
-    # [Optimize] Start Statistics Monitor
+
     asyncio.create_task(monitor_stats())
-    
+
     try:
-        # [Security] Apply MAX_HEADER_SIZE limit to StreamReader created by server
         server = await asyncio.start_server(
-            lambda r, w: handler(r, w, config), 
-            config.proxy_host, config.proxy_port, 
-            limit=MAX_HEADER_SIZE 
+            lambda r, w: handler(r, w, config),
+            config.proxy_host, config.proxy_port,
+            limit=MAX_HEADER_SIZE
         )
     except OSError as e:
         logger.error(f"Could not bind to {config.proxy_host}:{config.proxy_port} - {e}")
@@ -762,7 +777,7 @@ async def main_async(config: Config):
 
     addrs = ', '.join(str(s.getsockname()) for s in server.sockets)
     mode = "Server" if not config.upstream else "Client (HTTP + SOCKS5)"
-    
+
     print(f"{ANSI_CYAN}PYWAY v{VERSION}{ANSI_RESET}")
     print(f"{ANSI_CYAN}{'-'*60}{ANSI_RESET}")
     print(f" [+] Mode:        {ANSI_GREEN}{mode}{ANSI_RESET}")
@@ -773,19 +788,21 @@ async def main_async(config: Config):
         verify_col = ANSI_GREEN if config.ssl_verify else ANSI_RED
         print(f" [+] SSL Verify:  {verify_col}{verify_str}{ANSI_RESET}")
         print(f" [+] User-Agent:  {ANSI_GREEN}Randomized (Sticky){ANSI_RESET}")
-    
+
     dns_col = ANSI_GREEN if "aiodns" in config.dns_info else ANSI_YELLOW
     print(f" [+] DNS:         {dns_col}{config.dns_info}{ANSI_RESET}")
 
-    # [Security] Warning if no key
     if config.crypto:
         auth_str = "Enabled (XOR)"
         auth_color = ANSI_GREEN
-    else:
-        auth_str = "DISABLED (Open Proxy Risk!)"
+    elif config.upstream is None:
+        auth_str = "DISABLED (--allow-open enabled — Open Proxy!)"
         auth_color = ANSI_RED
+    else:
+        auth_str = "DISABLED"
+        auth_color = ANSI_YELLOW
     print(f" [+] Auth:        {auth_color}{auth_str}{ANSI_RESET}")
-    
+
     buf_info = f"{config.buffer_size//1024} KB"
     if config.socket_buffer:
         buf_info += f" (Socket: {config.socket_buffer} KB)"
@@ -794,7 +811,7 @@ async def main_async(config: Config):
 
     print(f"{ANSI_CYAN}{'-'*60}{ANSI_RESET}")
     print(f"{ANSI_CYAN}[INFO] Proxy listening... (Press Ctrl+C to stop){ANSI_RESET}\n")
-    
+
     async with server:
         while True:
             await asyncio.sleep(1)
@@ -815,12 +832,26 @@ def main():
     parser.add_argument('--verify-ssl', action='store_true', help="Enable SSL Verification")
     parser.add_argument('--max-conn', type=int, default=1000, help="Max Concurrent Connections")
     parser.add_argument('--block-local', action='store_true', help="Drop local/LAN traffic (Client mode)")
+    parser.add_argument('--allow-open', action='store_true', help="Allow server mode without authentication key")
 
     args = parser.parse_args()
     logger.setLevel(getattr(logging, args.log.upper()))
-    
+
     buf = (args.W * 1024) if args.W else 65536
-    
+
+    # Validate upstream scheme
+    if args.up:
+        parsed = urllib.parse.urlparse(args.up)
+        scheme = parsed.scheme.lower()
+        if scheme and scheme not in ('ws', 'wss', 'http', 'https'):
+            print(f"Error: Invalid upstream scheme '{scheme}'. Must be ws://, wss://, http:// or https://")
+            sys.exit(1)
+
+    # Server mode without authentication is an open proxy risk
+    if args.up is None and not args.k and not args.allow_open:
+        print("Error: Server mode requires -k (authentication key) or --allow-open flag")
+        sys.exit(1)
+
     try:
         import aiodns
         dns_info = "aiodns (Async)"
@@ -828,19 +859,33 @@ def main():
         dns_info = "System (Default)"
 
     crypto_obj = Crypto(args.k) if args.k else None
-    
+
     ua_pool = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
-        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0",
-        "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/116.0"
+        # Chrome 136 - Windows/Mac/Linux
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+        # Firefox 138 - Windows/Mac/Linux
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:138.0) Gecko/20100101 Firefox/138.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.7; rv:138.0) Gecko/20100101 Firefox/138.0",
+        "Mozilla/5.0 (X11; Linux x86_64; rv:138.0) Gecko/20100101 Firefox/138.0",
+        # Edge 136
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0",
+        # Safari 18.4 - macOS
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Safari/605.1.15",
+        # Mobile: iOS Safari 18.4
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Mobile/15E148 Safari/604.1",
+        "Mozilla/5.0 (iPad; CPU OS 18_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Mobile/15E148 Safari/604.1",
+        # Mobile: Android Chrome 136
+        "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36",
+        "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36",
+        # Mobile: Android WebView (common in apps)
+        "Mozilla/5.0 (Linux; Android 14; Pixel 7 Build/AP2A.240405.002) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/136.0.0.0 Mobile Safari/537.36",
     ]
     sticky_ua = random.choice(ua_pool)
+
+    # [Fix] stream_limit must accommodate MAX_WS_FRAME_SIZE
+    stream_limit = max(buf * 16, MAX_WS_FRAME_SIZE + 1048576)
 
     config = Config(
         proxy_host=args.p.rsplit(':', 1)[0] or '0.0.0.0',
@@ -848,22 +893,19 @@ def main():
         upstream=args.up, fakehost=args.fakehost, crypto=crypto_obj,
         user_agent=sticky_ua,
         dns_info=dns_info,
-        buffer_size=buf, stream_limit=buf*16, drain_threshold=buf*4,
+        buffer_size=buf, stream_limit=stream_limit, drain_threshold=buf*4,
         tcp_nodelay=not args.no_tcp_nodelay, tcp_keepalive=not args.no_tcp_keepalive,
         socket_buffer=args.socket_buffer, connection_timeout=args.connection_timeout,
         ssl_verify=args.verify_ssl,
         max_connections=args.max_conn,
-        block_local=args.block_local
+        block_local=args.block_local,
+        allow_open=args.allow_open,
     )
-    
+
     if args.up is None:
-        for p in ['http_proxy', 'https_proxy', 'all_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']: 
+        for p in ['http_proxy', 'https_proxy', 'all_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']:
             os.environ.pop(p, None)
-    
-    # [Optimize] Removed WindowsSelectorEventLoopPolicy to allow >512 loops (Proactor)
-    # if sys.platform == 'win32':
-    #     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -871,12 +913,19 @@ def main():
         main_task = loop.create_task(main_async(config))
         loop.run_until_complete(main_task)
     except KeyboardInterrupt:
-        print(f"\n{ANSI_YELLOW}[INFO] Stopping proxy (Force Kill)...{ANSI_RESET}")
+        print(f"\n{ANSI_YELLOW}[INFO] Shutting down gracefully...{ANSI_RESET}")
+        main_task.cancel()
+        try:
+            loop.run_until_complete(main_task)
+        except asyncio.CancelledError:
+            pass
         tasks = asyncio.all_tasks(loop)
-        for task in tasks: task.cancel()
+        for task in tasks:
+            task.cancel()
         loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
     finally:
-        try: loop.close()
+        try:
+            loop.close()
         except: pass
         print(f"{ANSI_GREEN}[INFO] Proxy stopped.{ANSI_RESET}")
 
