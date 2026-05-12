@@ -15,7 +15,7 @@ import time
 from typing import Optional, Tuple
 from dataclasses import dataclass
 
-VERSION = "2.6.8G"
+VERSION = "2.6.9G"
 CRLF = b"\r\n"
 CRLFCRLF = b"\r\n\r\n"
 MAX_WS_FRAME_SIZE = 10 * 1024 * 1024  # [Security] Limit WS frame to 10MB
@@ -687,9 +687,9 @@ async def _handle_client_impl(reader: asyncio.StreamReader, writer: asyncio.Stre
                 parsed = urllib.parse.urlparse(target)
                 target_host, target_port = parsed.hostname, str(parsed.port or 80)
                 if not target_host:
-                    for line in headers.decode(errors='ignore').split('\r\n'):
-                        if line.lower().startswith('host:'):
-                            h = line.split(':', 1)[1].strip()
+                    for line in headers.split(b'\r\n'):
+                        if len(line) > 5 and line[:5].lower() == b'host:':
+                            h = line[5:].strip().decode(errors='ignore')
                             target_host, target_port = parse_host_port(h)
                             break
 

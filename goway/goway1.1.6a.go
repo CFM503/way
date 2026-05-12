@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	Version        = "1.1.5a"
+	Version        = "1.1.6a"
 	MaxWSFrameSize = 16 * 1024 * 1024 // 16MB
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -141,6 +141,7 @@ type Config struct {
 	UserAgent string
 	DNS       string
 	BufPool   *sync.Pool
+	TLSBase   *tls.Config
 }
 
 // --- Logger ---
@@ -572,6 +573,11 @@ func main() {
 	fmt.Printf(" [+] Buffer:      %s\n", bufInfo)
 	fmt.Printf(" [+] Max Conns:   %d\n", cfg.MaxConns)
 
+	cfg.TLSBase = &tls.Config{
+		InsecureSkipVerify: !cfg.VerifySSL,
+		MinVersion:         tls.VersionTLS12,
+	}
+
 	cfg.BufPool = &sync.Pool{
 		New: func() interface{} {
 			b := make([]byte, cfg.BufferSize)
@@ -888,12 +894,12 @@ func handleClient(localConn net.Conn, cfg *Config) {
 
 		initialPayload = fullData
 
-		reqStr := string(fullData)
-		lines := strings.Split(reqStr, "\r\n")
-		if len(lines) == 0 {
+		// Parse first line at byte level
+		firstLineEnd := bytes.Index(fullData, []byte("\r\n"))
+		if firstLineEnd < 0 {
 			return
 		}
-		reqLine := lines[0]
+		reqLine := string(fullData[:firstLineEnd])
 		parts := strings.Fields(reqLine)
 		if len(parts) < 2 {
 			return
@@ -926,9 +932,20 @@ func handleClient(localConn net.Conn, cfg *Config) {
 					targetPort = "80"
 				}
 			} else {
-				for _, l := range lines {
-					if strings.HasPrefix(strings.ToLower(l), "host:") {
-						val := strings.TrimSpace(strings.SplitN(l, ":", 2)[1])
+				// Search Host header at byte level
+				searchData := fullData[firstLineEnd+2:]
+				for len(searchData) > 0 {
+					lineEnd := bytes.Index(searchData, []byte("\r\n"))
+					var line []byte
+					if lineEnd < 0 {
+						line = searchData
+						searchData = nil
+					} else {
+						line = searchData[:lineEnd]
+						searchData = searchData[lineEnd+2:]
+					}
+					if len(line) > 5 && indexFold(line[:5], "host:") == 0 {
+						val := strings.TrimSpace(string(line[5:]))
 						if strings.Contains(val, ":") {
 							h, p, splitErr := net.SplitHostPort(val)
 							if splitErr != nil {
@@ -981,11 +998,8 @@ func handleClient(localConn net.Conn, cfg *Config) {
 	}
 
 	if wsURL.Scheme == "wss" || wsURL.Scheme == "https" {
-		conf := &tls.Config{
-			InsecureSkipVerify: !cfg.VerifySSL,
-			ServerName:         sniHostname,
-			MinVersion:         tls.VersionTLS12,
-		}
+		conf := cfg.TLSBase.Clone()
+		conf.ServerName = sniHostname
 		wsConn, err = tls.Dial("tcp", dialAddr, conf)
 	} else {
 		wsConn, err = net.Dial("tcp", dialAddr)
