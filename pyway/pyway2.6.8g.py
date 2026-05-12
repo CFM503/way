@@ -15,7 +15,7 @@ import time
 from typing import Optional, Tuple
 from dataclasses import dataclass
 
-VERSION = "2.6.7G"
+VERSION = "2.6.8G"
 CRLF = b"\r\n"
 CRLFCRLF = b"\r\n\r\n"
 MAX_WS_FRAME_SIZE = 10 * 1024 * 1024  # [Security] Limit WS frame to 10MB
@@ -62,10 +62,16 @@ class Crypto:
             return data
         kl = self.key_len
         kb = self.key_bytes
-        repeats = len(data) // kl + 1
-        key_stream = (kb * repeats)[:len(data)]
-        result = int.from_bytes(data, 'big') ^ int.from_bytes(key_stream, 'big')
-        return result.to_bytes(len(data), 'big')
+        CHUNK = 65536
+        out = bytearray(len(data))
+        for off in range(0, len(data), CHUNK):
+            chunk = data[off:off + CHUNK]
+            cs = len(chunk)
+            repeats = cs // kl + 1
+            ks = (kb * repeats)[:cs]
+            r = int.from_bytes(chunk, 'big') ^ int.from_bytes(ks, 'big')
+            out[off:off + cs] = r.to_bytes(cs, 'big')
+        return bytes(out)
 
 
 @dataclass
@@ -88,6 +94,8 @@ class Config:
     max_connections: int = 1000  # [Security] DoS Protection
     block_local: bool = False
     allow_open: bool = False
+    ssl_context_verified: Optional[ssl.SSLContext] = None
+    ssl_context_unverified: Optional[ssl.SSLContext] = None
 
 
 class ColoredFormatter(logging.Formatter):
@@ -398,15 +406,7 @@ async def connect_to_upstream(target: str, config: Config) -> Tuple[asyncio.Stre
 
     ssl_context = None
     if use_ssl:
-        ssl_context = ssl.create_default_context()
-        if not config.ssl_verify:
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
-            if hasattr(ssl, 'TLSVersion'):
-                ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
-        else:
-            ssl_context.check_hostname = True
-            ssl_context.verify_mode = ssl.CERT_REQUIRED
+        ssl_context = config.ssl_context_verified if config.ssl_verify else config.ssl_context_unverified
 
     logger.debug("Connecting to upstream %s:%s (SSL: %s)", server_host, server_port, use_ssl)
 
@@ -427,7 +427,7 @@ async def connect_to_upstream(target: str, config: Config) -> Tuple[asyncio.Stre
     )
 
     handshake_path = upstream_parts.path or "/"
-    ws_key = base64.b64encode(os.urandom(16)).decode()
+    ws_key = base64.b64encode(random.randbytes(16)).decode()
     protocol_scheme = "https" if use_ssl else "http"
 
     # [Security] Sanitize inputs
@@ -512,7 +512,7 @@ async def handle_server(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             logger.warning("Max connections reached. Dropping %s", writer.get_extra_info('peername'))
             writer.close()
             return
-        conn_semaphore.acquire()
+        await conn_semaphore.acquire()
 
     try:
         await asyncio.wait_for(
@@ -621,7 +621,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         if conn_semaphore.locked():
             writer.close()
             return
-        conn_semaphore.acquire()
+        await conn_semaphore.acquire()
 
     peername = writer.get_extra_info('peername')
     logger.info("[CLIENT] Connection from %s", peername)
@@ -883,6 +883,17 @@ def main():
     # [Fix] stream_limit must accommodate MAX_WS_FRAME_SIZE
     stream_limit = max(buf * 4, MAX_WS_FRAME_SIZE + 65536)
 
+    # Pre-create SSL contexts (avoid per-connection overhead)
+    ssl_ctx_verified = ssl.create_default_context()
+    ssl_ctx_verified.check_hostname = True
+    ssl_ctx_verified.verify_mode = ssl.CERT_REQUIRED
+
+    ssl_ctx_unverified = ssl.create_default_context()
+    ssl_ctx_unverified.check_hostname = False
+    ssl_ctx_unverified.verify_mode = ssl.CERT_NONE
+    if hasattr(ssl, 'TLSVersion'):
+        ssl_ctx_unverified.minimum_version = ssl.TLSVersion.TLSv1_2
+
     config = Config(
         proxy_host=args.p.rsplit(':', 1)[0] or '0.0.0.0',
         proxy_port=int(args.p.rsplit(':', 1)[1]),
@@ -896,6 +907,8 @@ def main():
         max_connections=args.max_conn,
         block_local=args.block_local,
         allow_open=args.allow_open,
+        ssl_context_verified=ssl_ctx_verified,
+        ssl_context_unverified=ssl_ctx_unverified,
     )
 
     if args.up is None:

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -27,7 +28,7 @@ import (
 )
 
 const (
-	Version        = "1.1.4a"
+	Version        = "1.1.5a"
 	MaxWSFrameSize = 16 * 1024 * 1024 // 16MB
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -95,9 +96,8 @@ func (c *Crypto) Transform(data []byte) []byte {
 		return data
 	}
 	out := make([]byte, len(data))
-	for i, b := range data {
-		out[i] = b ^ c.keyBytes[i%c.keyLen]
-	}
+	copy(out, data)
+	c.TransformInPlace(out)
 	return out
 }
 
@@ -392,27 +392,26 @@ func readWSFrame(r io.Reader, w io.Writer) ([]byte, error) {
 		payloadLen := uint64(head[1] & 0x7F)
 
 		if payloadLen == 126 {
-			b := make([]byte, 2)
-			if _, err := io.ReadFull(r, b); err != nil {
+			var b [2]byte
+			if _, err := io.ReadFull(r, b[:]); err != nil {
 				return nil, err
 			}
-			payloadLen = uint64(binary.BigEndian.Uint16(b))
+			payloadLen = uint64(binary.BigEndian.Uint16(b[:]))
 		} else if payloadLen == 127 {
-			b := make([]byte, 8)
-			if _, err := io.ReadFull(r, b); err != nil {
+			var b [8]byte
+			if _, err := io.ReadFull(r, b[:]); err != nil {
 				return nil, err
 			}
-			payloadLen = binary.BigEndian.Uint64(b)
+			payloadLen = binary.BigEndian.Uint64(b[:])
 		}
 
 		if payloadLen > uint64(MaxWSFrameSize) {
 			return nil, errors.New("frame too large")
 		}
 
-		var maskKey []byte
+		var maskKey [4]byte
 		if masked {
-			maskKey = make([]byte, 4)
-			if _, err := io.ReadFull(r, maskKey); err != nil {
+			if _, err := io.ReadFull(r, maskKey[:]); err != nil {
 				return nil, err
 			}
 		}
@@ -423,8 +422,16 @@ func readWSFrame(r io.Reader, w io.Writer) ([]byte, error) {
 		}
 
 		if masked {
-			for i := 0; i < len(payload); i++ {
-				payload[i] ^= maskKey[i&3]
+			mk := maskKey[:]
+			i := 0
+			for ; i+4 <= len(payload); i += 4 {
+				payload[i] ^= mk[0]
+				payload[i+1] ^= mk[1]
+				payload[i+2] ^= mk[2]
+				payload[i+3] ^= mk[3]
+			}
+			for ; i < len(payload); i++ {
+				payload[i] ^= mk[i&3]
 			}
 		}
 
@@ -672,21 +679,21 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 		wsConn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
 		return
 	}
-	headerStr := string(headerBytes)
-
-	if !strings.Contains(strings.ToLower(headerStr), "upgrade: websocket") {
+	if indexFold(headerBytes, "upgrade: websocket") < 0 {
 		logError("handleServer missing upgrade: websocket")
 		wsConn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
 		return
 	}
 
 	var wsKey string
-	for _, line := range strings.Split(headerStr, "\r\n") {
-		if strings.HasPrefix(strings.ToLower(line), "sec-websocket-key:") {
-			_, val, ok := strings.Cut(line, ":")
-			if ok {
-				wsKey = strings.TrimSpace(val)
+	for _, line := range bytes.Split(headerBytes, []byte(CRLF)) {
+		if len(line) > 18 && asciiToLower(line[0]) == 's' &&
+			indexFold(line[:18], "sec-websocket-key:") == 0 {
+			val := strings.TrimSpace(string(line[18:]))
+			if val != "" {
+				wsKey = val
 			}
+			break
 		}
 	}
 
@@ -1163,4 +1170,34 @@ func computeAcceptKey(challenge string) string {
 	h.Write([]byte(challenge))
 	h.Write([]byte("258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+
+func asciiToLower(b byte) byte {
+	if b >= 'A' && b <= 'Z' {
+		return b + 32
+	}
+	return b
+}
+
+func indexFold(data []byte, substr string) int {
+	if len(substr) == 0 {
+		return 0
+	}
+	first := asciiToLower(substr[0])
+	for i := 0; i <= len(data)-len(substr); i++ {
+		if asciiToLower(data[i]) != first {
+			continue
+		}
+		match := true
+		for j := 1; j < len(substr); j++ {
+			if asciiToLower(data[i+j]) != asciiToLower(substr[j]) {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
 }
