@@ -15,7 +15,7 @@ import time
 from typing import Optional, Tuple
 from dataclasses import dataclass
 
-VERSION = "2.7.3G"
+VERSION = "2.7.4G"
 CRLF = b"\r\n"
 CRLFCRLF = b"\r\n\r\n"
 MAX_WS_FRAME_SIZE = 10 * 1024 * 1024  # [Security] Limit WS frame to 10MB
@@ -106,7 +106,7 @@ class Crypto:
             ks = ek if cs == CHUNK_SIZE else ek[:cs]
             r = int.from_bytes(chunk, 'big', signed=False) ^ int.from_bytes(ks, 'big', signed=False)
             out[off:off + cs] = r.to_bytes(cs, 'big')
-        return bytes(out)
+        return out
 
 
 @dataclass
@@ -362,7 +362,6 @@ async def read_ws_frame(reader: asyncio.StreamReader, writer: Optional[asyncio.S
                     ks = (masking_key * (cs // 4 + 1))[:cs]
                     r = int.from_bytes(chunk, 'big') ^ int.from_bytes(ks, 'big')
                     payload[off:off + cs] = r.to_bytes(cs, 'big')
-                payload = bytes(payload)
 
             if opcode in [0x0, 0x1, 0x2]:  # Text, Binary, Continuation
                 return payload
@@ -406,8 +405,7 @@ async def ws_forward(ws_reader: asyncio.StreamReader, ws_writer: asyncio.StreamW
                     should_mask = client_side
 
                     if not should_mask:
-                        writer.write(get_ws_header(len(data), opcode=0x2, masked=False))
-                        writer.write(data)
+                        write_ws_frame_direct(writer, data, opcode=0x2, masked=False)
                     else:
                         writer.write(create_ws_frame(data, opcode=0x2, masked=True))
 
@@ -565,9 +563,9 @@ async def connect_to_upstream(target: str, config: Config) -> Tuple[asyncio.Stre
     payload.extend(b' ' * random.randint(1, 40))
 
     if config.crypto:
-        payload = config.crypto.transform(bytes(payload))  # returns bytes
+        payload = config.crypto.transform(payload)
     else:
-        payload = bytes(payload)  # single conversion
+        payload = bytes(payload)
     server_writer.write(create_ws_frame(payload, opcode=0x2, masked=True))
     await server_writer.drain()
 

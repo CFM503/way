@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	Version        = "1.1.10a"
+	Version        = "1.1.11a"
 	MaxWSFrameSize = 16 * 1024 * 1024 // 16MB
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -90,10 +90,7 @@ func NewCrypto(key string) *Crypto {
 	hash := sha256.Sum256([]byte(key))
 	kl := len(hash)
 	// Pre-expand key to cryptoChunkSize for single-loop bulk XOR
-	ek := make([]byte, cryptoChunkSize)
-	for i := 0; i < cryptoChunkSize; i += kl {
-		copy(ek[i:], hash[:])
-	}
+	ek := bytes.Repeat(hash[:], cryptoChunkSize/kl+1)[:cryptoChunkSize]
 	return &Crypto{
 		keyBytes:    hash[:],
 		expandedKey: ek,
@@ -419,7 +416,7 @@ func readUntilCRLFCRLF(br *bufio.Reader) ([]byte, error) {
 	var buf bytes.Buffer
 	buf.Grow(1024)
 	for {
-		line, err := br.ReadBytes('\n')
+		line, err := br.ReadSlice('\n')
 		if err != nil {
 			return nil, err
 		}
@@ -738,7 +735,7 @@ func handleConnection(conn net.Conn, cfg *Config) {
 // --- Server Mode ---
 func handleServer(wsConn net.Conn, cfg *Config) {
 	logDebug("handleServer started for %v", wsConn.RemoteAddr())
-	br := bufio.NewReader(wsConn)
+	br := bufio.NewReaderSize(wsConn, MaxHeaderSize)
 	wsTCPConn := extractTCPConn(wsConn) // cached for tight-loop deadline sets
 
 	headerBytes, err := readUntilCRLFCRLF(br)
@@ -788,8 +785,11 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 		cfg.Crypto.TransformInPlace(authData)
 	}
 
-	targetStr := strings.TrimSpace(string(authData))
-	targetStr = strings.Fields(targetStr)[0]
+	targetBytes := bytes.TrimSpace(authData)
+	if idx := bytes.IndexByte(targetBytes, ' '); idx >= 0 {
+		targetBytes = targetBytes[:idx]
+	}
+	targetStr := string(targetBytes)
 
 	logDebug("handleServer targetStr: %s", targetStr)
 
@@ -959,20 +959,16 @@ func handleClient(localConn net.Conn, cfg *Config) {
 			cfg.HeaderBufPool.Put(restPtr)
 			return
 		}
-		fullData := make([]byte, 1+n)
-		copy(fullData, buf)
-		copy(fullData[1:], restBuf[:n])
-		cfg.HeaderBufPool.Put(restPtr)
-		initialPayload = fullData
-
-		// Parse first line at byte level
-		firstLineEnd := bytes.Index(fullData, []byte("\r\n"))
+		// Parse first line from restBuf (avoids fullData alloc for CONNECT)
+		firstLineEnd := bytes.Index(restBuf[:n], []byte("\r\n"))
 		if firstLineEnd < 0 {
+			cfg.HeaderBufPool.Put(restPtr)
 			return
 		}
-		reqLine := string(fullData[:firstLineEnd])
+		reqLine := string(buf[0]) + string(restBuf[:firstLineEnd])
 		parts := strings.Fields(reqLine)
 		if len(parts) < 2 {
+			cfg.HeaderBufPool.Put(restPtr)
 			return
 		}
 		method := parts[0]
@@ -982,13 +978,20 @@ func handleClient(localConn net.Conn, cfg *Config) {
 			if strings.Contains(urlPart, ":") {
 				h, p, splitErr := net.SplitHostPort(urlPart)
 				if splitErr != nil {
+					cfg.HeaderBufPool.Put(restPtr)
 					return
 				}
 				targetHost = h
 				targetPort = p
 			}
+			cfg.HeaderBufPool.Put(restPtr)
 			initialPayload = nil
 		} else {
+			fullData := make([]byte, 1+n)
+			copy(fullData, buf)
+			copy(fullData[1:], restBuf[:n])
+			cfg.HeaderBufPool.Put(restPtr)
+			initialPayload = fullData
 			u, err := url.Parse(urlPart)
 			if err == nil && u.Host != "" {
 				if strings.Contains(u.Host, ":") {
@@ -1004,7 +1007,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 				}
 			} else {
 				// Search Host header at byte level
-				searchData := fullData[firstLineEnd+2:]
+				searchData := fullData[firstLineEnd+3:]
 				for len(searchData) > 0 {
 					lineEnd := bytes.Index(searchData, []byte("\r\n"))
 					var line []byte
@@ -1088,7 +1091,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 	localTCPConn := extractTCPConn(localConn)
 	wsTCPConn := extractTCPConn(wsConn)
 
-	br := bufio.NewReader(wsConn)
+	br := bufio.NewReaderSize(wsConn, MaxHeaderSize)
 
 	path := wsURL.Path
 	if path == "" {

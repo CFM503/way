@@ -7,8 +7,8 @@
 Way Proxy 是一个**轻量级**、**高性能**的 HTTP/SOCKS5 转 WebSocket 代理工具，专为流媒体传输、高并发下载以及各种复杂网络环境设计。
 
 本项目包含两个语言的实现版本，它们具有相同的功能和参数用法：
-- 🐍 **Pyway**: 基于 Python `asyncio` 实现的异步高性能版本 (当前最新: v2.7.1g)。
-- 🐹 **Goway**: 基于 Go 语言实现的高并发、低延迟编译型版本 (当前最新: v1.1.8a)。
+- 🐍 **Pyway**: 基于 Python `asyncio` 实现的异步高性能版本 (当前最新: v2.7.4G)。
+- 🐹 **Goway**: 基于 Go 语言实现的高并发、低延迟编译型版本 (当前最新: v1.1.11a)。
 
 ---
 
@@ -222,7 +222,7 @@ server {
 
 ## 📊 性能优化记录
 
-> 以下记录了从 v1.1.3a / v2.6.6g 到 v1.1.8a / v2.7.1g 共 5 轮性能优化的详细变更。
+> 以下记录了从 v1.1.3a / v2.6.6g 到 v1.1.11a / v2.7.4G 共 6 轮性能优化的详细变更。
 > 每项优化均保持功能语义不变，仅改变内部实现。如需回退某项优化，可对照「优化前」代码恢复。
 
 ### 一、XOR 加密/解密优化
@@ -244,6 +244,7 @@ server {
 | 2.3 | R1 | Go | writeWSFrame 单次分配 | header/data分别写入，多次系统调用 | masked: 单次make+单次Write；unmasked: net.Buffers零拷贝 | 1次分配替代3次；内核可gather写入 | masked仍需拷贝data（需XOR原地修改） | 发送吞吐量 ~1.3x |
 | 2.4 | R5 | Go | createWSFrame XOR 4字节展开 | `for i := range payload { payload[i] ^= mk[i&3] }` | 4字节批量展开 `payload[i] ^= mk[0]; ... mk[3]` + 尾部处理 | 消除i&3位运算；与readWSFrame风格一致 | 代码1行→6行 | mask操作 ~1.5x |
 | 2.5 | R1 | Go | createWSFrame maskKey 复用 | 额外`make([]byte, 4)`分配maskKey | 复用frame内存 `mk := frame[len(hdr):len(hdr)+4]` | 零额外maskKey分配 | 无 | 每帧减少1次4字节分配 |
+| 2.6 | R6 | Py | read_ws_frame 去除unmask后bytes()拷贝 | unmask后将`bytearray`转为`bytes(payload)`二次分配 | 直接返回`bytearray`，调用方`.startswith()`/`.decode()`/`write()`均兼容 | 每帧省1次全帧拷贝 | 无 | 每帧 ~1 alloc |
 
 ### 三、Header 解析优化
 
@@ -255,6 +256,7 @@ server {
 | 3.4 | R4/5 | Py | header解析 data.find | `data.lower().split(CRLF)` 全文小写+split为list + generator遍历 | `data.lower().find(b'sec-websocket-key:')` 直接定位 + `data.find(CRLF,idx)` 截取 | 消除list分配(N个bytes对象)；O(n)单次扫描 | data.lower()仍全文小写 | header解析 ~2-3x |
 | 3.5 | R3 | Py | Host header字节级前缀比较 | `line.lower().startswith(b'host:')` 全行小写 | `len(line)>5 and line[:5].lower() == b'host:'` 仅前5字节 | 仅对5字节小写转换（vs整行20-80字节） | 无 | Host提取 ~1.5x |
 | 3.6 | R3 | Go | HTTP首行 bytes.Index | `strings.Split(string(fullData), "\r\n")[0]` 分割全部行 | `bytes.Index(fullData, []byte("\r\n"))` 直接定位首个CRLF | 消除Split分配；仅扫描到第一个CRLF | 无 | 首行解析 ~2x |
+| 3.7 | R6 | Go | handleServer auth目标字节级解析 | `string(authData)` + `strings.TrimSpace` + `strings.Fields` 三次分配 | `bytes.TrimSpace` + `bytes.IndexByte` 字节级操作，仅最后做`string()` | 消除3次分配；避免authData全文拷贝 | 代码略长 | 每连接 ~3 allocs |
 
 ### 四、TLS/SSL 优化
 
@@ -270,6 +272,9 @@ server {
 | 5.1 | R1 | Go | sync.Pool 缓冲区池 | 无（或已有，未改动） | 64KB缓冲区通过sync.Pool复用 | 高并发避免频繁堆分配 | Pool中对象暂不GC | GC压力降低 |
 | 5.2 | R4 | Go | padding append循环 | `[]byte(strings.Repeat(" ", padLen))` 临时string+转换 | `for i<padLen { append(targetPayload, ' ') }` | 消除1次string+1次[]byte分配 | 微小循环开销 | 微小(~1μs) |
 | 5.3 | R2 | Py | random.randbytes 替代 os.urandom | `os.urandom(16)` 系统调用 | `random.randbytes(16)` 用户空间PRNG | 避免系统调用~5-10μs | 密码学安全性降低（仅WS Key，可接受） | ~5-10μs/连接 |
+| 5.4 | R6 | Go | Crypto.New bytes.Repeat | `copy`循环2048次迭代扩展65536字节key | `bytes.Repeat(hash, kl_repeats)[:65536]` 单次调用 | 内部指数拷贝~11次替代2048次copy | 无 | 启动 ~1ms |
+| 5.5 | R6 | Go | handleClient CONNECT延迟fullData分配 | CONNECT请求预先分配`fullData`(~1-8KB)然后丢弃 | 从`restBuf`直接解析首行，仅非CONNECT时分配 | CONNECT占HTTPS流量主要比例，每次省~1-8KB | 非CONNECT路径多1次小string拼接 | 每次CONNECT省1 alloc |
+| 5.6 | R6 | Py | Crypto.transform 去除bytes()拷贝 | `return bytes(out)` 将bytearray复制为新bytes | `return out` 直接返回bytearray | 每加密帧省1次全帧拷贝 | 调用方类型签名期望bytes（bytearray兼容） | 每加密帧省1 alloc |
 
 ### 六、并发/锁优化
 
@@ -286,18 +291,20 @@ server {
 | 7.2 | R5 | Go | 101检查 bytes.Contains | `strings.Contains(string(respBytes), "101")` []byte→string拷贝 | `bytes.Contains(respBytes, []byte("101"))` 原字节搜索 | 消除respBytes拷贝(100-200B) | 无 | 微小(~1μs) |
 | 7.3 | R5 | Go | isLocalTarget EqualFold | `strings.ToLower(host)` 每次分配新字符串 + Split | `strings.EqualFold(host, "localhost")` + `IndexByte` 替代Split | 非本地目标避免ToLower分配；172.x用IndexByte替代Split | 代码略长 | ~50ns/连接 |
 | 7.4 | R1 | Py | Statistics lock已去（同6.1） | - | - | - | - | - |
+| 7.5 | R6 | Go | readUntilCRLFCRLF ReadSlice | `br.ReadBytes('\n')` 每行堆分配新[]byte | `br.ReadSlice('\n')` 返回内部缓冲区引用，零分配 | HTTP握手6-12行，每连接省~10次堆分配 | 需配合7.6确保缓冲区足够 | ~10 allocs/连接 |
+| 7.6 | R6 | Go | bufio.NewReader→NewReaderSize | `bufio.NewReader(conn)` 默认4KB缓冲区 | `bufio.NewReaderSize(conn, MaxHeaderSize)` 8KB缓冲区 | 确保ReadSlice不会因行>4KB溢出 | 每连接多4KB常驻缓冲区 | 配合7.5 |
 
 ### 汇总统计
 
 | 类别 | 优化项数 | 影响路径 | 最大单项提升 |
 |------|---------|---------|-------------|
 | XOR加密/解密 | 5 | 每帧热路径 | Py int.from_bytes ~100x (R1) |
-| WebSocket帧处理 | 5 | 每帧热路径 | Go 栈分配减少GC ~3μs/帧 |
-| Header解析 | 6 | 每连接握手 | Go indexFold ~5x (R1) |
+| WebSocket帧处理 | 6 | 每帧热路径 | Go 栈分配减少GC ~3μs/帧 |
+| Header解析 | 7 | 每连接握手 | Go indexFold ~5x (R1) |
 | TLS/SSL | 2 | 每WSS连接 | Py 预创建SSL Context ~5-20ms |
-| 内存管理 | 3 | 每连接/每帧 | Py 64KB分块内存峰值降低64x |
+| 内存管理 | 6 | 每连接/每帧 | Py 64KB分块内存峰值降低64x |
 | 并发/锁 | 2 | 每帧热路径 | Py 去锁 ~200ns/帧 |
-| 日志/I-O | 3 | 每次调用 | Py lazy logging ~17μs/连接 |
+| 日志/I-O | 5 | 每次调用 | Py lazy logging ~17μs/连接 |
 
 ---
 
