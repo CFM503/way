@@ -635,7 +635,7 @@ func main() {
 
 	cfg.BufPool = &sync.Pool{
 		New: func() interface{} {
-			return make([]byte, cfg.BufferSize)
+			buf := make([]byte, cfg.BufferSize); return &buf
 		},
 	}
 
