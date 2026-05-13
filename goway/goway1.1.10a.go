@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	Version        = "1.1.9a"
+	Version        = "1.1.10a"
 	MaxWSFrameSize = 16 * 1024 * 1024 // 16MB
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
