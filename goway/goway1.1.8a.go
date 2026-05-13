@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	Version        = "1.1.8a"
+	Version        = "1.1.9a"
 	MaxWSFrameSize = 16 * 1024 * 1024 // 16MB
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -75,9 +75,12 @@ func (s *Statistics) AddBytes(up, down int64) {
 
 // --- Crypto ---
 
+const cryptoChunkSize = 65536 // 64KB pre-expanded key chunk
+
 type Crypto struct {
-	keyBytes []byte
-	keyLen   int
+	keyBytes    []byte
+	expandedKey []byte
+	keyLen      int
 }
 
 func NewCrypto(key string) *Crypto {
@@ -85,9 +88,16 @@ func NewCrypto(key string) *Crypto {
 		return nil
 	}
 	hash := sha256.Sum256([]byte(key))
+	kl := len(hash)
+	// Pre-expand key to cryptoChunkSize for single-loop bulk XOR
+	ek := make([]byte, cryptoChunkSize)
+	for i := 0; i < cryptoChunkSize; i += kl {
+		copy(ek[i:], hash[:])
+	}
 	return &Crypto{
-		keyBytes: hash[:],
-		keyLen:   len(hash),
+		keyBytes:    hash[:],
+		expandedKey: ek,
+		keyLen:      kl,
 	}
 }
 
@@ -105,16 +115,19 @@ func (c *Crypto) TransformInPlace(data []byte) {
 	if c == nil || len(data) == 0 {
 		return
 	}
-	key := c.keyBytes
-	kl := c.keyLen
+	ek := c.expandedKey
+	n := len(data)
 	i := 0
-	for ; i+kl <= len(data); i += kl {
-		for j := 0; j < kl; j++ {
-			data[i+j] ^= key[j]
-		}
+	// Bulk: 8-byte XOR against pre-expanded key — single loop, no nesting
+	for ; i+8 <= n; i += 8 {
+		off := i & (cryptoChunkSize - 1)
+		binary.NativeEndian.PutUint64(data[i:],
+			binary.NativeEndian.Uint64(data[i:])^
+				binary.NativeEndian.Uint64(ek[off:]))
 	}
-	for ; i < len(data); i++ {
-		data[i] ^= key[i%kl]
+	// Tail: byte-by-byte for remainder (< 8 bytes)
+	for ; i < n; i++ {
+		data[i] ^= ek[i&(cryptoChunkSize-1)]
 	}
 }
 
@@ -137,11 +150,12 @@ type Config struct {
 	AllowOpen      bool
 
 	// Internal derived
-	Crypto    *Crypto
-	UserAgent string
-	DNS       string
-	BufPool   *sync.Pool
-	TLSBase   *tls.Config
+	Crypto        *Crypto
+	UserAgent     string
+	DNS           string
+	BufPool       *sync.Pool
+	HeaderBufPool *sync.Pool
+	TLSBase       *tls.Config
 }
 
 // --- Logger ---
@@ -281,12 +295,11 @@ func createWSFrame(data []byte, opcode byte, masked bool) []byte {
 		rand.Read(mk)
 		payload := frame[len(hdr)+4:]
 		copy(payload, data)
+		maskWord := binary.NativeEndian.Uint32(mk)
 		i := 0
 		for ; i+4 <= len(payload); i += 4 {
-			payload[i] ^= mk[0]
-			payload[i+1] ^= mk[1]
-			payload[i+2] ^= mk[2]
-			payload[i+3] ^= mk[3]
+			binary.NativeEndian.PutUint32(payload[i:],
+				binary.NativeEndian.Uint32(payload[i:])^maskWord)
 		}
 		for ; i < len(payload); i++ {
 			payload[i] ^= mk[i&3]
@@ -297,23 +310,56 @@ func createWSFrame(data []byte, opcode byte, masked bool) []byte {
 }
 
 func writeWSFrame(w io.Writer, data []byte, opcode byte, masked bool) error {
-	header := getWSHeader(len(data), opcode, masked)
-	if masked {
-		maskKey := make([]byte, 4)
-		rand.Read(maskKey)
-		header = append(header, maskKey...)
-		frame := make([]byte, len(header)+len(data))
-		copy(frame, header)
-		copy(frame[len(header):], data)
-		for i := len(header); i < len(frame); i++ {
-			frame[i] ^= maskKey[(i-len(header))&3]
-		}
-		_, err := w.Write(frame)
+	if !masked {
+		header := getWSHeader(len(data), opcode, false)
+		bufs := net.Buffers{header, data}
+		_, err := bufs.WriteTo(w)
 		return err
 	}
 
-	bufs := net.Buffers{header, data}
-	_, err := bufs.WriteTo(w)
+	// Masked: single allocation for header + 4-byte maskKey + data
+	dl := len(data)
+	hdrLen := 2
+	if dl >= 65536 {
+		hdrLen = 10
+	} else if dl >= 126 {
+		hdrLen = 4
+	}
+	total := hdrLen + 4 + dl
+	frame := make([]byte, total)
+
+	// Build header in-place (avoids getWSHeader stack→heap escape)
+	frame[0] = 0b10000000 | opcode
+	if dl < 126 {
+		frame[1] = byte(dl) | 128
+	} else if dl < 65536 {
+		frame[1] = 126 | 128
+		binary.BigEndian.PutUint16(frame[2:4], uint16(dl))
+	} else {
+		frame[1] = 127 | 128
+		binary.BigEndian.PutUint64(frame[2:10], uint64(dl))
+	}
+
+	// Generate mask key directly into frame
+	mk := frame[hdrLen : hdrLen+4]
+	rand.Read(mk)
+	maskWord := binary.NativeEndian.Uint32(mk)
+
+	// Copy data after header+mask
+	copy(frame[hdrLen+4:], data)
+
+	// XOR mask data in-place (4-byte batches + tail)
+	payload := frame[hdrLen+4:]
+	i := 0
+	for ; i+4 <= dl; i += 4 {
+		binary.NativeEndian.PutUint32(payload[i:],
+			binary.NativeEndian.Uint32(payload[i:])^maskWord)
+	}
+	for ; i < dl; i++ {
+		payload[i] ^= mk[i&3]
+	}
+
+	_, err := w.Write(frame)
 	return err
 }
 
@@ -350,42 +396,45 @@ func optimizeSocket(conn net.Conn, cfg *Config) {
 	}
 }
 
-// setReadDeadline sets a read deadline on the underlying TCP connection
-// to detect idle/hung connections.
-func setReadDeadline(conn net.Conn, timeoutSec int) {
-	if timeoutSec <= 0 {
+// extractTCPConn extracts the underlying *net.TCPConn from a net.Conn
+// (unwrapping TLS if necessary). Returns nil if not backed by TCP.
+func extractTCPConn(conn net.Conn) *net.TCPConn {
+	if tlsConn, ok := conn.(*tls.Conn); ok {
+		tc, _ := tlsConn.NetConn().(*net.TCPConn)
+		return tc
+	}
+	tc, _ := conn.(*net.TCPConn)
+	return tc
+}
+
+// setTCPReadDeadline sets a read deadline directly on a pre-resolved *net.TCPConn.
+func setTCPReadDeadline(tcpConn *net.TCPConn, timeoutSec int) {
+	if tcpConn == nil || timeoutSec <= 0 {
 		return
 	}
-	var tcpConn *net.TCPConn
-	if tlsConn, ok := conn.(*tls.Conn); ok {
-		tcpConn, _ = tlsConn.NetConn().(*net.TCPConn)
-	} else {
-		tcpConn, _ = conn.(*net.TCPConn)
-	}
-	if tcpConn != nil {
-		tcpConn.SetReadDeadline(time.Now().Add(time.Duration(timeoutSec) * time.Second))
-	}
+	tcpConn.SetReadDeadline(time.Now().Add(time.Duration(timeoutSec) * time.Second))
 }
 
 func readUntilCRLFCRLF(br *bufio.Reader) ([]byte, error) {
-	res := make([]byte, 0, 512)
+	var buf bytes.Buffer
+	buf.Grow(1024)
 	for {
 		line, err := br.ReadBytes('\n')
 		if err != nil {
 			return nil, err
 		}
-		res = append(res, line...)
-		n := len(res)
+		buf.Write(line)
+		b := buf.Bytes()
+		n := len(b)
 		if n >= 4 &&
-			res[n-4] == '\r' && res[n-3] == '\n' &&
-			res[n-2] == '\r' && res[n-1] == '\n' {
-			break
+			b[n-4] == '\r' && b[n-3] == '\n' &&
+			b[n-2] == '\r' && b[n-1] == '\n' {
+			return b, nil
 		}
 		if n > MaxHeaderSize {
 			return nil, errors.New("header too large")
 		}
 	}
-	return res, nil
 }
 
 func readWSFrame(r io.Reader, w io.Writer) ([]byte, error) {
@@ -431,12 +480,11 @@ func readWSFrame(r io.Reader, w io.Writer) ([]byte, error) {
 
 		if masked {
 			mk := maskKey[:]
+			maskWord := binary.NativeEndian.Uint32(mk)
 			i := 0
 			for ; i+4 <= len(payload); i += 4 {
-				payload[i] ^= mk[0]
-				payload[i+1] ^= mk[1]
-				payload[i+2] ^= mk[2]
-				payload[i+3] ^= mk[3]
+				binary.NativeEndian.PutUint32(payload[i:],
+					binary.NativeEndian.Uint32(payload[i:])^maskWord)
 			}
 			for ; i < len(payload); i++ {
 				payload[i] ^= mk[i&3]
@@ -587,8 +635,14 @@ func main() {
 
 	cfg.BufPool = &sync.Pool{
 		New: func() interface{} {
-			b := make([]byte, cfg.BufferSize)
-			return &b
+			return make([]byte, cfg.BufferSize)
+		},
+	}
+
+	cfg.HeaderBufPool = &sync.Pool{
+		New: func() interface{} {
+			buf := make([]byte, MaxHeaderSize)
+			return &buf
 		},
 	}
 
@@ -685,6 +739,7 @@ func handleConnection(conn net.Conn, cfg *Config) {
 func handleServer(wsConn net.Conn, cfg *Config) {
 	logDebug("handleServer started for %v", wsConn.RemoteAddr())
 	br := bufio.NewReader(wsConn)
+	wsTCPConn := extractTCPConn(wsConn) // cached for tight-loop deadline sets
 
 	headerBytes, err := readUntilCRLFCRLF(br)
 	if err != nil {
@@ -722,7 +777,7 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 		return
 	}
 
-	setReadDeadline(wsConn, cfg.ConnTimeout)
+	setTCPReadDeadline(wsTCPConn, cfg.ConnTimeout)
 	authData, err := readWSFrame(br, wsConn)
 	if err != nil {
 		logError("handleServer read auth data err: %v", err)
@@ -748,6 +803,9 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 	optimizeSocket(wsConn, cfg)
 	optimizeSocket(targetConn, cfg)
 
+	// Resolve target TCPConn once for use in tight loop
+	targetTCPConn := extractTCPConn(targetConn)
+
 	logInfo("[SERVER] Connect -> %s", targetStr)
 
 	ok := []byte("OK\n")
@@ -765,7 +823,7 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 		var err error
 		defer func() { errCh <- err }()
 		for {
-			setReadDeadline(wsConn, cfg.ConnTimeout)
+			setTCPReadDeadline(wsTCPConn, cfg.ConnTimeout)
 			data, errRead := readWSFrame(br, wsConn)
 			if errRead != nil {
 				err = errRead
@@ -787,7 +845,7 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
 		for {
-			setReadDeadline(targetConn, cfg.ConnTimeout)
+			setTCPReadDeadline(targetTCPConn, cfg.ConnTimeout)
 			nr, errRead := targetConn.Read(buf)
 			if errRead != nil {
 				err = errRead
@@ -894,13 +952,17 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		targetPort = strconv.Itoa(int(portVal))
 	} else {
 		// HTTP Proxy
-		restBuf := make([]byte, 8192)
+		restPtr := cfg.HeaderBufPool.Get().(*[]byte)
+		restBuf := *restPtr
 		n, readErr := localConn.Read(restBuf)
 		if readErr != nil && n == 0 {
+			cfg.HeaderBufPool.Put(restPtr)
 			return
 		}
-		fullData := append(buf, restBuf[:n]...)
-
+		fullData := make([]byte, 1+n)
+		copy(fullData, buf)
+		copy(fullData[1:], restBuf[:n])
+		cfg.HeaderBufPool.Put(restPtr)
 		initialPayload = fullData
 
 		// Parse first line at byte level
@@ -1023,6 +1085,9 @@ func handleClient(localConn net.Conn, cfg *Config) {
 	optimizeSocket(localConn, cfg)
 	optimizeSocket(wsConn, cfg)
 
+	localTCPConn := extractTCPConn(localConn)
+	wsTCPConn := extractTCPConn(wsConn)
+
 	br := bufio.NewReader(wsConn)
 
 	path := wsURL.Path
@@ -1074,7 +1139,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		headers[i], headers[j] = headers[j], headers[i]
 	}
 
-	var handshakeBuf strings.Builder
+	var handshakeBuf bytes.Buffer
 	handshakeBuf.Grow(len(reqLine) + len(headers)*80 + 2)
 	handshakeBuf.WriteString(reqLine)
 	for _, h := range headers {
@@ -1083,11 +1148,11 @@ func handleClient(localConn net.Conn, cfg *Config) {
 	}
 	handshakeBuf.WriteString("\r\n")
 
-	if _, err := wsConn.Write([]byte(handshakeBuf.String())); err != nil {
+	if _, err := wsConn.Write(handshakeBuf.Bytes()); err != nil {
 		return
 	}
 
-	setReadDeadline(wsConn, cfg.ConnTimeout)
+	setTCPReadDeadline(wsTCPConn, cfg.ConnTimeout)
 	respBytes, err := readUntilCRLFCRLF(br)
 	if err != nil {
 		logError("Handshake read failed: %v", err)
@@ -1111,7 +1176,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		return
 	}
 
-	setReadDeadline(wsConn, cfg.ConnTimeout)
+	setTCPReadDeadline(wsTCPConn, cfg.ConnTimeout)
 	okFrame, err := readWSFrame(br, wsConn)
 	if err != nil {
 		logError("Read OK failed: %v", err)
@@ -1153,7 +1218,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
 		for {
-			setReadDeadline(localConn, cfg.ConnTimeout)
+			setTCPReadDeadline(localTCPConn, cfg.ConnTimeout)
 			nr, errRead := localConn.Read(buf)
 			if errRead != nil {
 				err = errRead
@@ -1173,7 +1238,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		var err error
 		defer func() { errCh <- err }()
 		for {
-			setReadDeadline(wsConn, cfg.ConnTimeout)
+			setTCPReadDeadline(wsTCPConn, cfg.ConnTimeout)
 			data, errRead := readWSFrame(br, wsConn)
 			if errRead != nil {
 				err = errRead

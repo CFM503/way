@@ -15,7 +15,7 @@ import time
 from typing import Optional, Tuple
 from dataclasses import dataclass
 
-VERSION = "2.7.1G"
+VERSION = "2.7.2G"
 CRLF = b"\r\n"
 CRLFCRLF = b"\r\n\r\n"
 MAX_WS_FRAME_SIZE = 10 * 1024 * 1024  # [Security] Limit WS frame to 10MB
@@ -51,25 +51,60 @@ class Statistics:
 
 stats = Statistics()
 
+# Module-level pools to avoid per-call allocation
+_UA_POOL = [
+    # Chrome 136 - Windows/Mac/Linux
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+    # Firefox 138 - Windows/Mac/Linux
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:138.0) Gecko/20100101 Firefox/138.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.7; rv:138.0) Gecko/20100101 Firefox/138.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:138.0) Gecko/20100101 Firefox/138.0",
+    # Edge 136
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0",
+    # Safari 18.4 - macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Safari/605.1.15",
+    # Mobile: iOS Safari 18.4
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (iPad; CPU OS 18_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Mobile/15E148 Safari/604.1",
+    # Mobile: Android Chrome 136
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36",
+    # Mobile: Android WebView (common in apps)
+    "Mozilla/5.0 (Linux; Android 14; Pixel 7 Build/AP2A.240405.002) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/136.0.0.0 Mobile Safari/537.36",
+]
+
+_ACCEPT_LANG_POOL = [
+    "en-US,en;q=0.9",
+    "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+    "en-GB,en;q=0.9,en-US;q=0.8",
+    "zh-CN,zh;q=0.9,en;q=0.8",
+    "en-US,en;q=0.9,ja;q=0.8",
+]
+
+
+CHUNK_SIZE = 65536  # 64KB chunk for XOR operations
 
 class Crypto:
+    __slots__ = ('key_bytes', 'key_len', 'expanded_key')
+
     def __init__(self, key: str):
         self.key_bytes = hashlib.sha256(key.encode()).digest()
         self.key_len = len(self.key_bytes)
+        repeats = CHUNK_SIZE // self.key_len + 1
+        self.expanded_key = (self.key_bytes * repeats)[:CHUNK_SIZE]
 
     def transform(self, data: bytes) -> bytes:
         if not data:
             return data
-        kl = self.key_len
-        kb = self.key_bytes
-        CHUNK = 65536
+        ek = self.expanded_key
         out = bytearray(len(data))
-        for off in range(0, len(data), CHUNK):
-            chunk = data[off:off + CHUNK]
-            cs = len(chunk)
-            repeats = cs // kl + 1
-            ks = (kb * repeats)[:cs]
-            r = int.from_bytes(chunk, 'big') ^ int.from_bytes(ks, 'big')
+        for off in range(0, len(data), CHUNK_SIZE):
+            cs = min(CHUNK_SIZE, len(data) - off)
+            chunk = data[off:off + cs]
+            ks = ek if cs == CHUNK_SIZE else ek[:cs]
+            r = int.from_bytes(chunk, 'big', signed=False) ^ int.from_bytes(ks, 'big', signed=False)
             out[off:off + cs] = r.to_bytes(cs, 'big')
         return bytes(out)
 
@@ -147,6 +182,30 @@ def custom_exception_handler(loop, context):
         return
 
     logger.debug("Loop exception: %s", context)
+
+
+def _ifind(data: bytes, sub: bytes) -> int:
+    """Case-insensitive byte search. Zero-allocation, O(n) scan."""
+    n, m = len(data), len(sub)
+    if m == 0:
+        return 0
+    sub_lower = sub.lower()
+    first = sub_lower[0]
+    for i in range(n - m + 1):
+        b = data[i]
+        if 65 <= b <= 90:  # A-Z → a-z
+            b += 32
+        if b != first:
+            continue
+        for j in range(1, m):
+            bj = data[i+j]
+            if 65 <= bj <= 90:
+                bj += 32
+            if bj != sub_lower[j]:
+                break
+        else:
+            return i
+    return -1
 
 
 def parse_host_port(address: str, default_port: int = 80) -> Tuple[str, str]:
@@ -239,25 +298,41 @@ def get_ws_header(data_len: int, opcode: int = 0x2, masked: bool = False) -> byt
 
 
 def create_ws_frame(data: bytes, opcode: int = 0x2, masked: bool = False) -> bytes:
-    header = get_ws_header(len(data), opcode, masked)
-
+    """Create a WebSocket frame with minimal allocations."""
+    dl = len(data)
+    hdr = get_ws_header(dl, opcode, masked)
     if masked:
         mask_int = random.getrandbits(32)
-        masking_key = mask_int.to_bytes(4, 'big')
-        header.extend(masking_key)
-        dl = len(data)
-        CHUNK = 65536
-        out = bytearray(dl)
-        for off in range(0, dl, CHUNK):
-            chunk = data[off:off + CHUNK]
-            cs = len(chunk)
-            repeats = cs // 4 + 1
-            ks = (masking_key * repeats)[:cs]
+        mk = mask_int.to_bytes(4, 'big')
+        total = len(hdr) + 4 + dl
+        frame = bytearray(total)
+        frame[:len(hdr)] = hdr
+        frame[len(hdr):len(hdr)+4] = mk
+        off = len(hdr) + 4
+        for pos in range(0, dl, CHUNK_SIZE):
+            cs = min(CHUNK_SIZE, dl - pos)
+            chunk = data[pos:pos + cs]
+            ks = (mk * (cs // 4 + 1))[:cs]
             r = int.from_bytes(chunk, 'big') ^ int.from_bytes(ks, 'big')
-            out[off:off + cs] = r.to_bytes(cs, 'big')
-        return bytes(header) + bytes(out)
+            frame[off+pos:off+pos+cs] = r.to_bytes(cs, 'big')
+        return bytes(frame)
+    # Unmasked: single allocation for header + data
+    total = len(hdr) + dl
+    frame = bytearray(total)
+    frame[:len(hdr)] = hdr
+    frame[len(hdr):] = data
+    return bytes(frame)
 
-    return bytes(header) + data
+
+def write_ws_frame_direct(writer: asyncio.StreamWriter, data: bytes,
+                           opcode: int = 0x2, masked: bool = False) -> None:
+    """Write a WebSocket frame avoiding header+data concatenation copy."""
+    header = get_ws_header(len(data), opcode, masked)
+    if masked:
+        writer.write(create_ws_frame(data, opcode, masked=True))
+    else:
+        writer.write(header)  # bytearray is bytes-like, no copy needed
+        writer.write(data)
 
 
 async def read_ws_frame(reader: asyncio.StreamReader, writer: Optional[asyncio.StreamWriter] = None) -> Optional[bytes]:
@@ -278,19 +353,16 @@ async def read_ws_frame(reader: asyncio.StreamReader, writer: Optional[asyncio.S
                 return None
 
             masking_key = await reader.readexactly(4) if masked else None
-            payload = await reader.readexactly(payload_len)
+            payload = bytearray(await reader.readexactly(payload_len))
 
             if masked and masking_key:
-                CHUNK = 65536
-                out = bytearray(payload_len)
-                for off in range(0, payload_len, CHUNK):
-                    chunk = payload[off:off + CHUNK]
-                    cs = len(chunk)
-                    repeats = cs // 4 + 1
-                    ks = (masking_key * repeats)[:cs]
+                for off in range(0, payload_len, CHUNK_SIZE):
+                    cs = min(CHUNK_SIZE, payload_len - off)
+                    chunk = payload[off:off + cs]
+                    ks = (masking_key * (cs // 4 + 1))[:cs]
                     r = int.from_bytes(chunk, 'big') ^ int.from_bytes(ks, 'big')
-                    out[off:off + cs] = r.to_bytes(cs, 'big')
-                payload = bytes(out)
+                    payload[off:off + cs] = r.to_bytes(cs, 'big')
+                payload = bytes(payload)
 
             if opcode in [0x0, 0x1, 0x2]:  # Text, Binary, Continuation
                 return payload
@@ -334,8 +406,8 @@ async def ws_forward(ws_reader: asyncio.StreamReader, ws_writer: asyncio.StreamW
                     should_mask = client_side
 
                     if not should_mask:
-                        header = get_ws_header(len(data), opcode=0x2, masked=False)
-                        writer.write(header + data)
+                        writer.write(get_ws_header(len(data), opcode=0x2, masked=False))
+                        writer.write(data)
                     else:
                         writer.write(create_ws_frame(data, opcode=0x2, masked=True))
 
@@ -448,13 +520,7 @@ async def connect_to_upstream(target: str, config: Config) -> Tuple[asyncio.Stre
     safe_user_agent = sanitize_header(config.user_agent)
 
     # Randomize header order to avoid fixed fingerprint
-    accept_lang = random.choice([
-        "en-US,en;q=0.9",
-        "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
-        "en-GB,en;q=0.9,en-US;q=0.8",
-        "zh-CN,zh;q=0.9,en;q=0.8",
-        "en-US,en;q=0.9,ja;q=0.8",
-    ])
+    accept_lang = random.choice(_ACCEPT_LANG_POOL)
     accept_enc = "gzip, deflate, br, zstd"
     sec_fetch = "websocket"
 
@@ -499,8 +565,10 @@ async def connect_to_upstream(target: str, config: Config) -> Tuple[asyncio.Stre
     payload.extend(b' ' * random.randint(1, 40))
 
     if config.crypto:
-        payload = config.crypto.transform(bytes(payload))
-    server_writer.write(create_ws_frame(bytes(payload), opcode=0x2, masked=True))
+        payload = config.crypto.transform(bytes(payload))  # returns bytes
+    else:
+        payload = bytes(payload)  # single conversion
+    server_writer.write(create_ws_frame(payload, opcode=0x2, masked=True))
     await server_writer.drain()
 
     confirmation = await read_ws_frame(server_reader)
@@ -550,7 +618,7 @@ async def _handle_server_impl(reader: asyncio.StreamReader, writer: asyncio.Stre
             logger.warning("[Security] Header too large, dropping connection.")
             return
 
-        idx = data.lower().find(b'sec-websocket-key:')
+        idx = _ifind(data, b'sec-websocket-key:')
         ws_key_line = None
         if idx >= 0:
             end = data.find(CRLF, idx)
@@ -874,29 +942,7 @@ def main():
 
     crypto_obj = Crypto(args.k) if args.k else None
 
-    ua_pool = [
-        # Chrome 136 - Windows/Mac/Linux
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-        # Firefox 138 - Windows/Mac/Linux
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:138.0) Gecko/20100101 Firefox/138.0",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.7; rv:138.0) Gecko/20100101 Firefox/138.0",
-        "Mozilla/5.0 (X11; Linux x86_64; rv:138.0) Gecko/20100101 Firefox/138.0",
-        # Edge 136
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0",
-        # Safari 18.4 - macOS
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Safari/605.1.15",
-        # Mobile: iOS Safari 18.4
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Mobile/15E148 Safari/604.1",
-        "Mozilla/5.0 (iPad; CPU OS 18_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Mobile/15E148 Safari/604.1",
-        # Mobile: Android Chrome 136
-        "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36",
-        "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36",
-        # Mobile: Android WebView (common in apps)
-        "Mozilla/5.0 (Linux; Android 14; Pixel 7 Build/AP2A.240405.002) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/136.0.0.0 Mobile Safari/537.36",
-    ]
-    sticky_ua = random.choice(ua_pool)
+    sticky_ua = random.choice(_UA_POOL)
 
     # [Fix] stream_limit must accommodate MAX_WS_FRAME_SIZE
     stream_limit = max(buf * 4, MAX_WS_FRAME_SIZE + 65536)
