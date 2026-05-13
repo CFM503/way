@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	Version        = "1.1.11a"
+	Version        = "1.1.12a"
 	MaxWSFrameSize = 16 * 1024 * 1024 // 16MB
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -96,16 +96,6 @@ func NewCrypto(key string) *Crypto {
 		expandedKey: ek,
 		keyLen:      kl,
 	}
-}
-
-func (c *Crypto) Transform(data []byte) []byte {
-	if c == nil || len(data) == 0 {
-		return data
-	}
-	out := make([]byte, len(data))
-	copy(out, data)
-	c.TransformInPlace(out)
-	return out
 }
 
 func (c *Crypto) TransformInPlace(data []byte) {
@@ -496,7 +486,7 @@ func readWSFrame(r io.Reader, w io.Writer) ([]byte, error) {
 		}
 		if opcode == 0x9 {
 			if w != nil {
-				if _, err := w.Write(createWSFrame(payload, 0xA, true)); err != nil {
+				if err := writeWSFrame(w, payload, 0xA, true); err != nil {
 					return nil, err
 				}
 			}
@@ -759,8 +749,8 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 		} else {
 			end += start
 		}
-		if val := strings.TrimSpace(string(headerBytes[start:end])); val != "" {
-			wsKey = val
+		if val := bytes.TrimSpace(headerBytes[start:end]); len(val) > 0 {
+			wsKey = string(val)
 		}
 	}
 
@@ -812,7 +802,7 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 	if cfg.Crypto != nil {
 		cfg.Crypto.TransformInPlace(ok)
 	}
-	if _, err := wsConn.Write(createWSFrame(ok, 0x2, false)); err != nil {
+	if err := writeWSFrame(wsConn, ok, 0x2, false); err != nil {
 		return
 	}
 
@@ -867,6 +857,11 @@ func isLocalTarget(host string) bool {
 		host == "127.0.0.1" || host == "::1" || host == "[::1]" || host == "0.0.0.0" {
 		return true
 	}
+	// Private IPv4 always starts with '1' (10.x, 172.16+, 192.168.x).
+	// Skip ToLower allocation for the common case of public hostnames.
+	if len(host) > 0 && host[0] != '1' {
+		return false
+	}
 	h := strings.ToLower(host)
 	if strings.HasPrefix(h, "192.168.") || strings.HasPrefix(h, "10.") {
 		return true
@@ -895,8 +890,8 @@ func handleClient(localConn net.Conn, cfg *Config) {
 	ver := buf[0]
 	if ver == 0x05 {
 		// SOCKS5
-		nmBuf := make([]byte, 1)
-		if _, err := localConn.Read(nmBuf); err != nil {
+		var nmBuf [1]byte
+		if _, err := localConn.Read(nmBuf[:]); err != nil {
 			return
 		}
 		nmethods := int(nmBuf[0])
@@ -909,8 +904,8 @@ func handleClient(localConn net.Conn, cfg *Config) {
 			return
 		}
 
-		reqHead := make([]byte, 4)
-		if _, err := localConn.Read(reqHead); err != nil {
+		var reqHead [4]byte
+		if _, err := localConn.Read(reqHead[:]); err != nil {
 			return
 		}
 		cmd := reqHead[1]
@@ -921,14 +916,14 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		}
 
 		if atyp == 0x01 {
-			ipBuf := make([]byte, 4)
-			if _, err := io.ReadFull(localConn, ipBuf); err != nil {
+			var ipBuf [4]byte
+			if _, err := io.ReadFull(localConn, ipBuf[:]); err != nil {
 				return
 			}
-			targetHost = net.IP(ipBuf).String()
+			targetHost = net.IP(ipBuf[:]).String()
 		} else if atyp == 0x03 {
-			lenBuf := make([]byte, 1)
-			if _, err := io.ReadFull(localConn, lenBuf); err != nil {
+			var lenBuf [1]byte
+			if _, err := io.ReadFull(localConn, lenBuf[:]); err != nil {
 				return
 			}
 			domainBuf := make([]byte, int(lenBuf[0]))
@@ -937,18 +932,18 @@ func handleClient(localConn net.Conn, cfg *Config) {
 			}
 			targetHost = string(domainBuf)
 		} else if atyp == 0x04 {
-			ipBuf := make([]byte, 16)
-			if _, err := io.ReadFull(localConn, ipBuf); err != nil {
+			var ipBuf [16]byte
+			if _, err := io.ReadFull(localConn, ipBuf[:]); err != nil {
 				return
 			}
-			targetHost = "[" + net.IP(ipBuf).String() + "]"
+			targetHost = "[" + net.IP(ipBuf[:]).String() + "]"
 		}
 
-		portBuf := make([]byte, 2)
-		if _, err := io.ReadFull(localConn, portBuf); err != nil {
+		var portBuf [2]byte
+		if _, err := io.ReadFull(localConn, portBuf[:]); err != nil {
 			return
 		}
-		portVal := binary.BigEndian.Uint16(portBuf)
+		portVal := binary.BigEndian.Uint16(portBuf[:])
 		targetPort = strconv.Itoa(int(portVal))
 	} else {
 		// HTTP Proxy
@@ -1175,7 +1170,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 	if cfg.Crypto != nil {
 		cfg.Crypto.TransformInPlace(targetPayload)
 	}
-	if _, err := wsConn.Write(createWSFrame(targetPayload, 0x2, true)); err != nil {
+	if err := writeWSFrame(wsConn, targetPayload, 0x2, true); err != nil {
 		return
 	}
 
@@ -1273,22 +1268,28 @@ func asciiToLower(b byte) byte {
 }
 
 func indexFold(data []byte, substr string) int {
-	if len(substr) == 0 {
+	n := len(substr)
+	if n == 0 {
 		return 0
 	}
-	first := asciiToLower(substr[0])
-	for i := 0; i <= len(data)-len(substr); i++ {
+	// Pre-lower substr so inner loop avoids asciiToLower on every comparison.
+	// Substr is ≤19 bytes — compiler stack-allocates this slice.
+	sub := []byte(substr)
+	for i := 0; i < n; i++ {
+		sub[i] = asciiToLower(sub[i])
+	}
+	first := sub[0]
+	for i := 0; i <= len(data)-n; i++ {
 		if asciiToLower(data[i]) != first {
 			continue
 		}
-		match := true
-		for j := 1; j < len(substr); j++ {
-			if asciiToLower(data[i+j]) != asciiToLower(substr[j]) {
-				match = false
+		j := 1
+		for ; j < n; j++ {
+			if asciiToLower(data[i+j]) != sub[j] {
 				break
 			}
 		}
-		if match {
+		if j == n {
 			return i
 		}
 	}

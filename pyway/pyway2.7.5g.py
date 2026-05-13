@@ -15,7 +15,7 @@ import time
 from typing import Optional, Tuple
 from dataclasses import dataclass
 
-VERSION = "2.7.4G"
+VERSION = "2.7.5G"
 CRLF = b"\r\n"
 CRLFCRLF = b"\r\n\r\n"
 MAX_WS_FRAME_SIZE = 10 * 1024 * 1024  # [Security] Limit WS frame to 10MB
@@ -95,17 +95,24 @@ class Crypto:
         repeats = CHUNK_SIZE // self.key_len + 1
         self.expanded_key = (self.key_bytes * repeats)[:CHUNK_SIZE]
 
-    def transform(self, data: bytes) -> bytes:
+    def transform(self, data: bytes) -> bytearray:
         if not data:
             return data
         ek = self.expanded_key
-        out = bytearray(len(data))
-        for off in range(0, len(data), CHUNK_SIZE):
-            cs = min(CHUNK_SIZE, len(data) - off)
-            chunk = data[off:off + cs]
-            ks = ek if cs == CHUNK_SIZE else ek[:cs]
-            r = int.from_bytes(chunk, 'big', signed=False) ^ int.from_bytes(ks, 'big', signed=False)
-            out[off:off + cs] = r.to_bytes(cs, 'big')
+        dl = len(data)
+        out = bytearray(dl)
+        if dl <= 4096:
+            # Direct loop for small frames — avoids big-int allocation overhead
+            for i in range(dl):
+                out[i] = data[i] ^ ek[i]
+        else:
+            # Big-int XOR per 64KB chunk for large frames (C-level bulk operation)
+            for off in range(0, dl, CHUNK_SIZE):
+                cs = min(CHUNK_SIZE, dl - off)
+                chunk = data[off:off + cs]
+                ks = ek if cs == CHUNK_SIZE else ek[:cs]
+                r = int.from_bytes(chunk, 'big', signed=False) ^ int.from_bytes(ks, 'big', signed=False)
+                out[off:off + cs] = r.to_bytes(cs, 'big')
         return out
 
 
@@ -315,13 +322,13 @@ def create_ws_frame(data: bytes, opcode: int = 0x2, masked: bool = False) -> byt
             ks = (mk * (cs // 4 + 1))[:cs]
             r = int.from_bytes(chunk, 'big') ^ int.from_bytes(ks, 'big')
             frame[off+pos:off+pos+cs] = r.to_bytes(cs, 'big')
-        return bytes(frame)
+        return frame
     # Unmasked: single allocation for header + data
     total = len(hdr) + dl
     frame = bytearray(total)
     frame[:len(hdr)] = hdr
     frame[len(hdr):] = data
-    return bytes(frame)
+    return frame
 
 
 def write_ws_frame_direct(writer: asyncio.StreamWriter, data: bytes,
@@ -365,10 +372,9 @@ async def read_ws_frame(reader: asyncio.StreamReader, writer: Optional[asyncio.S
 
             if opcode in [0x0, 0x1, 0x2]:  # Text, Binary, Continuation
                 return payload
-            elif opcode == 0x9:  # Ping
+            elif opcode == 0x9:  # Ping — pong flushed with next data drain
                 if writer and not writer.is_closing():
                     writer.write(create_ws_frame(payload, opcode=0xA, masked=True))
-                    await writer.drain()
                 continue
             elif opcode == 0xA:  # Pong
                 continue
@@ -564,8 +570,6 @@ async def connect_to_upstream(target: str, config: Config) -> Tuple[asyncio.Stre
 
     if config.crypto:
         payload = config.crypto.transform(payload)
-    else:
-        payload = bytes(payload)
     server_writer.write(create_ws_frame(payload, opcode=0x2, masked=True))
     await server_writer.drain()
 
@@ -636,6 +640,9 @@ async def _handle_server_impl(reader: asyncio.StreamReader, writer: asyncio.Stre
             b"Connection: Upgrade\r\nSec-WebSocket-Accept: " + accept_key + CRLFCRLF
         )
         await writer.drain()
+
+        # Raise read buffer limit from 8KB (handshake) to data-plane size
+        reader._limit = config.stream_limit
 
         auth_data = await read_ws_frame(reader)
         if auth_data is None:
@@ -806,6 +813,9 @@ async def _handle_client_impl(reader: asyncio.StreamReader, writer: asyncio.Stre
         else:
             server_writer.write(create_ws_frame(full_initial_request, opcode=0x2, masked=True))
             await server_writer.drain()
+
+        # Raise local reader buffer limit from 8KB to data-plane size
+        reader._limit = config.stream_limit
 
         await ws_forward(server_reader, server_writer, reader, writer, client_side=True, config=config)
     finally:

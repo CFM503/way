@@ -7,8 +7,8 @@
 Way Proxy 是一个**轻量级**、**高性能**的 HTTP/SOCKS5 转 WebSocket 代理工具，专为流媒体传输、高并发下载以及各种复杂网络环境设计。
 
 本项目包含两个语言的实现版本，它们具有相同的功能和参数用法：
-- 🐍 **Pyway**: 基于 Python `asyncio` 实现的异步高性能版本 (当前最新: v2.7.4G)。
-- 🐹 **Goway**: 基于 Go 语言实现的高并发、低延迟编译型版本 (当前最新: v1.1.11a)。
+- 🐍 **Pyway**: 基于 Python `asyncio` 实现的异步高性能版本 (当前最新: v2.7.5G)。
+- 🐹 **Goway**: 基于 Go 语言实现的高并发、低延迟编译型版本 (当前最新: v1.1.12a)。
 
 ---
 
@@ -222,7 +222,7 @@ server {
 
 ## 📊 性能优化记录
 
-> 以下记录了从 v1.1.3a / v2.6.6g 到 v1.1.11a / v2.7.4G 共 6 轮性能优化的详细变更。
+> 以下记录了从 v1.1.3a / v2.6.6g 到 v1.1.12a / v2.7.5G 共 7 轮性能优化的详细变更。
 > 每项优化均保持功能语义不变，仅改变内部实现。如需回退某项优化，可对照「优化前」代码恢复。
 
 ### 一、XOR 加密/解密优化
@@ -294,6 +294,32 @@ server {
 | 7.5 | R6 | Go | readUntilCRLFCRLF ReadSlice | `br.ReadBytes('\n')` 每行堆分配新[]byte | `br.ReadSlice('\n')` 返回内部缓冲区引用，零分配 | HTTP握手6-12行，每连接省~10次堆分配 | 需配合7.6确保缓冲区足够 | ~10 allocs/连接 |
 | 7.6 | R6 | Go | bufio.NewReader→NewReaderSize | `bufio.NewReader(conn)` 默认4KB缓冲区 | `bufio.NewReaderSize(conn, MaxHeaderSize)` 8KB缓冲区 | 确保ReadSlice不会因行>4KB溢出 | 每连接多4KB常驻缓冲区 | 配合7.5 |
 
+### 八、热路径优化 (R7)
+
+| # | 轮次 | 文件 | 优化项 | 优化前 | 优化后 | 好处 | 坏处 | 预期提升 |
+|---|------|------|--------|--------|--------|------|------|----------|
+| 8.1 | R7 | Go | createWSFrame→writeWSFrame (3处) | `wsConn.Write(createWSFrame(...))` 堆分配帧后写入 | `writeWSFrame(wsConn, ...)` 零拷贝/net.Buffers | unmasked帧零拷贝；masked帧单次分配 | 无 | unmasked零拷贝；masked省1 alloc |
+| 8.2 | R7 | Py | create_ws_frame 返回bytearray | `return bytes(frame)` bytearray→bytes二次拷贝 | `return frame` 直接返回bytearray | 每帧省1次整帧拷贝(1-64KB) | 无（bytearray兼容所有bytes-like接口） | 每帧省1 alloc |
+| 8.3 | R7 | Go | indexFold 预计算小写模式串 | `asciiToLower(substr[j])` 内层循环重复调用 | 预计算`[]byte(substr)`小写化，内层用切片索引 | 内层循环从函数调用→切片索引；消除重复ASCII转换 | 每次调用多1次≤19字节栈分配 | 握手header搜索 ~1.5x |
+| 8.4 | R7 | Py | Crypto.transform小帧快速路径 | ≤4KB帧仍走int.from_bytes大整数路径 | ≤4KB帧走直接bytearray XOR循环 | 避免Python大整数(~2KB+)分配开销 | >4KB帧走原路径 | 小帧XOR ~2-3x |
+
+### 九、内存分配优化 (R7)
+
+| # | 轮次 | 文件 | 优化项 | 优化前 | 优化后 | 好处 | 坏处 | 预期提升 |
+|---|------|------|--------|--------|--------|------|------|----------|
+| 9.1 | R7 | Go | isLocalTarget首字节快速拒绝 | `strings.ToLower(host)` 无条件分配新字符串 | `host[0] != '1'` 直接返回false | 99%连接(公网)跳过ToLower分配 | 无（私有IPv4首字节必为'1'） | ~50ns/连接 |
+| 9.2 | R7 | Go | wsKey提取 bytes.TrimSpace | `strings.TrimSpace(string(headerBytes))` 双重分配 | `bytes.TrimSpace(headerBytes)` 直接操作字节 | 省去[]byte→string→string链 | 无 | 省2 allocs/连接 |
+| 9.3 | R7 | Py | connect_to_upstream 移除bytes() | `payload = bytes(payload)` 多余bytearray→bytes拷贝 | 直接使用bytearray payload | 省1次payload拷贝(~20-60B) | 无 | 省1 alloc/连接 |
+| 9.4 | R7 | Go | SOCKS5栈数组替代堆分配 | `make([]byte, N)` 7处堆分配 | `var buf [N]byte` 栈分配 | 每SOCKS5连接省7次堆分配+GC扫描 | 无 | 每SOCKS5连接省7 allocs |
+| 9.5 | R7 | Go | 删除死代码Crypto.Transform | 未被调用的拷贝+委托方法(8行) | 移除 | 减少代码体积，消除混淆 | 无 | 无运行时影响 |
+
+### 十、缓冲与调度优化 (R7)
+
+| # | 轮次 | 文件 | 优化项 | 优化前 | 优化后 | 好处 | 坏处 | 预期提升 |
+|---|------|------|--------|--------|--------|------|------|----------|
+| 10.1 | R7 | Py | reader._limit提升 | 握手后8KB buffer限制持续到数据传输 | 握手后提升至stream_limit(~256KB+) | 减少传输阶段read系统调用次数 | 每连接多~248KB缓冲区 | 大帧吞吐提升 |
+| 10.2 | R7 | Py | Ping响应去drain | `await writer.drain()` 暂停读循环等待刷出 | 移除drain，pong随下一数据帧自然刷出 | 高吞吐时不阻塞数据读取循环 | pong延迟略增(毫秒级) | 减少读循环暂停 |
+
 ### 汇总统计
 
 | 类别 | 优化项数 | 影响路径 | 最大单项提升 |
@@ -305,6 +331,9 @@ server {
 | 内存管理 | 6 | 每连接/每帧 | Py 64KB分块内存峰值降低64x |
 | 并发/锁 | 2 | 每帧热路径 | Py 去锁 ~200ns/帧 |
 | 日志/I-O | 5 | 每次调用 | Py lazy logging ~17μs/连接 |
+| 热路径优化 (R7) | 4 | 每帧/每握手 | Py create_ws_frame去拷贝 ~1 alloc/帧 |
+| 内存分配优化 (R7) | 5 | 每连接 | Go isLocalTarget快速拒绝 ~50ns/连接 |
+| 缓冲与调度优化 (R7) | 2 | 每连接/数据传输 | Py reader._limit提升 吞吐量 ↑ |
 
 ---
 
