@@ -15,7 +15,7 @@ import time
 from typing import Optional, Tuple
 from dataclasses import dataclass
 
-VERSION = "2.7.5G"
+VERSION = "2.7.6G"
 CRLF = b"\r\n"
 CRLFCRLF = b"\r\n\r\n"
 MAX_WS_FRAME_SIZE = 10 * 1024 * 1024  # [Security] Limit WS frame to 10MB
@@ -287,20 +287,31 @@ async def safe_close_streamwriter(w: Optional[asyncio.StreamWriter]):
 
 
 def get_ws_header(data_len: int, opcode: int = 0x2, masked: bool = False) -> bytes:
-    header = bytearray()
     fin_bit = 0b10000000
-    header.append(fin_bit | opcode)
-
     mask_bit = 128 if masked else 0
 
     if data_len < 126:
-        header.append(data_len | mask_bit)
+        header = bytearray(2)
+        header[0] = fin_bit | opcode
+        header[1] = data_len | mask_bit
     elif data_len < 65536:
-        header.append(126 | mask_bit)
-        header.extend(struct.pack('!H', data_len))
+        header = bytearray(4)
+        header[0] = fin_bit | opcode
+        header[1] = 126 | mask_bit
+        header[2] = (data_len >> 8) & 0xFF
+        header[3] = data_len & 0xFF
     else:
-        header.append(127 | mask_bit)
-        header.extend(struct.pack('!Q', data_len))
+        header = bytearray(10)
+        header[0] = fin_bit | opcode
+        header[1] = 127 | mask_bit
+        header[2] = (data_len >> 56) & 0xFF
+        header[3] = (data_len >> 48) & 0xFF
+        header[4] = (data_len >> 40) & 0xFF
+        header[5] = (data_len >> 32) & 0xFF
+        header[6] = (data_len >> 24) & 0xFF
+        header[7] = (data_len >> 16) & 0xFF
+        header[8] = (data_len >> 8) & 0xFF
+        header[9] = data_len & 0xFF
     return header
 
 
@@ -360,9 +371,11 @@ async def read_ws_frame(reader: asyncio.StreamReader, writer: Optional[asyncio.S
                 return None
 
             masking_key = await reader.readexactly(4) if masked else None
-            payload = bytearray(await reader.readexactly(payload_len))
+            payload = await reader.readexactly(payload_len)
 
             if masked and masking_key:
+                # Only copy to bytearray when unmasking is needed
+                payload = bytearray(payload)
                 for off in range(0, payload_len, CHUNK_SIZE):
                     cs = min(CHUNK_SIZE, payload_len - off)
                     chunk = payload[off:off + cs]
@@ -528,29 +541,28 @@ async def connect_to_upstream(target: str, config: Config) -> Tuple[asyncio.Stre
     accept_enc = "gzip, deflate, br, zstd"
     sec_fetch = "websocket"
 
-    # Build handshake with randomized header order
+    # Build handshake as bytes directly (avoids f-string allocs)
     remaining = [
-        f"Host: {handshake_host}",
-        f"Connection: Upgrade",
-        f"Pragma: no-cache",
-        f"Cache-Control: no-cache",
-        f"User-Agent: {safe_user_agent}",
-        f"Upgrade: websocket",
-        f"Origin: {protocol_scheme}://{sni_hostname}",
-        f"Sec-WebSocket-Version: 13",
-        f"Sec-WebSocket-Key: {ws_key}",
-        f"Accept-Language: {accept_lang}",
-        f"Accept-Encoding: {accept_enc}",
-        f"Sec-Fetch-Dest: {sec_fetch}",
-        f"Sec-Fetch-Mode: websocket",
-        f"Sec-Fetch-Site: cross-site",
+        b"Host: " + handshake_host.encode(),
+        b"Connection: Upgrade",
+        b"Pragma: no-cache",
+        b"Cache-Control: no-cache",
+        b"User-Agent: " + safe_user_agent.encode(),
+        b"Upgrade: websocket",
+        b"Origin: " + protocol_scheme.encode() + b"://" + sni_hostname.encode(),
+        b"Sec-WebSocket-Version: 13",
+        b"Sec-WebSocket-Key: " + ws_key.encode(),
+        b"Accept-Language: " + accept_lang.encode(),
+        b"Accept-Encoding: " + accept_enc.encode(),
+        b"Sec-Fetch-Dest: " + sec_fetch.encode(),
+        b"Sec-Fetch-Mode: websocket",
+        b"Sec-Fetch-Site: cross-site",
     ]
     # Randomly include permessage-deflate extension (~67% chance) to reduce fingerprint
     if random.random() < 0.67:
-        remaining.append(f"Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits")
+        remaining.append(b"Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits")
     random.shuffle(remaining)
-    handshake = (f"GET {handshake_path} HTTP/1.1\r\n"
-                 + "\r\n".join(remaining) + "\r\n\r\n").encode()
+    handshake = b"GET " + handshake_path.encode() + b" HTTP/1.1\r\n" + b"\r\n".join(remaining) + b"\r\n\r\n"
 
     server_writer.write(handshake)
     await server_writer.drain()

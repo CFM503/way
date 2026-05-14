@@ -7,8 +7,8 @@
 Way Proxy 是一个**轻量级**、**高性能**的 HTTP/SOCKS5 转 WebSocket 代理工具，专为流媒体传输、高并发下载以及各种复杂网络环境设计。
 
 本项目包含两个语言的实现版本，它们具有相同的功能和参数用法：
-- 🐍 **Pyway**: 基于 Python `asyncio` 实现的异步高性能版本 (当前最新: v2.7.5G)。
-- 🐹 **Goway**: 基于 Go 语言实现的高并发、低延迟编译型版本 (当前最新: v1.1.12a)。
+- 🐍 **Pyway**: 基于 Python `asyncio` 实现的异步高性能版本 (当前最新: v2.7.6G)。
+- 🐹 **Goway**: 基于 Go 语言实现的高并发、低延迟编译型版本 (当前最新: v1.1.13a)。
 
 ---
 
@@ -222,7 +222,7 @@ server {
 
 ## 📊 性能优化记录
 
-> 以下记录了从 v1.1.3a / v2.6.6g 到 v1.1.12a / v2.7.5G 共 7 轮性能优化的详细变更。
+> 以下记录了从 v1.1.3a / v2.6.6g 到 v1.1.13a / v2.7.6G 共 8 轮性能优化的详细变更。
 > 每项优化均保持功能语义不变，仅改变内部实现。如需回退某项优化，可对照「优化前」代码恢复。
 
 ### 一、XOR 加密/解密优化
@@ -320,6 +320,25 @@ server {
 | 10.1 | R7 | Py | reader._limit提升 | 握手后8KB buffer限制持续到数据传输 | 握手后提升至stream_limit(~256KB+) | 减少传输阶段read系统调用次数 | 每连接多~248KB缓冲区 | 大帧吞吐提升 |
 | 10.2 | R7 | Py | Ping响应去drain | `await writer.drain()` 暂停读循环等待刷出 | 移除drain，pong随下一数据帧自然刷出 | 高吞吐时不阻塞数据读取循环 | pong延迟略增(毫秒级) | 减少读循环暂停 |
 
+### 十一、字符串与I/O优化 (R8)
+
+| # | 轮次 | 文件 | 优化项 | 优化前 | 优化后 | 好处 | 坏处 | 预期提升 |
+|---|------|------|--------|--------|--------|------|------|----------|
+| 11.1 | R8 | Go | handleServer握手 bytes.Buffer | `wsConn.Write([]byte(fmt.Sprintf("HTTP/1.1 101...%s...", acc)))` 双重分配 | `bytes.Buffer` 直接写入响应，单次Write | 消除fmt.Sprintf+[]byte()双重分配(~150B) | 4行→7行 | 省2 allocs/连接 |
+| 11.2 | R8 | Go | handleClient 7处fmt.Sprintf→字符串拼接 | `fmt.Sprintf("Host: %s", hostHeader)` 反射格式化 | `"Host: " + hostHeader` 编译期拼接 | 消除7次fmt.Sprintf分配(每次~50B) | 略长 | 省7 allocs/连接 |
+| 11.3 | R8 | Go | targetPayload fmt.Sprintf→拼接 | `fmt.Sprintf("%s:%s\n", host, port)` 格式化 | `host + ":" + port + "\n"` 直接拼接 | 消除fmt.Sprintf分配 | 无 | 省1 alloc/连接 |
+| 11.4 | R8 | Py | connect_to_upstream bytes握手 | f-string列表 → str.join → encode 多重分配 | bytes列表 → b"".join 直接构建bytes | 消除14个f-string分配 + join临时str + encode | 无 | 省~16 allocs/连接 |
+
+### 十二、缓冲与解析优化 (R8)
+
+| # | 轮次 | 文件 | 优化项 | 优化前 | 优化后 | 好处 | 坏处 | 预期提升 |
+|---|------|------|--------|--------|--------|------|------|----------|
+| 12.1 | R8 | Go | readUntilCRLFCRLF Grow预分配 | `buf.Grow(1024)` 1KB初始→多次扩容 | `buf.Grow(MaxHeaderSize)` 8KB一次性分配 | 避免header读取时bytes.Buffer内部多次扩容 | 每连接多7KB初始缓冲 | 省1-2次扩容/连接 |
+| 12.2 | R8 | Go | handleClient初始字节栈分配 | `buf := make([]byte, 1)` 堆分配 | `var buf [1]byte` 栈分配 | 省1次堆分配 | 无 | 省1 alloc/连接 |
+| 12.3 | R8 | Go | HTTP请求行字节级解析 | `string(buf[0])+string(restBuf)` 两次转换+拼接 + `strings.Fields` 切片分配 | `bytes.IndexByte` 字节级定位，直接提取method/urlPart | 消除1次拼接string + 1次Fields []string分配 | 代码略长 | 省~5 allocs/连接 |
+| 12.4 | R8 | Py | get_ws_header预分配+去struct.pack | `bytearray()` 空然后append/extend + `struct.pack('!H')` 临时bytes | 预分配bytearray(N) + 手动位操作 | 避免扩容 + 消除struct.pack临时对象 | 大长度手动位操作7行 | 省1-2 allocs/帧 |
+| 12.5 | R8 | Py | read_ws_frame非masked避免bytearray拷贝 | `bytearray(await readexactly(n))` 无差别bytes→bytearray拷贝 | masked时才创建bytearray；非masked直接返回bytes | 非masked帧省1次全帧拷贝(~1-64KB) | 返回类型从bytearray变为bytes（调用方兼容） | 非masked省1 alloc/帧 |
+
 ### 汇总统计
 
 | 类别 | 优化项数 | 影响路径 | 最大单项提升 |
@@ -334,6 +353,8 @@ server {
 | 热路径优化 (R7) | 4 | 每帧/每握手 | Py create_ws_frame去拷贝 ~1 alloc/帧 |
 | 内存分配优化 (R7) | 5 | 每连接 | Go isLocalTarget快速拒绝 ~50ns/连接 |
 | 缓冲与调度优化 (R7) | 2 | 每连接/数据传输 | Py reader._limit提升 吞吐量 ↑ |
+| 字符串与I/O优化 (R8) | 4 | 每连接/每握手 | Go 7处fmt.Sprintf消除 ~7 allocs/连接 |
+| 缓冲与解析优化 (R8) | 5 | 每连接/每帧 | Py get_ws_header预分配 ~2 allocs/帧 |
 
 ---
 

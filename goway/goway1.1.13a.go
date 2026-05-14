@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	Version        = "1.1.12a"
+	Version        = "1.1.13a"
 	MaxWSFrameSize = 16 * 1024 * 1024 // 16MB
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -404,7 +404,7 @@ func setTCPReadDeadline(tcpConn *net.TCPConn, timeoutSec int) {
 
 func readUntilCRLFCRLF(br *bufio.Reader) ([]byte, error) {
 	var buf bytes.Buffer
-	buf.Grow(1024)
+	buf.Grow(MaxHeaderSize)
 	for {
 		line, err := br.ReadSlice('\n')
 		if err != nil {
@@ -760,7 +760,12 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 	}
 
 	acc := computeAcceptKey(wsKey)
-	if _, err := wsConn.Write([]byte(fmt.Sprintf("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", acc))); err != nil {
+	var respBuf bytes.Buffer
+	respBuf.Grow(150)
+	respBuf.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ")
+	respBuf.WriteString(acc)
+	respBuf.WriteString("\r\n\r\n")
+	if _, err := wsConn.Write(respBuf.Bytes()); err != nil {
 		return
 	}
 
@@ -878,8 +883,8 @@ func isLocalTarget(host string) bool {
 
 // --- Client Mode ---
 func handleClient(localConn net.Conn, cfg *Config) {
-	buf := make([]byte, 1)
-	if _, err := localConn.Read(buf); err != nil {
+	var buf [1]byte
+	if _, err := localConn.Read(buf[:]); err != nil {
 		return
 	}
 
@@ -954,21 +959,28 @@ func handleClient(localConn net.Conn, cfg *Config) {
 			cfg.HeaderBufPool.Put(restPtr)
 			return
 		}
-		// Parse first line from restBuf (avoids fullData alloc for CONNECT)
+		// Parse first line byte-level (avoids string concat + Fields allocs)
 		firstLineEnd := bytes.Index(restBuf[:n], []byte("\r\n"))
 		if firstLineEnd < 0 {
 			cfg.HeaderBufPool.Put(restPtr)
 			return
 		}
-		reqLine := string(buf[0]) + string(restBuf[:firstLineEnd])
-		parts := strings.Fields(reqLine)
-		if len(parts) < 2 {
+		firstLine := restBuf[:firstLineEnd]
+		sp1 := bytes.IndexByte(firstLine, ' ')
+		if sp1 < 0 {
 			cfg.HeaderBufPool.Put(restPtr)
 			return
 		}
-		method := parts[0]
-		urlPart := parts[1]
-
+		rest := firstLine[sp1+1:]
+		sp2 := bytes.IndexByte(rest, ' ')
+		var urlBytes []byte
+		if sp2 >= 0 {
+			urlBytes = rest[:sp2]
+		} else {
+			urlBytes = rest
+		}
+		method := string(buf[0]) + string(firstLine[:sp1])
+		urlPart := string(urlBytes)
 		if method == "CONNECT" {
 			if strings.Contains(urlPart, ":") {
 				h, p, splitErr := net.SplitHostPort(urlPart)
@@ -983,7 +995,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 			initialPayload = nil
 		} else {
 			fullData := make([]byte, 1+n)
-			copy(fullData, buf)
+			copy(fullData, buf[:])
 			copy(fullData[1:], restBuf[:n])
 			cfg.HeaderBufPool.Put(restPtr)
 			initialPayload = fullData
@@ -1112,21 +1124,21 @@ func handleClient(localConn net.Conn, cfg *Config) {
 
 	secFetch := "websocket"
 
-	reqLine := fmt.Sprintf("GET %s HTTP/1.1\r\n", path)
+	reqLine := "GET " + path + " HTTP/1.1\r\n"
 	headers := []string{
-		fmt.Sprintf("Host: %s", hostHeader),
+		"Host: " + hostHeader,
 		"Connection: Upgrade",
 		"Pragma: no-cache",
 		"Cache-Control: no-cache",
-		fmt.Sprintf("User-Agent: %s", userAgent),
+		"User-Agent: " + userAgent,
 		"Upgrade: websocket",
-		fmt.Sprintf("Origin: %s://%s", protocolScheme, sniHostname),
+		"Origin: " + protocolScheme + "://" + sniHostname,
 		"Sec-WebSocket-Version: 13",
-		fmt.Sprintf("Sec-WebSocket-Key: %s", wsKeyStr),
+		"Sec-WebSocket-Key: " + wsKeyStr,
 		"Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits",
-		fmt.Sprintf("Accept-Language: %s", acceptLang),
+		"Accept-Language: " + acceptLang,
 		"Accept-Encoding: gzip, deflate, br, zstd",
-		fmt.Sprintf("Sec-Fetch-Dest: %s", secFetch),
+		"Sec-Fetch-Dest: " + secFetch,
 		"Sec-Fetch-Mode: websocket",
 		"Sec-Fetch-Site: cross-site",
 	}
@@ -1161,7 +1173,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		return
 	}
 
-	targetPayload := []byte(fmt.Sprintf("%s:%s\n", targetHost, targetPort))
+	targetPayload := []byte(targetHost + ":" + targetPort + "\n")
 	padLen := 1 + mrand.Intn(40)
 	for i := 0; i < padLen; i++ {
 		targetPayload = append(targetPayload, ' ')
