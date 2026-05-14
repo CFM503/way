@@ -28,11 +28,16 @@ import (
 )
 
 const (
-	Version        = "1.1.13a"
+	Version        = "1.1.14a"
 	MaxWSFrameSize = 16 * 1024 * 1024 // 16MB
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
 	CRLFCRLF       = "\r\n\r\n"
+)
+
+var (
+	okBytes = []byte("OK\n")
+	crlfB   = []byte{'\r', '\n'}
 )
 
 // ANSI colors
@@ -271,29 +276,6 @@ func getWSHeader(dataLen int, opcode byte, masked bool) []byte {
 		n = 10
 	}
 	return buf[:n]
-}
-
-func createWSFrame(data []byte, opcode byte, masked bool) []byte {
-	hdr := getWSHeader(len(data), opcode, masked)
-	if masked {
-		frame := make([]byte, len(hdr)+4+len(data))
-		copy(frame, hdr)
-		mk := frame[len(hdr) : len(hdr)+4]
-		rand.Read(mk)
-		payload := frame[len(hdr)+4:]
-		copy(payload, data)
-		maskWord := binary.NativeEndian.Uint32(mk)
-		i := 0
-		for ; i+4 <= len(payload); i += 4 {
-			binary.NativeEndian.PutUint32(payload[i:],
-				binary.NativeEndian.Uint32(payload[i:])^maskWord)
-		}
-		for ; i < len(payload); i++ {
-			payload[i] ^= mk[i&3]
-		}
-		return frame
-	}
-	return append(hdr, data...)
 }
 
 func writeWSFrame(w io.Writer, data []byte, opcode byte, masked bool) error {
@@ -743,7 +725,7 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 	var wsKey string
 	if idx := indexFold(headerBytes, "sec-websocket-key:"); idx >= 0 {
 		start := idx + 19
-		end := bytes.Index(headerBytes[start:], []byte("\r\n"))
+		end := bytes.Index(headerBytes[start:], crlfB)
 		if end < 0 {
 			end = len(headerBytes)
 		} else {
@@ -803,9 +785,13 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 
 	logInfo("[SERVER] Connect -> %s", targetStr)
 
-	ok := []byte("OK\n")
+	var ok []byte
 	if cfg.Crypto != nil {
+		ok = make([]byte, 3)
+		copy(ok, "OK\n")
 		cfg.Crypto.TransformInPlace(ok)
+	} else {
+		ok = okBytes
 	}
 	if err := writeWSFrame(wsConn, ok, 0x2, false); err != nil {
 		return
@@ -900,7 +886,13 @@ func handleClient(localConn net.Conn, cfg *Config) {
 			return
 		}
 		nmethods := int(nmBuf[0])
-		discard := make([]byte, nmethods)
+		var discard []byte
+		if nmethods <= 8 {
+			var dbuf [8]byte
+			discard = dbuf[:nmethods]
+		} else {
+			discard = make([]byte, nmethods)
+		}
 		if _, err := localConn.Read(discard); err != nil {
 			return
 		}
@@ -960,7 +952,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 			return
 		}
 		// Parse first line byte-level (avoids string concat + Fields allocs)
-		firstLineEnd := bytes.Index(restBuf[:n], []byte("\r\n"))
+		firstLineEnd := bytes.Index(restBuf[:n], crlfB)
 		if firstLineEnd < 0 {
 			cfg.HeaderBufPool.Put(restPtr)
 			return
@@ -1016,7 +1008,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 				// Search Host header at byte level
 				searchData := fullData[firstLineEnd+3:]
 				for len(searchData) > 0 {
-					lineEnd := bytes.Index(searchData, []byte("\r\n"))
+					lineEnd := bytes.Index(searchData, crlfB)
 					var line []byte
 					if lineEnd < 0 {
 						line = searchData
@@ -1104,11 +1096,11 @@ func handleClient(localConn net.Conn, cfg *Config) {
 	if path == "" {
 		path = "/"
 	}
-	wsKey := make([]byte, 16)
-	if _, err := rand.Read(wsKey); err != nil {
+	var wsKey [16]byte
+	if _, err := rand.Read(wsKey[:]); err != nil {
 		return
 	}
-	wsKeyStr := base64.StdEncoding.EncodeToString(wsKey)
+	wsKeyStr := base64.StdEncoding.EncodeToString(wsKey[:])
 
 	hostHeader := sanitizeHeader(wsHost)
 	if cfg.FakeHost != "" {

@@ -15,7 +15,7 @@ import time
 from typing import Optional, Tuple
 from dataclasses import dataclass
 
-VERSION = "2.7.6G"
+VERSION = "2.7.7G"
 CRLF = b"\r\n"
 CRLFCRLF = b"\r\n\r\n"
 MAX_WS_FRAME_SIZE = 10 * 1024 * 1024  # [Security] Limit WS frame to 10MB
@@ -402,69 +402,87 @@ async def read_ws_frame(reader: asyncio.StreamReader, writer: Optional[asyncio.S
         return None
 
 
-async def ws_forward(ws_reader: asyncio.StreamReader, ws_writer: asyncio.StreamWriter,
-                      tcp_reader: asyncio.StreamReader, tcp_writer: asyncio.StreamWriter,
-                      client_side: bool, config: Config):
+async def _transfer_ws_to_tcp(ws_reader, tcp_writer, client_side, config):
+    """WebSocket -> TCP: read WS frames, write raw data."""
+    pending = 0
+    try:
+        while True:
+            try:
+                data = await asyncio.wait_for(
+                    read_ws_frame(ws_reader, writer=tcp_writer),
+                    timeout=config.connection_timeout
+                )
+            except asyncio.TimeoutError:
+                break
+            if data is None or tcp_writer.is_closing():
+                break
+            if not data:
+                continue
+            tcp_writer.write(data)
+            if client_side:
+                stats.add_bytes(down=len(data))
+            else:
+                stats.add_bytes(up=len(data))
+            pending += len(data)
+            if pending >= config.drain_threshold:
+                await tcp_writer.drain()
+                pending = 0
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.debug("WS->TCP transfer error: %s", e)
+    finally:
+        try:
+            if pending > 0 and not tcp_writer.is_closing():
+                await asyncio.wait_for(tcp_writer.drain(), timeout=1.0)
+        except: pass
+
+
+async def _transfer_tcp_to_ws(tcp_reader, ws_writer, client_side, config):
+    """TCP -> WebSocket: read raw data, write WS frames."""
+    pending = 0
+    try:
+        while True:
+            try:
+                data = await asyncio.wait_for(
+                    tcp_reader.read(config.buffer_size),
+                    timeout=config.connection_timeout
+                )
+            except asyncio.TimeoutError:
+                break
+            if not data:
+                break
+            if ws_writer.is_closing():
+                break
+            if client_side:
+                ws_writer.write(create_ws_frame(data, opcode=0x2, masked=True))
+                stats.add_bytes(up=len(data))
+            else:
+                write_ws_frame_direct(ws_writer, data, opcode=0x2, masked=False)
+                stats.add_bytes(down=len(data))
+            pending += len(data)
+            if pending >= config.drain_threshold:
+                await ws_writer.drain()
+                pending = 0
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.debug("TCP->WS transfer error: %s", e)
+    finally:
+        try:
+            if pending > 0 and not ws_writer.is_closing():
+                await asyncio.wait_for(ws_writer.drain(), timeout=1.0)
+        except: pass
+
+
+async def ws_forward(ws_reader, ws_writer, tcp_reader, tcp_writer, client_side, config):
 
     stats.add_conn()
 
-    async def transfer(reader, writer, is_ws_out: bool):
-        pending = 0
-        try:
-            while True:
-                if is_ws_out:
-                    # TCP -> WebSocket
-                    try:
-                        data = await asyncio.wait_for(reader.read(config.buffer_size), timeout=config.connection_timeout)
-                    except asyncio.TimeoutError:
-                        break  # Idle connection timeout
-                    if not data: break
-                    if writer.is_closing(): break
-
-                    should_mask = client_side
-
-                    if not should_mask:
-                        write_ws_frame_direct(writer, data, opcode=0x2, masked=False)
-                    else:
-                        writer.write(create_ws_frame(data, opcode=0x2, masked=True))
-
-                    if client_side:
-                        stats.add_bytes(up=len(data))
-                    else:
-                        stats.add_bytes(down=len(data))
-
-                else:
-                    # WebSocket -> TCP
-                    try:
-                        data = await asyncio.wait_for(read_ws_frame(reader, writer=writer), timeout=config.connection_timeout)
-                    except asyncio.TimeoutError:
-                        break  # Idle connection timeout
-                    if data is None or writer.is_closing(): break
-                    if not data: continue
-                    writer.write(data)
-
-                    if client_side:
-                        stats.add_bytes(down=len(data))
-                    else:
-                        stats.add_bytes(up=len(data))
-
-                pending += len(data)
-
-                if pending >= config.drain_threshold:
-                    await writer.drain()
-                    pending = 0
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.debug("Transfer error: %s", e)
-        finally:
-            try:
-                if pending > 0 and not writer.is_closing():
-                    await asyncio.wait_for(writer.drain(), timeout=1.0)
-            except: pass
-
-    task_ws_to_tcp = asyncio.create_task(transfer(ws_reader, tcp_writer, is_ws_out=False))
-    task_tcp_to_ws = asyncio.create_task(transfer(tcp_reader, ws_writer, is_ws_out=True))
+    task_ws_to_tcp = asyncio.create_task(
+        _transfer_ws_to_tcp(ws_reader, tcp_writer, client_side, config))
+    task_tcp_to_ws = asyncio.create_task(
+        _transfer_tcp_to_ws(tcp_reader, ws_writer, client_side, config))
 
     try:
         done, pending = await asyncio.wait(
@@ -577,7 +595,8 @@ async def connect_to_upstream(target: str, config: Config) -> Tuple[asyncio.Stre
     if b"HTTP/1.1 101" not in response_data and b"HTTP/1.0 101" not in response_data:
         raise ConnectionError(f"Handshake failed: {response_data.decode(errors='ignore')[:100]}")
 
-    payload = bytearray(f"{target}\n".encode())
+    payload = bytearray(target.encode())
+    payload.extend(b"\n")
     payload.extend(b' ' * random.randint(1, 40))
 
     if config.crypto:
@@ -668,11 +687,15 @@ async def _handle_server_impl(reader: asyncio.StreamReader, writer: asyncio.Stre
             logger.warning("[Security] Empty auth data from %s", writer.get_extra_info('peername'))
             return
 
-        clean_auth = auth_data.decode(errors='ignore').strip()
-
-        # [Fix] IPv6 Support
+        # Parse target directly from bytes (avoids full decode + strip)
+        # auth_data format: "host:port\n" + random padding spaces
+        target_end = len(auth_data)
+        for i in range(len(auth_data)):
+            if auth_data[i] <= 32:
+                target_end = i
+                break
         try:
-            target_str = clean_auth.split(maxsplit=1)[0]
+            target_str = bytes(auth_data[:target_end]).decode()
             target_host, target_port = parse_host_port(target_str)
         except Exception:
             logger.warning("[Security] Malformed target format: %s", clean_auth[:50])

@@ -7,8 +7,8 @@
 Way Proxy 是一个**轻量级**、**高性能**的 HTTP/SOCKS5 转 WebSocket 代理工具，专为流媒体传输、高并发下载以及各种复杂网络环境设计。
 
 本项目包含两个语言的实现版本，它们具有相同的功能和参数用法：
-- 🐍 **Pyway**: 基于 Python `asyncio` 实现的异步高性能版本 (当前最新: v2.7.6G)。
-- 🐹 **Goway**: 基于 Go 语言实现的高并发、低延迟编译型版本 (当前最新: v1.1.13a)。
+- 🐍 **Pyway**: 基于 Python `asyncio` 实现的异步高性能版本 (当前最新: v2.7.7G)。
+- 🐹 **Goway**: 基于 Go 语言实现的高并发、低延迟编译型版本 (当前最新: v1.1.14a)。
 
 ---
 
@@ -222,7 +222,7 @@ server {
 
 ## 📊 性能优化记录
 
-> 以下记录了从 v1.1.3a / v2.6.6g 到 v1.1.13a / v2.7.6G 共 8 轮性能优化的详细变更。
+> 以下记录了从 v1.1.3a / v2.6.6g 到 v1.1.14a / v2.7.7G 共 9 轮性能优化的详细变更。
 > 每项优化均保持功能语义不变，仅改变内部实现。如需回退某项优化，可对照「优化前」代码恢复。
 
 ### 一、XOR 加密/解密优化
@@ -339,6 +339,24 @@ server {
 | 12.4 | R8 | Py | get_ws_header预分配+去struct.pack | `bytearray()` 空然后append/extend + `struct.pack('!H')` 临时bytes | 预分配bytearray(N) + 手动位操作 | 避免扩容 + 消除struct.pack临时对象 | 大长度手动位操作7行 | 省1-2 allocs/帧 |
 | 12.5 | R8 | Py | read_ws_frame非masked避免bytearray拷贝 | `bytearray(await readexactly(n))` 无差别bytes→bytearray拷贝 | masked时才创建bytearray；非masked直接返回bytes | 非masked帧省1次全帧拷贝(~1-64KB) | 返回类型从bytearray变为bytes（调用方兼容） | 非masked省1 alloc/帧 |
 
+### 十三、代码清理与热路径栈分配 (R9)
+
+| # | 轮次 | 文件 | 优化项 | 优化前 | 优化后 | 好处 | 坏处 | 预期提升 |
+|---|------|------|--------|--------|--------|------|------|----------|
+| 13.1 | R9 | Go | 删除未使用 createWSFrame | 死代码(~22行)定义但从未调用 | 直接移除函数 | 减少二进制体积，消除混淆 | 无 | 二进制减~600B |
+| 13.2 | R9 | Go | handleClient wsKey 栈分配 | `wsKey := make([]byte, 16)` 堆分配 | `var wsKey [16]byte` 栈分配 | 省1次堆分配(16B) | 无 | 省1 alloc/连接 |
+| 13.3 | R9 | Go | SOCKS5 discard 条件栈分配 | `discard := make([]byte, nmethods)` 无条件堆分配 | nmethods≤8时使用8字节栈数组，超出才堆分配 | 绝大多数SOCKS5握手省1次堆分配 | 多3行代码 | 省1 alloc/SOCKS5连接 |
+| 13.4 | R9 | Go | handleServer okBytes 包级复用 | `ok := []byte("OK\n")` 每连接分配 | 无加密时复用包级 `okBytes`；加密时copy后变换 | 省1次堆分配(3B) | 加密路径多1次copy(3B) | 无加密省1 alloc/连接 |
+| 13.5 | R9 | Go | crlfB 包级预分配替换字面量 | `bytes.Index(buf, []byte("\r\n"))` 每次构造新slice | 包级 `crlfB = []byte{'\r', '\n'}`，3处引用直接使用 | 省去每次`[]byte("\r\n")`字面量→slice分配 | 无 | 省~3 allocs/HTTP连接 |
+
+### 十四、分支消除与字节级解析 (R9)
+
+| # | 轮次 | 文件 | 优化项 | 优化前 | 优化后 | 好处 | 坏处 | 预期提升 |
+|---|------|------|--------|--------|--------|------|------|----------|
+| 14.1 | R9 | Py | ws_forward transfer 闭包拆分为两个模块级函数 | 单transfer函数内含`is_ws_out`分支，每迭代判断；闭包捕获变量 | `_transfer_ws_to_tcp` + `_transfer_tcp_to_ws` 两个独立函数 | 消除热路径每迭代分支预测开销；内联友好 | 代码行数略增(~30行) | 每迭代省1分支 |
+| 14.2 | R9 | Py | connect_to_upstream payload 去f-string | `bytearray(f"{target}\n".encode())` f-string分配 + encode分配 | `bytearray(target.encode())` + extend b"\n" + extend空格 | 节省f-string临时字符串 + encode中间bytes | 拆成3行 | 省~2 allocs/连接 |
+| 14.3 | R9 | Py | _handle_server_impl auth 字节级目标解析 | `auth_data.decode(errors='ignore').strip()` 全文decode+创建string | 字节遍历找到首个空白字符位置，仅decode目标部分 | 避免整段auth_data(含~40B填充)的decode分配 | 多5行代码 | 省1次大decode/连接 |
+
 ### 汇总统计
 
 | 类别 | 优化项数 | 影响路径 | 最大单项提升 |
@@ -355,6 +373,8 @@ server {
 | 缓冲与调度优化 (R7) | 2 | 每连接/数据传输 | Py reader._limit提升 吞吐量 ↑ |
 | 字符串与I/O优化 (R8) | 4 | 每连接/每握手 | Go 7处fmt.Sprintf消除 ~7 allocs/连接 |
 | 缓冲与解析优化 (R8) | 5 | 每连接/每帧 | Py get_ws_header预分配 ~2 allocs/帧 |
+| 代码清理与栈分配 (R9) | 5 | 每连接 | Go wsKey/okBytes/crlfB栈分配+包级复用 ~5 allocs/连接 |
+| 分支消除与字节解析 (R9) | 3 | 每帧/每连接 | Py transfer拆分消除is_ws_out分支; auth字节解析 |
 
 ---
 
