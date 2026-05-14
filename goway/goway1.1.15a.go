@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	Version        = "1.1.14a"
+	Version        = "1.1.15a"
 	MaxWSFrameSize = 16 * 1024 * 1024 // 16MB
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -249,9 +249,26 @@ func sanitizeHeader(value string) string {
 	if value == "" {
 		return ""
 	}
-	s := strings.ReplaceAll(value, "\r", "")
-	s = strings.ReplaceAll(s, "\n", "")
-	return strings.TrimSpace(s)
+	b := []byte(value)
+	n := 0
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		if c != '\r' && c != '\n' {
+			b[n] = c
+			n++
+		}
+	}
+	// Trim leading whitespace
+	start := 0
+	for start < n && (b[start] == ' ' || b[start] == '\t') {
+		start++
+	}
+	// Trim trailing whitespace
+	end := n
+	for end > start && (b[end-1] == ' ' || b[end-1] == '\t') {
+		end--
+	}
+	return string(b[start:end])
 }
 
 // --- WebSocket Framing ---
@@ -460,21 +477,18 @@ func readWSFrame(r io.Reader, w io.Writer) ([]byte, error) {
 			}
 		}
 
-		if opcode == 0x0 || opcode == 0x1 || opcode == 0x2 {
+		switch opcode {
+		case 0x0, 0x1, 0x2: // Text, Binary, Continuation
 			return payload, nil
-		}
-		if opcode == 0x8 {
+		case 0x8: // Close
 			return nil, io.EOF
-		}
-		if opcode == 0x9 {
+		case 0x9: // Ping
 			if w != nil {
 				if err := writeWSFrame(w, payload, 0xA, true); err != nil {
 					return nil, err
 				}
 			}
-			continue
 		}
-		continue
 	}
 }
 

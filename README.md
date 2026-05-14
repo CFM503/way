@@ -7,8 +7,8 @@
 Way Proxy 是一个**轻量级**、**高性能**的 HTTP/SOCKS5 转 WebSocket 代理工具，专为流媒体传输、高并发下载以及各种复杂网络环境设计。
 
 本项目包含两个语言的实现版本，它们具有相同的功能和参数用法：
-- 🐍 **Pyway**: 基于 Python `asyncio` 实现的异步高性能版本 (当前最新: v2.7.7G)。
-- 🐹 **Goway**: 基于 Go 语言实现的高并发、低延迟编译型版本 (当前最新: v1.1.14a)。
+- 🐍 **Pyway**: 基于 Python `asyncio` 实现的异步高性能版本 (当前最新: v2.7.8G)。
+- 🐹 **Goway**: 基于 Go 语言实现的高并发、低延迟编译型版本 (当前最新: v1.1.15a)。
 
 ---
 
@@ -222,7 +222,7 @@ server {
 
 ## 📊 性能优化记录
 
-> 以下记录了从 v1.1.3a / v2.6.6g 到 v1.1.14a / v2.7.7G 共 9 轮性能优化的详细变更。
+> 以下记录了从 v1.1.3a / v2.6.6g 到 v1.1.15a / v2.7.8G 共 10 轮性能优化的详细变更。
 > 每项优化均保持功能语义不变，仅改变内部实现。如需回退某项优化，可对照「优化前」代码恢复。
 
 ### 一、XOR 加密/解密优化
@@ -357,6 +357,20 @@ server {
 | 14.2 | R9 | Py | connect_to_upstream payload 去f-string | `bytearray(f"{target}\n".encode())` f-string分配 + encode分配 | `bytearray(target.encode())` + extend b"\n" + extend空格 | 节省f-string临时字符串 + encode中间bytes | 拆成3行 | 省~2 allocs/连接 |
 | 14.3 | R9 | Py | _handle_server_impl auth 字节级目标解析 | `auth_data.decode(errors='ignore').strip()` 全文decode+创建string | 字节遍历找到首个空白字符位置，仅decode目标部分 | 避免整段auth_data(含~40B填充)的decode分配 | 多5行代码 | 省1次大decode/连接 |
 
+### 十五、输入过滤单遍化与热路径分支消除 (R10)
+
+| # | 轮次 | 文件 | 优化项 | 优化前 | 优化后 | 好处 | 坏处 | 预期提升 |
+|---|------|------|--------|--------|--------|------|------|----------|
+| 15.1 | R10 | Go | sanitizeHeader 单遍字节过滤 | `ReplaceAll(\r)→ReplaceAll(\n)→TrimSpace` 三遍遍历+多中间串 | 转为 `[]byte` 原地过滤CR/LF后双向trim空格 | 单遍处理、零额外分配 | 代码略长 | 省3次字符串中间分配/头部清洗 |
+| 15.2 | R10 | Go | readWSFrame opcode if→switch | 3个串联if+continue（不可穷举） | switch-case（穷举明确） | 消除分支预测失败；编译器可优化跳转表 | 无 | 每帧微量 |
+
+### 十六、编码安全与快速路径 (R10)
+
+| # | 轮次 | 文件 | 优化项 | 优化前 | 优化后 | 好处 | 坏处 | 预期提升 |
+|---|------|------|--------|--------|--------|------|------|----------|
+| 16.1 | R10 | Py | is_local_target 首字符快速拒绝 | 所有主机名都 `.lower()` | 首字符不在 `10lL[:` 时直接返回 False | 避免绝大多数域名的 `.lower()` 分配 | 极少数首字符为 `1` 的域名仍需 `.lower()` | 省 1 str 分配/非本地连接 |
+| 16.2 | R10 | Py | create_ws_frame masked 小帧直接 XOR | 所有 masked 帧都走 `int.from_bytes` 大整数路径 | ≤256B 帧直接字节 XOR | 避免小帧 `int.from_bytes/to_bytes` 分配与 C 调用开销 | 大帧仍走原路径 | 小帧省 ~2μs/帧 |
+
 ### 汇总统计
 
 | 类别 | 优化项数 | 影响路径 | 最大单项提升 |
@@ -375,6 +389,8 @@ server {
 | 缓冲与解析优化 (R8) | 5 | 每连接/每帧 | Py get_ws_header预分配 ~2 allocs/帧 |
 | 代码清理与栈分配 (R9) | 5 | 每连接 | Go wsKey/okBytes/crlfB栈分配+包级复用 ~5 allocs/连接 |
 | 分支消除与字节解析 (R9) | 3 | 每帧/每连接 | Py transfer拆分消除is_ws_out分支; auth字节解析 |
+| 输入过滤单遍化与分支消除 (R10) | 2 | 每连接/每帧 | Go sanitizeHeader单遍零分配; switch-case跳转优化 |
+| 编码安全与快速路径 (R10) | 2 | 每连接/每帧 | Py is_local_target首字符快速拒绝; 小帧直接XOR |
 
 ---
 

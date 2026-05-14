@@ -15,7 +15,7 @@ import time
 from typing import Optional, Tuple
 from dataclasses import dataclass
 
-VERSION = "2.7.7G"
+VERSION = "2.7.8G"
 CRLF = b"\r\n"
 CRLFCRLF = b"\r\n\r\n"
 MAX_WS_FRAME_SIZE = 10 * 1024 * 1024  # [Security] Limit WS frame to 10MB
@@ -236,6 +236,9 @@ def parse_host_port(address: str, default_port: int = 80) -> Tuple[str, str]:
 
 
 def is_local_target(host: str) -> bool:
+    # Fast rejection: most public hostnames start with a-z (not 0-1, l/L, [, :)
+    if not host or host[0] not in b"10lL[":
+        return False
     h = host.lower()
     if h in ("localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"):
         return True
@@ -327,12 +330,17 @@ def create_ws_frame(data: bytes, opcode: int = 0x2, masked: bool = False) -> byt
         frame[:len(hdr)] = hdr
         frame[len(hdr):len(hdr)+4] = mk
         off = len(hdr) + 4
-        for pos in range(0, dl, CHUNK_SIZE):
-            cs = min(CHUNK_SIZE, dl - pos)
-            chunk = data[pos:pos + cs]
-            ks = (mk * (cs // 4 + 1))[:cs]
-            r = int.from_bytes(chunk, 'big') ^ int.from_bytes(ks, 'big')
-            frame[off+pos:off+pos+cs] = r.to_bytes(cs, 'big')
+        if dl <= 256:
+            # Small frame fast path: direct byte XOR (avoids int.from_bytes overhead)
+            for pos in range(dl):
+                frame[off + pos] = data[pos] ^ mk[pos & 3]
+        else:
+            for pos in range(0, dl, CHUNK_SIZE):
+                cs = min(CHUNK_SIZE, dl - pos)
+                chunk = data[pos:pos + cs]
+                ks = (mk * (cs // 4 + 1))[:cs]
+                r = int.from_bytes(chunk, 'big') ^ int.from_bytes(ks, 'big')
+                frame[off+pos:off+pos+cs] = r.to_bytes(cs, 'big')
         return frame
     # Unmasked: single allocation for header + data
     total = len(hdr) + dl
@@ -698,7 +706,7 @@ async def _handle_server_impl(reader: asyncio.StreamReader, writer: asyncio.Stre
             target_str = bytes(auth_data[:target_end]).decode()
             target_host, target_port = parse_host_port(target_str)
         except Exception:
-            logger.warning("[Security] Malformed target format: %s", clean_auth[:50])
+            logger.warning("[Security] Malformed target format: %s", auth_data[:50].decode(errors="ignore"))
             return
 
         logger.info("[SERVER] Connect -> %s:%s", target_host, target_port)
