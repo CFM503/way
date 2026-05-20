@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -148,6 +149,64 @@ type Config struct {
 	BufPool       *sync.Pool
 	HeaderBufPool *sync.Pool
 	TLSBase       *tls.Config
+}
+
+// --- DNS Resolver ---
+
+type RemoteResolver struct {
+	serverIP string
+	resolver *net.Resolver
+	timeout  time.Duration
+}
+
+func NewRemoteResolver(serverIP string) *RemoteResolver {
+	r := &RemoteResolver{
+		serverIP: serverIP,
+		timeout:  5 * time.Second,
+	}
+	r.resolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{Timeout: r.timeout}
+			return d.DialContext(ctx, network, net.JoinHostPort(serverIP, "53"))
+		},
+	}
+	return r
+}
+
+func (r *RemoteResolver) Resolve(host string) (string, error) {
+	// If already an IP, return as-is
+	if ip := net.ParseIP(host); ip != nil {
+		return host, nil
+	}
+
+	// Try remote DNS with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
+	defer cancel()
+
+	addrs, err := r.resolver.LookupHost(ctx, host)
+	if err == nil && len(addrs) > 0 {
+		logInfo("[DNS] %s -> %s (remote: %s)", host, addrs[0], r.serverIP)
+		return addrs[0], nil
+	}
+
+	if err != nil {
+		logWarn("[DNS] Remote lookup failed for %s: %v, falling back to system DNS", host, err)
+	} else {
+		logWarn("[DNS] Remote lookup returned no addresses for %s, falling back to system DNS", host)
+	}
+
+	// Fallback to system DNS
+	sysResolver := &net.Resolver{PreferGo: false}
+	sysAddrs, sysErr := sysResolver.LookupHost(context.Background(), host)
+	if sysErr != nil {
+		return "", fmt.Errorf("DNS resolution failed for %s: remote=%v, system=%v", host, err, sysErr)
+	}
+	if len(sysAddrs) == 0 {
+		return "", fmt.Errorf("DNS resolution returned no addresses for %s", host)
+	}
+	logInfo("[DNS] %s -> %s (system fallback)", host, sysAddrs[0])
+	return sysAddrs[0], nil
 }
 
 // --- Logger ---
