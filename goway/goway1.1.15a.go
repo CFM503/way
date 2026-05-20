@@ -146,6 +146,7 @@ type Config struct {
 	Crypto        *Crypto
 	UserAgent     string
 	DNS           string
+	Resolver      *RemoteResolver
 	BufPool       *sync.Pool
 	HeaderBufPool *sync.Pool
 	TLSBase       *tls.Config
@@ -570,6 +571,7 @@ func main() {
 	maxConnFlag := flag.Int("max-conn", 1000, "Max Concurrent Connections")
 	blockLocalFlag := flag.Bool("block-local", false, "Drop local/LAN traffic (Client mode)")
 	allowOpenFlag := flag.Bool("allow-open", false, "Allow server mode without authentication key")
+	dnsFlag := flag.String("dns", "", "Remote DNS server IP (e.g. 8.8.8.8)")
 
 	flag.Parse()
 
@@ -594,6 +596,14 @@ func main() {
 		MaxConns:       *maxConnFlag,
 		BlockLocal:     *blockLocalFlag,
 		AllowOpen:      *allowOpenFlag,
+	}
+
+	if *dnsFlag != "" {
+		if net.ParseIP(*dnsFlag) == nil {
+			fmt.Printf("Error: -dns requires a valid IP address (e.g. 8.8.8.8), got '%s'\n", *dnsFlag)
+			os.Exit(1)
+		}
+		cfg.Resolver = NewRemoteResolver(*dnsFlag)
 	}
 
 	host := "0.0.0.0"
@@ -652,8 +662,11 @@ func main() {
 		fmt.Printf(" [+] User-Agent:  %sRandomized (Sticky)%s\n", AnsiGreen, AnsiReset)
 	}
 
-	dnsCol := AnsiYellow
-	fmt.Printf(" [+] DNS:         %sSystem default%s\n", dnsCol, AnsiReset)
+	if cfg.Resolver != nil {
+		fmt.Printf(" [+] DNS:         %sRemote: %s (UDP+TCP)%s\n", AnsiGreen, cfg.Resolver.serverIP, AnsiReset)
+	} else {
+		fmt.Printf(" [+] DNS:         %sSystem default%s\n", AnsiYellow, AnsiReset)
+	}
 
 	if cfg.Crypto != nil {
 		fmt.Printf(" [+] Auth:        %sEnabled (XOR)%s\n", AnsiGreen, AnsiReset)
