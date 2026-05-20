@@ -858,6 +858,18 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 
 	logDebug("handleServer targetStr: %s", targetStr)
 
+	// Remote DNS resolution for target address
+	if cfg.Resolver != nil {
+		host, port, splitErr := net.SplitHostPort(targetStr)
+		if splitErr == nil {
+			if resolvedIP, resolveErr := cfg.Resolver.Resolve(host); resolveErr == nil {
+				targetStr = net.JoinHostPort(resolvedIP, port)
+			} else {
+				logError("[DNS] Failed to resolve %s: %v", host, resolveErr)
+			}
+		}
+	}
+
 	targetConn, err := net.DialTimeout("tcp4", targetStr, time.Duration(cfg.ConnTimeout)*time.Second)
 	if err != nil {
 		logError("handleServer net.DialTimeout err: %v", err)
