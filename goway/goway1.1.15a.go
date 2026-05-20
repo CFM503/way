@@ -198,7 +198,9 @@ func (r *RemoteResolver) Resolve(host string) (string, error) {
 
 	// Fallback to system DNS
 	sysResolver := &net.Resolver{PreferGo: false}
-	sysAddrs, sysErr := sysResolver.LookupHost(context.Background(), host)
+	sysCtx, sysCancel := context.WithTimeout(context.Background(), r.timeout)
+	defer sysCancel()
+	sysAddrs, sysErr := sysResolver.LookupHost(sysCtx, host)
 	if sysErr != nil {
 		return "", fmt.Errorf("DNS resolution failed for %s: remote=%v, system=%v", host, err, sysErr)
 	}
