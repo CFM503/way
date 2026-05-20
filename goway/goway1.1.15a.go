@@ -1164,7 +1164,17 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		}
 	}
 
-	dialAddr := net.JoinHostPort(wsHost, wsPort)
+	// Remote DNS resolution for upstream host
+	dialHost := wsHost
+	if cfg.Resolver != nil {
+		if resolvedIP, resolveErr := cfg.Resolver.Resolve(wsHost); resolveErr == nil {
+			dialHost = resolvedIP
+		} else {
+			logError("[DNS] Failed to resolve upstream %s: %v", wsHost, resolveErr)
+		}
+	}
+
+	dialAddr := net.JoinHostPort(dialHost, wsPort)
 	sniHostname := sanitizeHeader(wsHost)
 	if cfg.FakeHost != "" {
 		sniHostname = sanitizeHeader(strings.Split(cfg.FakeHost, ":")[0])
