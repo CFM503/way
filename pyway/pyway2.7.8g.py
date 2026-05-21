@@ -138,6 +138,126 @@ class Config:
     allow_open: bool = False
     ssl_context_verified: Optional[ssl.SSLContext] = None
     ssl_context_unverified: Optional[ssl.SSLContext] = None
+    resolver: Optional['RemoteResolver'] = None
+
+
+class RemoteResolver:
+    """DNS resolver using a remote server via UDP with TCP fallback."""
+
+    def __init__(self, server_ip: str):
+        self.server_ip = server_ip
+        self.timeout = 5.0
+
+    def _build_query(self, hostname: str) -> bytes:
+        """Build a DNS A record query packet."""
+        header = struct.pack('!HHHHHH', 0x1234, 0x0100, 1, 0, 0, 0)
+        question = b''
+        for part in hostname.split('.'):
+            question += bytes([len(part)]) + part.encode()
+        question += b'\x00' + struct.pack('!HH', 1, 1)  # A record, IN class
+        return header + question
+
+    def _parse_response(self, data: bytes) -> Optional[str]:
+        """Parse DNS response and extract first A record IP."""
+        if len(data) < 12:
+            return None
+        qdcount = struct.unpack('!H', data[4:6])[0]
+        ancount = struct.unpack('!H', data[6:8])[0]
+        offset = 12
+        for _ in range(qdcount):
+            while offset < len(data) and data[offset] != 0:
+                offset += 1 + data[offset]
+            offset += 5  # null + type(2) + class(2)
+        for _ in range(ancount):
+            if offset >= len(data):
+                return None
+            if data[offset] & 0xC0 == 0xC0:
+                offset += 2
+            else:
+                while offset < len(data) and data[offset] != 0:
+                    offset += 1 + data[offset]
+                offset += 1
+            if offset + 10 > len(data):
+                return None
+            rtype, rclass, rdlength = struct.unpack('!HHH', data[offset:offset+6])
+            offset += 8
+            if rtype == 1 and rclass == 1 and rdlength == 4:
+                return '.'.join(str(b) for b in data[offset:offset+4])
+            offset += rdlength
+        return None
+
+    async def resolve(self, host: str) -> str:
+        """Resolve hostname via remote DNS. Returns IP or original host on failure."""
+        import ipaddress
+        try:
+            ipaddress.ip_address(host)
+            return host
+        except ValueError:
+            pass
+
+        loop = asyncio.get_event_loop()
+        query = self._build_query(host)
+
+        # Try UDP
+        try:
+            ip = await loop.run_in_executor(None, self._query_udp, query)
+            if ip:
+                logger.info("[DNS] %s -> %s (remote: %s)", host, ip, self.server_ip)
+                return ip
+        except Exception as e:
+            logger.warning("[DNS] Remote UDP lookup failed for %s: %s, trying TCP", host, e)
+
+        # Try TCP
+        try:
+            ip = await loop.run_in_executor(None, self._query_tcp, query)
+            if ip:
+                logger.info("[DNS] %s -> %s (remote TCP: %s)", host, ip, self.server_ip)
+                return ip
+        except Exception as e:
+            logger.warning("[DNS] Remote TCP lookup failed for %s: %s", host, e)
+
+        # Fallback to system DNS
+        logger.warning("[DNS] Remote lookup failed for %s, falling back to system DNS", host)
+        try:
+            addrs = await loop.run_in_executor(None, socket.gethostbyname, host)
+            logger.info("[DNS] %s -> %s (system fallback)", host, addrs)
+            return addrs
+        except socket.gaierror as e:
+            raise OSError(f"DNS resolution failed for {host}: remote=timeout, system={e}")
+
+    def _query_udp(self, query: bytes) -> Optional[str]:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(self.timeout)
+        try:
+            sock.sendto(query, (self.server_ip, 53))
+            data, _ = sock.recvfrom(4096)
+            return self._parse_response(data)
+        except socket.timeout:
+            return None
+        finally:
+            sock.close()
+
+    def _query_tcp(self, query: bytes) -> Optional[str]:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        try:
+            sock.connect((self.server_ip, 53))
+            sock.send(struct.pack('!H', len(query)) + query)
+            length_data = sock.recv(2)
+            if len(length_data) < 2:
+                return None
+            resp_len = struct.unpack('!H', length_data)[0]
+            data = b''
+            while len(data) < resp_len:
+                chunk = sock.recv(resp_len - len(data))
+                if not chunk:
+                    break
+                data += chunk
+            return self._parse_response(data)
+        except socket.timeout:
+            return None
+        finally:
+            sock.close()
 
 
 class ColoredFormatter(logging.Formatter):
@@ -536,12 +656,20 @@ async def connect_to_upstream(target: str, config: Config) -> Tuple[asyncio.Stre
     if use_ssl:
         ssl_context = config.ssl_context_verified if config.ssl_verify else config.ssl_context_unverified
 
-    logger.debug("Connecting to upstream %s:%s (SSL: %s)", server_host, server_port, use_ssl)
+    # Remote DNS resolution for upstream host
+    dial_host = server_host
+    if config.resolver:
+        try:
+            dial_host = await config.resolver.resolve(server_host)
+        except OSError as e:
+            logger.error("[DNS] Failed to resolve upstream %s: %s", server_host, e)
+
+    logger.debug("Connecting to upstream %s:%s (SSL: %s)", dial_host, server_port, use_ssl)
 
     sni_hostname = sanitize_header(config.fakehost.split(':')[0] if config.fakehost else server_host)
 
     server_reader, server_writer = await asyncio.open_connection(
-        server_host, server_port,
+        dial_host, server_port,
         limit=config.stream_limit,
         ssl=ssl_context,
         server_hostname=sni_hostname if use_ssl else None
@@ -709,10 +837,18 @@ async def _handle_server_impl(reader: asyncio.StreamReader, writer: asyncio.Stre
             logger.warning("[Security] Malformed target format: %s", auth_data[:50].decode(errors="ignore"))
             return
 
-        logger.info("[SERVER] Connect -> %s:%s", target_host, target_port)
+        # Remote DNS resolution for target address
+        dial_host = target_host
+        if config.resolver:
+            try:
+                dial_host = await config.resolver.resolve(target_host)
+            except OSError as e:
+                logger.error("[DNS] Failed to resolve %s: %s", target_host, e)
+
+        logger.info("[SERVER] Connect -> %s:%s", dial_host, target_port)
         # Force IPv4 to prevent IPv6 routing issues on some VPS
         target_reader, target_writer = await asyncio.open_connection(
-            target_host, int(target_port), limit=config.stream_limit, family=socket.AF_INET
+            dial_host, int(target_port), limit=config.stream_limit, family=socket.AF_INET
         )
 
         ok_payload = b"OK\n"
@@ -922,7 +1058,7 @@ async def main_async(config: Config):
         print(f" [+] SSL Verify:  {verify_col}{verify_str}{ANSI_RESET}")
         print(f" [+] User-Agent:  {ANSI_GREEN}Randomized (Sticky){ANSI_RESET}")
 
-    dns_col = ANSI_GREEN if "aiodns" in config.dns_info else ANSI_YELLOW
+    dns_col = ANSI_GREEN if ("aiodns" in config.dns_info or "Remote" in config.dns_info) else ANSI_YELLOW
     print(f" [+] DNS:         {dns_col}{config.dns_info}{ANSI_RESET}")
 
     if config.crypto:
@@ -966,6 +1102,7 @@ def main():
     parser.add_argument('--max-conn', type=int, default=1000, help="Max Concurrent Connections")
     parser.add_argument('--block-local', action='store_true', help="Drop local/LAN traffic (Client mode)")
     parser.add_argument('--allow-open', action='store_true', help="Allow server mode without authentication key")
+    parser.add_argument('-dns', help="Remote DNS server IP (e.g. 8.8.8.8)")
 
     args = parser.parse_args()
     logger.setLevel(getattr(logging, args.log.upper()))
@@ -985,11 +1122,23 @@ def main():
         print("Error: Server mode requires -k (authentication key) or --allow-open flag")
         sys.exit(1)
 
-    try:
-        import aiodns
-        dns_info = "aiodns (Async)"
-    except ImportError:
-        dns_info = "System (Default)"
+    # Validate and create remote DNS resolver
+    resolver = None
+    if args.dns:
+        import ipaddress
+        try:
+            ipaddress.ip_address(args.dns)
+        except ValueError:
+            print(f"Error: -dns requires a valid IP address (e.g. 8.8.8.8), got '{args.dns}'")
+            sys.exit(1)
+        resolver = RemoteResolver(args.dns)
+        dns_info = f"Remote: {args.dns} (UDP+TCP)"
+    else:
+        try:
+            import aiodns
+            dns_info = "aiodns (Async)"
+        except ImportError:
+            dns_info = "System (Default)"
 
     crypto_obj = Crypto(args.k) if args.k else None
 
@@ -1014,7 +1163,7 @@ def main():
         proxy_port=int(args.p.rsplit(':', 1)[1]),
         upstream=args.up, fakehost=args.fakehost, crypto=crypto_obj,
         user_agent=sticky_ua,
-        dns_info=dns_info,
+        dns_info=dns_info, resolver=resolver,
         buffer_size=buf, stream_limit=stream_limit, drain_threshold=buf*4,
         tcp_nodelay=not args.no_tcp_nodelay, tcp_keepalive=not args.no_tcp_keepalive,
         socket_buffer=args.socket_buffer, connection_timeout=args.connection_timeout,
