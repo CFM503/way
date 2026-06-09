@@ -19,16 +19,13 @@ import (
 	"net"
 	"net/url"
 	"os"
-	"os/exec"
 	"os/signal"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
-	"unsafe"
 )
 
 const (
@@ -85,103 +82,13 @@ func (s *Statistics) AddBytes(up, down int64) {
 }
 // --- TUI / GUI-Style CLI Implementation ---
 
-type coord struct {
-	X int16
-	Y int16
-}
-
-type smallRect struct {
-	Left   int16
-	Top    int16
-	Right  int16
-	Bottom int16
-}
-
-type consoleScreenBufferInfo struct {
-	Size              coord
-	CursorPosition    coord
-	Attributes        uint16
-	Window            smallRect
-	MaximumWindowSize coord
-}
-
 var (
 	tuiEnabled   bool
 	tuiLogMu     sync.Mutex
 	tuiLogBuffer []string
 	maxTuiLogs   = 12
 	tuiRefreshCh = make(chan struct{}, 1)
-
-	// Syscalls for Windows console VT support
-	kernel32                       = syscall.NewLazyDLL("kernel32.dll")
-	procGetStdHandle               = kernel32.NewProc("GetStdHandle")
-	procGetConsoleMode             = kernel32.NewProc("GetConsoleMode")
-	procSetConsoleMode             = kernel32.NewProc("SetConsoleMode")
-	procGetConsoleScreenBufferInfo = kernel32.NewProc("GetConsoleScreenBufferInfo")
 )
-
-const (
-	stdOutputHandle                 = uint32(-11 & 0xffffffff)
-	enableVirtualTerminalProcessing = 0x0004
-)
-
-func initWindowsConsole() {
-	if runtime.GOOS != "windows" {
-		return
-	}
-	handle, _, _ := procGetStdHandle.Call(uintptr(stdOutputHandle))
-	if handle == 0 {
-		return
-	}
-	var mode uint32
-	r1, _, _ := procGetConsoleMode.Call(handle, uintptr(unsafe.Pointer(&mode)))
-	if r1 == 0 {
-		return
-	}
-	mode |= enableVirtualTerminalProcessing
-	procSetConsoleMode.Call(handle, uintptr(mode))
-}
-
-func getTerminalSize() (width int, height int) {
-	// Defaults
-	width = 80
-	height = 24
-
-	if runtime.GOOS == "windows" {
-		handle, _, _ := procGetStdHandle.Call(uintptr(stdOutputHandle))
-		if handle != 0 {
-			var info consoleScreenBufferInfo
-			r1, _, _ := procGetConsoleScreenBufferInfo.Call(handle, uintptr(unsafe.Pointer(&info)))
-			if r1 != 0 {
-				width = int(info.Window.Right - info.Window.Left + 1)
-				height = int(info.Window.Bottom - info.Window.Top + 1)
-			}
-		}
-	} else {
-		// Unix / Linux / macOS: run "stty size" which compiles cleanly on Windows
-		cmd := exec.Command("stty", "size")
-		cmd.Stdin = os.Stdin
-		out, err := cmd.Output()
-		if err == nil {
-			parts := strings.Fields(string(out))
-			if len(parts) == 2 {
-				h, errH := strconv.Atoi(parts[0])
-				w, errW := strconv.Atoi(parts[1])
-				if errH == nil && errW == nil {
-					width = w
-					height = h
-				}
-			}
-		}
-	}
-	if width < 50 {
-		width = 50
-	}
-	if height < 10 {
-		height = 10
-	}
-	return width, height
-}
 
 func addTuiLog(line string) {
 	tuiLogMu.Lock()
