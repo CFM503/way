@@ -19,6 +19,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"runtime"
 	"strconv"
@@ -82,8 +83,27 @@ func (s *Statistics) AddBytes(up, down int64) {
 		atomic.AddInt64(&s.bytesDown, down)
 	}
 }
-
 // --- TUI / GUI-Style CLI Implementation ---
+
+type coord struct {
+	X int16
+	Y int16
+}
+
+type smallRect struct {
+	Left   int16
+	Top    int16
+	Right  int16
+	Bottom int16
+}
+
+type consoleScreenBufferInfo struct {
+	Size              coord
+	CursorPosition    coord
+	Attributes        uint16
+	Window            smallRect
+	MaximumWindowSize coord
+}
 
 var (
 	tuiEnabled   bool
@@ -93,10 +113,11 @@ var (
 	tuiRefreshCh = make(chan struct{}, 1)
 
 	// Syscalls for Windows console VT support
-	kernel32           = syscall.NewLazyDLL("kernel32.dll")
-	procGetStdHandle   = kernel32.NewProc("GetStdHandle")
-	procGetConsoleMode = kernel32.NewProc("GetConsoleMode")
-	procSetConsoleMode = kernel32.NewProc("SetConsoleMode")
+	kernel32                       = syscall.NewLazyDLL("kernel32.dll")
+	procGetStdHandle               = kernel32.NewProc("GetStdHandle")
+	procGetConsoleMode             = kernel32.NewProc("GetConsoleMode")
+	procSetConsoleMode             = kernel32.NewProc("SetConsoleMode")
+	procGetConsoleScreenBufferInfo = kernel32.NewProc("GetConsoleScreenBufferInfo")
 )
 
 const (
@@ -121,12 +142,53 @@ func initWindowsConsole() {
 	procSetConsoleMode.Call(handle, uintptr(mode))
 }
 
+func getTerminalSize() (width int, height int) {
+	// Defaults
+	width = 80
+	height = 24
+
+	if runtime.GOOS == "windows" {
+		handle, _, _ := procGetStdHandle.Call(uintptr(stdOutputHandle))
+		if handle != 0 {
+			var info consoleScreenBufferInfo
+			r1, _, _ := procGetConsoleScreenBufferInfo.Call(handle, uintptr(unsafe.Pointer(&info)))
+			if r1 != 0 {
+				width = int(info.Window.Right - info.Window.Left + 1)
+				height = int(info.Window.Bottom - info.Window.Top + 1)
+			}
+		}
+	} else {
+		// Unix / Linux / macOS: run "stty size" which compiles cleanly on Windows
+		cmd := exec.Command("stty", "size")
+		cmd.Stdin = os.Stdin
+		out, err := cmd.Output()
+		if err == nil {
+			parts := strings.Fields(string(out))
+			if len(parts) == 2 {
+				h, errH := strconv.Atoi(parts[0])
+				w, errW := strconv.Atoi(parts[1])
+				if errH == nil && errW == nil {
+					width = w
+					height = h
+				}
+			}
+		}
+	}
+	if width < 50 {
+		width = 50
+	}
+	if height < 10 {
+		height = 10
+	}
+	return width, height
+}
+
 func addTuiLog(line string) {
 	tuiLogMu.Lock()
 	line = strings.TrimSpace(line)
 	tuiLogBuffer = append(tuiLogBuffer, line)
-	if len(tuiLogBuffer) > maxTuiLogs {
-		tuiLogBuffer = tuiLogBuffer[len(tuiLogBuffer)-maxTuiLogs:]
+	if len(tuiLogBuffer) > 100 {
+		tuiLogBuffer = tuiLogBuffer[len(tuiLogBuffer)-100:]
 	}
 	tuiLogMu.Unlock()
 	triggerTuiRefresh()
@@ -210,6 +272,12 @@ func drawTuiRow(buf *bytes.Buffer, content string, width int) {
 	buf.WriteString(" │\n")
 }
 
+func formatTwoColumns(leftLabel, leftVal, rightLabel, rightVal string, colWidth int) string {
+	leftStr := leftLabel + leftVal
+	rightStr := rightLabel + rightVal
+	return padVisible(leftStr, colWidth) + rightStr
+}
+
 func formatBytes(bytes int64) string {
 	if bytes == 0 {
 		return "0 B"
@@ -227,28 +295,61 @@ func formatBytes(bytes int64) string {
 }
 
 func drawTUI(cfg *Config) {
+	termWidth, termHeight := getTerminalSize()
+
+	boxWidth := termWidth - 2
+	if boxWidth < 50 {
+		boxWidth = 50
+	}
+	if boxWidth > 110 {
+		boxWidth = 110
+	}
+
+	innerWidth := boxWidth - 4
+	colWidth := innerWidth / 2
+
 	var buf bytes.Buffer
-	buf.WriteString("\033[H")
+	buf.WriteString("\033[H\033[J")
 
 	// Top Border
-	buf.WriteString("┌" + strings.Repeat("─", 68) + "┐\n")
+	buf.WriteString("┌" + strings.Repeat("─", boxWidth-2) + "┐\n")
 
 	// Title
 	title := "GOWAY Proxy Dashboard (v" + Version + ")"
-	pad := (68 - len(title)) / 2
-	buf.WriteString("│" + strings.Repeat(" ", pad) + AnsiCyan + title + AnsiReset + strings.Repeat(" ", 68-pad-len(title)) + "│\n")
-	buf.WriteString("├" + strings.Repeat("─", 68) + "┤\n")
+	pad := (boxWidth - 2 - len(title)) / 2
+	if pad < 0 {
+		pad = 0
+	}
+	buf.WriteString("│" + strings.Repeat(" ", pad) + AnsiCyan + title + AnsiReset + strings.Repeat(" ", boxWidth-2-pad-len(title)) + "│\n")
+	buf.WriteString("├" + strings.Repeat("─", boxWidth-2) + "┤\n")
 
 	// Config Panel
 	mode := "Server"
 	if cfg.Upstream != "" {
 		mode = "Client (HTTP + SOCKS5)"
 	}
-	drawTuiRow(&buf, "Mode:      "+AnsiGreen+mode+AnsiReset, 70)
-	drawTuiRow(&buf, fmt.Sprintf("Listen:    %s%s:%d%s", AnsiYellow, cfg.ProxyHost, cfg.ProxyPort, AnsiReset), 70)
-	if cfg.Upstream != "" {
-		drawTuiRow(&buf, "Upstream:  "+AnsiMagenta+cfg.Upstream+AnsiReset, 70)
+	modeCol := AnsiGreen + mode + AnsiReset
+	if cfg.Upstream == "" {
+		modeCol = AnsiYellow + mode + AnsiReset
 	}
+	maxConnVal := fmt.Sprintf("%d", cfg.MaxConns)
+	drawTuiRow(&buf, formatTwoColumns("Mode:      ", modeCol, "Max Conns:   ", maxConnVal, colWidth), boxWidth)
+
+	listenVal := fmt.Sprintf("%s:%d", cfg.ProxyHost, cfg.ProxyPort)
+	timeoutVal := fmt.Sprintf("%ds", cfg.ConnTimeout)
+	drawTuiRow(&buf, formatTwoColumns("Listen:    ", AnsiYellow+listenVal+AnsiReset, "Timeout:     ", AnsiYellow+timeoutVal+AnsiReset, colWidth), boxWidth)
+
+	upstreamVal := "N/A"
+	if cfg.Upstream != "" {
+		upstreamVal = cfg.Upstream
+	}
+	blockLocalVal := "Disabled"
+	blockLocalCol := AnsiRed + blockLocalVal + AnsiReset
+	if cfg.BlockLocal {
+		blockLocalVal = "Enabled"
+		blockLocalCol = AnsiGreen + blockLocalVal + AnsiReset
+	}
+	drawTuiRow(&buf, formatTwoColumns("Upstream:  ", AnsiMagenta+upstreamVal+AnsiReset, "Block Local: ", blockLocalCol, colWidth), boxWidth)
 
 	var sslVerifyStr string
 	if cfg.Upstream != "" {
@@ -269,9 +370,7 @@ func drawTUI(cfg *Config) {
 	} else {
 		authStr = AnsiYellow + "Disabled" + AnsiReset
 	}
-
-	rowAuth := "Auth:      " + padVisible(authStr, 25) + " SSL Verify: " + sslVerifyStr
-	drawTuiRow(&buf, rowAuth, 70)
+	drawTuiRow(&buf, formatTwoColumns("Auth:      ", authStr, "SSL Verify:  ", sslVerifyStr, colWidth), boxWidth)
 
 	var dnsStr string
 	if cfg.Resolver != nil {
@@ -279,16 +378,43 @@ func drawTUI(cfg *Config) {
 	} else {
 		dnsStr = AnsiYellow + "System Default" + AnsiReset
 	}
+	var levelStr string
+	switch globalLogLevel {
+	case DEBUG:
+		levelStr = AnsiCyan + "DEBUG" + AnsiReset
+	case INFO:
+		levelStr = AnsiGreen + "INFO" + AnsiReset
+	case WARN:
+		levelStr = AnsiYellow + "WARN" + AnsiReset
+	case ERROR:
+		levelStr = AnsiRed + "ERROR" + AnsiReset
+	}
+	drawTuiRow(&buf, formatTwoColumns("DNS:       ", dnsStr, "Log Level:   ", levelStr, colWidth), boxWidth)
 
 	bufKB := cfg.BufferSize / 1024
 	bufInfo := fmt.Sprintf("%d KB", bufKB)
 	if cfg.SocketBuffer > 0 {
 		bufInfo += fmt.Sprintf(" (Socket: %d KB)", cfg.SocketBuffer)
 	}
-	rowDNS := "DNS:       " + padVisible(dnsStr, 25) + " Buffer:     " + bufInfo
-	drawTuiRow(&buf, rowDNS, 70)
 
-	buf.WriteString("├" + strings.Repeat("─", 68) + "┤\n")
+	ndVal := AnsiGreen + "On" + AnsiReset
+	if cfg.NoTcpNoDelay {
+		ndVal = AnsiRed + "Off" + AnsiReset
+	}
+	kaVal := AnsiGreen + "On" + AnsiReset
+	if cfg.NoTcpKeepAlive {
+		kaVal = AnsiRed + "Off" + AnsiReset
+	}
+	tcpSettings := fmt.Sprintf("NoDelay:%s KeepAlive:%s", ndVal, kaVal)
+	drawTuiRow(&buf, formatTwoColumns("Buffer:    ", bufInfo, "TCP Settings:", tcpSettings, colWidth), boxWidth)
+
+	configLines := 6
+	if cfg.FakeHost != "" {
+		drawTuiRow(&buf, formatTwoColumns("Fake Host: ", AnsiMagenta+cfg.FakeHost+AnsiReset, "", "", colWidth), boxWidth)
+		configLines = 7
+	}
+
+	buf.WriteString("├" + strings.Repeat("─", boxWidth-2) + "┤\n")
 
 	// Stats Panel
 	active := atomic.LoadInt64(&stats.activeConns)
@@ -301,31 +427,42 @@ func drawTUI(cfg *Config) {
 	totalDownStr := formatBytes(currDown)
 	totalUpStr := formatBytes(currUp)
 
-	rowConns := "Conns:     " + padVisible(activeStr, 25) + " Max Conns:   " + fmt.Sprintf("%d", cfg.MaxConns)
-	rowDown := "Download:  " + padVisible(speedDownStr, 25) + " Total Down:  " + totalDownStr
-	rowUp := "Upload:    " + padVisible(speedUpStr, 25) + " Total Up:    " + totalUpStr
+	drawTuiRow(&buf, formatTwoColumns("Conns:     ", activeStr, "", "", colWidth), boxWidth)
+	drawTuiRow(&buf, formatTwoColumns("Download:  ", speedDownStr, "Total Down:  ", totalDownStr, colWidth), boxWidth)
+	drawTuiRow(&buf, formatTwoColumns("Upload:    ", speedUpStr, "Total Up:    ", totalUpStr, colWidth), boxWidth)
 
-	drawTuiRow(&buf, rowConns, 70)
-	drawTuiRow(&buf, rowDown, 70)
-	drawTuiRow(&buf, rowUp, 70)
+	buf.WriteString("├" + strings.Repeat("─", boxWidth-2) + "┤\n")
 
-	buf.WriteString("├" + strings.Repeat("─", 68) + "┤\n")
+	// Calculate remaining lines for logs
+	usedHeight := 3 + configLines + 4 + 2 + 1
+	maxTuiLogs = termHeight - usedHeight
+	if maxTuiLogs < 5 {
+		maxTuiLogs = 5
+	}
 
 	// Logs Panel
-	drawTuiRow(&buf, AnsiCyan+"Recent Logs:"+AnsiReset, 70)
+	drawTuiRow(&buf, AnsiCyan+"Recent Logs:"+AnsiReset, boxWidth)
 	tuiLogMu.Lock()
-	for i := 0; i < maxTuiLogs; i++ {
-		var line string
-		if i < len(tuiLogBuffer) {
-			line = tuiLogBuffer[i]
-		}
-		line = truncateVisible(line, 66)
-		drawTuiRow(&buf, line, 70)
+	numLogs := len(tuiLogBuffer)
+	startIdx := numLogs - maxTuiLogs
+	if startIdx < 0 {
+		startIdx = 0
+	}
+
+	printed := 0
+	for i := startIdx; i < numLogs; i++ {
+		line := tuiLogBuffer[i]
+		line = truncateVisible(line, innerWidth)
+		drawTuiRow(&buf, line, boxWidth)
+		printed++
+	}
+	for i := printed; i < maxTuiLogs; i++ {
+		drawTuiRow(&buf, "", boxWidth)
 	}
 	tuiLogMu.Unlock()
 
 	// Bottom Border
-	buf.WriteString("└" + strings.Repeat("─", 68) + "┘\n")
+	buf.WriteString("└" + strings.Repeat("─", boxWidth-2) + "┘\n")
 
 	os.Stdout.Write(buf.Bytes())
 }
@@ -345,7 +482,6 @@ func tuiRefreshLoop(cfg *Config, shutdown <-chan struct{}) {
 		}
 	}
 }
-
 // --- Crypto ---
 
 const cryptoChunkSize = 65536 // 64KB pre-expanded key chunk
