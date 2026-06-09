@@ -29,7 +29,7 @@ import (
 )
 
 const (
-	Version        = "1.3.1"
+	Version        = "1.3.2"
 	MaxWSFrameSize = 16 * 1024 * 1024 // 16MB
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -895,7 +895,7 @@ func main() {
 	kFlag := flag.String("k", "", "Authentication Key")
 	logFlag := flag.String("log", "INFO", "Log Level")
 	fakeHostFlag := flag.String("fakehost", "", "Spoofing Hostname")
-	wFlag := flag.Int("W", 0, "App Buffer Size in KB")
+	wFlag := flag.Int("W", 256, "App Buffer Size in KB")
 	noDelayFlag := flag.Bool("no-tcp-nodelay", false, "Disable TCP_NODELAY")
 	keepAliveFlag := flag.Bool("no-tcp-keepalive", false, "Disable TCP KeepAlive")
 	sockBufFlag := flag.Int("socket-buffer", 0, "Kernel Socket Buffer")
@@ -928,7 +928,7 @@ func main() {
 		Upstream:       *upFlag,
 		FakeHost:       *fakeHostFlag,
 		Key:            *kFlag,
-		BufferSize:     65536,
+		BufferSize:     262144,
 		NoTcpNoDelay:   *noDelayFlag,
 		NoTcpKeepAlive: *keepAliveFlag,
 		SocketBuffer:   *sockBufFlag,

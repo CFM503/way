@@ -17,7 +17,7 @@ import shutil
 from typing import Optional, Tuple
 from dataclasses import dataclass
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 CRLF = b"\r\n"
 CRLFCRLF = b"\r\n\r\n"
 MAX_WS_FRAME_SIZE = 10 * 1024 * 1024  # [Security] Limit WS frame to 10MB
@@ -129,9 +129,9 @@ class Config:
     upstream: Optional[str] = None
     fakehost: Optional[str] = None
     crypto: Optional[Crypto] = None
-    buffer_size: int = 65536
+    buffer_size: int = 262144
     stream_limit: int = 1048576
-    drain_threshold: int = 262144
+    drain_threshold: int = 1048576
     tcp_nodelay: bool = True
     tcp_keepalive: bool = True
     socket_buffer: int = 0
@@ -1427,7 +1427,7 @@ def main():
     parser.add_argument('-k', help="Authentication Key")
     parser.add_argument('-log', default='INFO', help="Log Level")
     parser.add_argument('-fakehost', help="Spoofing Hostname")
-    parser.add_argument('-W', type=int, help="App Buffer Size in KB")
+    parser.add_argument('-W', type=int, default=256, help="App Buffer Size in KB")
     parser.add_argument('--no-tcp-nodelay', action='store_true', help="Disable TCP_NODELAY")
     parser.add_argument('--no-tcp-keepalive', action='store_true', help="Disable TCP KeepAlive")
     parser.add_argument('--socket-buffer', type=int, default=0, help="Kernel Socket Buffer")
@@ -1445,7 +1445,7 @@ def main():
     args = parser.parse_args()
     logger.setLevel(getattr(logging, args.log.upper()))
 
-    buf = (args.W * 1024) if args.W else 65536
+    buf = (args.W * 1024) if args.W else 262144
 
     # Validate upstream scheme
     if args.up:
