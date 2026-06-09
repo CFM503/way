@@ -20,16 +20,18 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 const (
-	Version        = "1.2.0c"
+	Version        = "1.3.0"
 	MaxWSFrameSize = 16 * 1024 * 1024 // 16MB
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -58,6 +60,8 @@ type Statistics struct {
 	activeConns int64
 	bytesUp     int64
 	bytesDown   int64
+	speedUp     float64
+	speedDown   float64
 }
 
 var stats Statistics
@@ -76,6 +80,269 @@ func (s *Statistics) AddBytes(up, down int64) {
 	}
 	if down > 0 {
 		atomic.AddInt64(&s.bytesDown, down)
+	}
+}
+
+// --- TUI / GUI-Style CLI Implementation ---
+
+var (
+	tuiEnabled   bool
+	tuiLogMu     sync.Mutex
+	tuiLogBuffer []string
+	maxTuiLogs   = 12
+	tuiRefreshCh = make(chan struct{}, 1)
+
+	// Syscalls for Windows console VT support
+	kernel32           = syscall.NewLazyDLL("kernel32.dll")
+	procGetStdHandle   = kernel32.NewProc("GetStdHandle")
+	procGetConsoleMode = kernel32.NewProc("GetConsoleMode")
+	procSetConsoleMode = kernel32.NewProc("SetConsoleMode")
+)
+
+const (
+	stdOutputHandle                 = uint32(-11 & 0xffffffff)
+	enableVirtualTerminalProcessing = 0x0004
+)
+
+func initWindowsConsole() {
+	if runtime.GOOS != "windows" {
+		return
+	}
+	handle, _, _ := procGetStdHandle.Call(uintptr(stdOutputHandle))
+	if handle == 0 {
+		return
+	}
+	var mode uint32
+	r1, _, _ := procGetConsoleMode.Call(handle, uintptr(unsafe.Pointer(&mode)))
+	if r1 == 0 {
+		return
+	}
+	mode |= enableVirtualTerminalProcessing
+	procSetConsoleMode.Call(handle, uintptr(mode))
+}
+
+func addTuiLog(line string) {
+	tuiLogMu.Lock()
+	line = strings.TrimSpace(line)
+	tuiLogBuffer = append(tuiLogBuffer, line)
+	if len(tuiLogBuffer) > maxTuiLogs {
+		tuiLogBuffer = tuiLogBuffer[len(tuiLogBuffer)-maxTuiLogs:]
+	}
+	tuiLogMu.Unlock()
+	triggerTuiRefresh()
+}
+
+func triggerTuiRefresh() {
+	select {
+	case tuiRefreshCh <- struct{}{}:
+	default:
+	}
+}
+
+func visibleLength(s string) int {
+	inEscape := false
+	length := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\033' {
+			inEscape = true
+			continue
+		}
+		if inEscape {
+			if s[i] == 'm' {
+				inEscape = false
+			}
+			continue
+		}
+		length++
+	}
+	return length
+}
+
+func padVisible(s string, width int) string {
+	vl := visibleLength(s)
+	if vl >= width {
+		return s
+	}
+	return s + strings.Repeat(" ", width-vl)
+}
+
+func truncateVisible(s string, maxLen int) string {
+	vl := visibleLength(s)
+	if vl <= maxLen {
+		return s
+	}
+	var result strings.Builder
+	inEscape := false
+	visibleCount := 0
+	limit := maxLen - 3
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\033' {
+			inEscape = true
+			result.WriteByte(s[i])
+			continue
+		}
+		if inEscape {
+			result.WriteByte(s[i])
+			if s[i] == 'm' {
+				inEscape = false
+			}
+			continue
+		}
+		if visibleCount < limit {
+			result.WriteByte(s[i])
+			visibleCount++
+		} else {
+			break
+		}
+	}
+	result.WriteString("...")
+	result.WriteString(AnsiReset)
+	return result.String()
+}
+
+func drawTuiRow(buf *bytes.Buffer, content string, width int) {
+	buf.WriteString("│ ")
+	visibleLen := visibleLength(content)
+	buf.WriteString(content)
+	if visibleLen < width-4 {
+		buf.WriteString(strings.Repeat(" ", width-4-visibleLen))
+	}
+	buf.WriteString(" │\n")
+}
+
+func formatBytes(bytes int64) string {
+	if bytes == 0 {
+		return "0 B"
+	}
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.2f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+func drawTUI(cfg *Config) {
+	var buf bytes.Buffer
+	buf.WriteString("\033[H")
+
+	// Top Border
+	buf.WriteString("┌" + strings.Repeat("─", 68) + "┐\n")
+
+	// Title
+	title := "GOWAY Proxy Dashboard (v" + Version + ")"
+	pad := (68 - len(title)) / 2
+	buf.WriteString("│" + strings.Repeat(" ", pad) + AnsiCyan + title + AnsiReset + strings.Repeat(" ", 68-pad-len(title)) + "│\n")
+	buf.WriteString("├" + strings.Repeat("─", 68) + "┤\n")
+
+	// Config Panel
+	mode := "Server"
+	if cfg.Upstream != "" {
+		mode = "Client (HTTP + SOCKS5)"
+	}
+	drawTuiRow(&buf, "Mode:      "+AnsiGreen+mode+AnsiReset, 70)
+	drawTuiRow(&buf, fmt.Sprintf("Listen:    %s%s:%d%s", AnsiYellow, cfg.ProxyHost, cfg.ProxyPort, AnsiReset), 70)
+	if cfg.Upstream != "" {
+		drawTuiRow(&buf, "Upstream:  "+AnsiMagenta+cfg.Upstream+AnsiReset, 70)
+	}
+
+	var sslVerifyStr string
+	if cfg.Upstream != "" {
+		if cfg.VerifySSL {
+			sslVerifyStr = AnsiGreen + "Enabled" + AnsiReset
+		} else {
+			sslVerifyStr = AnsiRed + "Disabled (Insecure)" + AnsiReset
+		}
+	} else {
+		sslVerifyStr = AnsiGrey + "N/A" + AnsiReset
+	}
+
+	var authStr string
+	if cfg.Crypto != nil {
+		authStr = AnsiGreen + "Enabled (XOR)" + AnsiReset
+	} else if cfg.Upstream == "" {
+		authStr = AnsiRed + "DISABLED (Open Proxy!)" + AnsiReset
+	} else {
+		authStr = AnsiYellow + "Disabled" + AnsiReset
+	}
+
+	rowAuth := "Auth:      " + padVisible(authStr, 25) + " SSL Verify: " + sslVerifyStr
+	drawTuiRow(&buf, rowAuth, 70)
+
+	var dnsStr string
+	if cfg.Resolver != nil {
+		dnsStr = AnsiGreen + "Remote: " + cfg.Resolver.serverIP + AnsiReset
+	} else {
+		dnsStr = AnsiYellow + "System Default" + AnsiReset
+	}
+
+	bufKB := cfg.BufferSize / 1024
+	bufInfo := fmt.Sprintf("%d KB", bufKB)
+	if cfg.SocketBuffer > 0 {
+		bufInfo += fmt.Sprintf(" (Socket: %d KB)", cfg.SocketBuffer)
+	}
+	rowDNS := "DNS:       " + padVisible(dnsStr, 25) + " Buffer:     " + bufInfo
+	drawTuiRow(&buf, rowDNS, 70)
+
+	buf.WriteString("├" + strings.Repeat("─", 68) + "┤\n")
+
+	// Stats Panel
+	active := atomic.LoadInt64(&stats.activeConns)
+	currUp := atomic.LoadInt64(&stats.bytesUp)
+	currDown := atomic.LoadInt64(&stats.bytesDown)
+
+	activeStr := fmt.Sprintf("%d / %d", active, cfg.MaxConns)
+	speedDownStr := fmt.Sprintf("%.2f MB/s", stats.speedDown)
+	speedUpStr := fmt.Sprintf("%.2f MB/s", stats.speedUp)
+	totalDownStr := formatBytes(currDown)
+	totalUpStr := formatBytes(currUp)
+
+	rowConns := "Conns:     " + padVisible(activeStr, 25) + " Max Conns:   " + fmt.Sprintf("%d", cfg.MaxConns)
+	rowDown := "Download:  " + padVisible(speedDownStr, 25) + " Total Down:  " + totalDownStr
+	rowUp := "Upload:    " + padVisible(speedUpStr, 25) + " Total Up:    " + totalUpStr
+
+	drawTuiRow(&buf, rowConns, 70)
+	drawTuiRow(&buf, rowDown, 70)
+	drawTuiRow(&buf, rowUp, 70)
+
+	buf.WriteString("├" + strings.Repeat("─", 68) + "┤\n")
+
+	// Logs Panel
+	drawTuiRow(&buf, AnsiCyan+"Recent Logs:"+AnsiReset, 70)
+	tuiLogMu.Lock()
+	for i := 0; i < maxTuiLogs; i++ {
+		var line string
+		if i < len(tuiLogBuffer) {
+			line = tuiLogBuffer[i]
+		}
+		line = truncateVisible(line, 66)
+		drawTuiRow(&buf, line, 70)
+	}
+	tuiLogMu.Unlock()
+
+	// Bottom Border
+	buf.WriteString("└" + strings.Repeat("─", 68) + "┘\n")
+
+	os.Stdout.Write(buf.Bytes())
+}
+
+func tuiRefreshLoop(cfg *Config, shutdown <-chan struct{}) {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	drawTUI(cfg)
+	for {
+		select {
+		case <-shutdown:
+			return
+		case <-ticker.C:
+			drawTUI(cfg)
+		case <-tuiRefreshCh:
+			drawTUI(cfg)
+		}
 	}
 }
 
@@ -141,6 +408,7 @@ type Config struct {
 	MaxConns       int
 	BlockLocal     bool
 	AllowOpen      bool
+	TUI            bool
 
 	// Internal derived
 	Crypto        *Crypto
@@ -242,25 +510,45 @@ func parseLogLevel(levelStr string) LogLevel {
 
 func logDebug(format string, v ...interface{}) {
 	if globalLogLevel <= DEBUG {
-		log.Printf(AnsiCyan+"[DEBUG] "+format+AnsiReset, v...)
+		msg := fmt.Sprintf(format, v...)
+		if tuiEnabled {
+			addTuiLog(time.Now().Format("15:04:05") + " " + AnsiCyan + "[DEBUG] " + msg + AnsiReset)
+		} else {
+			log.Printf(AnsiCyan+"[DEBUG] "+format+AnsiReset, v...)
+		}
 	}
 }
 
 func logInfo(format string, v ...interface{}) {
 	if globalLogLevel <= INFO {
-		log.Printf(AnsiGreen+"[INFO] "+format+AnsiReset, v...)
+		msg := fmt.Sprintf(format, v...)
+		if tuiEnabled {
+			addTuiLog(time.Now().Format("15:04:05") + " " + AnsiGreen + "[INFO] " + msg + AnsiReset)
+		} else {
+			log.Printf(AnsiGreen+"[INFO] "+format+AnsiReset, v...)
+		}
 	}
 }
 
 func logWarn(format string, v ...interface{}) {
 	if globalLogLevel <= WARN {
-		log.Printf(AnsiYellow+"[WARN] "+format+AnsiReset, v...)
+		msg := fmt.Sprintf(format, v...)
+		if tuiEnabled {
+			addTuiLog(time.Now().Format("15:04:05") + " " + AnsiYellow + "[WARN] " + msg + AnsiReset)
+		} else {
+			log.Printf(AnsiYellow+"[WARN] "+format+AnsiReset, v...)
+		}
 	}
 }
 
 func logError(format string, v ...interface{}) {
 	if globalLogLevel <= ERROR {
-		log.Printf(AnsiRed+"[ERROR] "+format+AnsiReset, v...)
+		msg := fmt.Sprintf(format, v...)
+		if tuiEnabled {
+			addTuiLog(time.Now().Format("15:04:05") + " " + AnsiRed + "[ERROR] " + msg + AnsiReset)
+		} else {
+			log.Printf(AnsiRed+"[ERROR] "+format+AnsiReset, v...)
+		}
 	}
 }
 
@@ -557,6 +845,8 @@ func readWSFrame(r io.Reader, w io.Writer) ([]byte, error) {
 // --- Main Logic ---
 
 func main() {
+	initWindowsConsole()
+
 	pFlag := flag.String("p", "", "Listen Address (e.g. :8080)")
 	upFlag := flag.String("up", "", "Upstream WebSocket URL")
 	kFlag := flag.String("k", "", "Authentication Key")
@@ -569,13 +859,21 @@ func main() {
 	connTimeoutFlag := flag.Int("connection-timeout", 300, "Connection Timeout")
 	verifySSLFlag := flag.Bool("verify-ssl", false, "Enable SSL Verification")
 	maxConnFlag := flag.Int("max-conn", 1000, "Max Concurrent Connections")
-	blockLocalFlag := flag.Bool("block-local", false, "Drop local/LAN traffic (Client mode)")
+	blockLocalFlag := flag.Bool("block-local", true, "Drop local/LAN traffic (Client mode)")
 	allowOpenFlag := flag.Bool("allow-open", false, "Allow server mode without authentication key")
 	dnsFlag := flag.String("dns", "", "Remote DNS server IP (e.g. 8.8.8.8)")
+	tuiFlag := flag.Bool("tui", false, "Enable GUI-style Terminal User Interface")
+	versionFlag := flag.Bool("version", false, "Print version and exit")
 
 	flag.Parse()
 
+	if *versionFlag {
+		fmt.Printf("GOWAY v%s\n", Version)
+		os.Exit(0)
+	}
+
 	globalLogLevel = parseLogLevel(*logFlag)
+	tuiEnabled = *tuiFlag
 
 	if *pFlag == "" {
 		fmt.Println("Error: -p is required")
@@ -596,6 +894,7 @@ func main() {
 		MaxConns:       *maxConnFlag,
 		BlockLocal:     *blockLocalFlag,
 		AllowOpen:      *allowOpenFlag,
+		TUI:            tuiEnabled,
 	}
 
 	if *dnsFlag != "" {
@@ -637,53 +936,56 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Print Banner
-	mode := "Server"
-	if cfg.Upstream != "" {
-		mode = "Client (HTTP + SOCKS5)"
-	}
-
-	fmt.Printf("%sGOWAY v%s%s\n", AnsiCyan, Version, AnsiReset)
-	fmt.Printf("%s%s%s\n", AnsiCyan, strings.Repeat("-", 60), AnsiReset)
-
 	listenAddr := fmt.Sprintf("%s:%d", cfg.ProxyHost, cfg.ProxyPort)
-	fmt.Printf(" [+] Mode:        %s%s%s\n", AnsiGreen, mode, AnsiReset)
-	fmt.Printf(" [+] Listen:      %s%s%s\n", AnsiYellow, listenAddr, AnsiReset)
 
-	if cfg.Upstream != "" {
-		fmt.Printf(" [+] Upstream:    %s%s%s\n", AnsiMagenta, cfg.Upstream, AnsiReset)
-		verifyStr := "Disabled (Insecure)"
-		verifyCol := AnsiRed
-		if cfg.VerifySSL {
-			verifyStr = "Enabled"
-			verifyCol = AnsiGreen
+	if !tuiEnabled {
+		// Print Banner
+		mode := "Server"
+		if cfg.Upstream != "" {
+			mode = "Client (HTTP + SOCKS5)"
 		}
-		fmt.Printf(" [+] SSL Verify:  %s%s%s\n", verifyCol, verifyStr, AnsiReset)
-		fmt.Printf(" [+] User-Agent:  %sRandomized (Sticky)%s\n", AnsiGreen, AnsiReset)
-	}
 
-	if cfg.Resolver != nil {
-		fmt.Printf(" [+] DNS:         %sRemote: %s (UDP+TCP)%s\n", AnsiGreen, cfg.Resolver.serverIP, AnsiReset)
-	} else {
-		fmt.Printf(" [+] DNS:         %sSystem default%s\n", AnsiYellow, AnsiReset)
-	}
+		fmt.Printf("%sGOWAY v%s%s\n", AnsiCyan, Version, AnsiReset)
+		fmt.Printf("%s%s%s\n", AnsiCyan, strings.Repeat("-", 60), AnsiReset)
 
-	if cfg.Crypto != nil {
-		fmt.Printf(" [+] Auth:        %sEnabled (XOR)%s\n", AnsiGreen, AnsiReset)
-	} else if cfg.Upstream == "" {
-		fmt.Printf(" [+] Auth:        %sDISABLED (--allow-open enabled — Open Proxy!)%s\n", AnsiRed, AnsiReset)
-	} else {
-		// Client mode without key: server may still accept unauthenticated
-		fmt.Printf(" [+] Auth:        %sDISABLED%s\n", AnsiYellow, AnsiReset)
-	}
+		fmt.Printf(" [+] Mode:        %s%s%s\n", AnsiGreen, mode, AnsiReset)
+		fmt.Printf(" [+] Listen:      %s%s%s\n", AnsiYellow, listenAddr, AnsiReset)
 
-	bufKB := cfg.BufferSize / 1024
-	bufInfo := fmt.Sprintf("%d KB", bufKB)
-	if cfg.SocketBuffer > 0 {
-		bufInfo += fmt.Sprintf(" (Socket: %d KB)", cfg.SocketBuffer)
+		if cfg.Upstream != "" {
+			fmt.Printf(" [+] Upstream:    %s%s%s\n", AnsiMagenta, cfg.Upstream, AnsiReset)
+			verifyStr := "Disabled (Insecure)"
+			verifyCol := AnsiRed
+			if cfg.VerifySSL {
+				verifyStr = "Enabled"
+				verifyCol = AnsiGreen
+			}
+			fmt.Printf(" [+] SSL Verify:  %s%s%s\n", verifyCol, verifyStr, AnsiReset)
+			fmt.Printf(" [+] User-Agent:  %sRandomized (Sticky)%s\n", AnsiGreen, AnsiReset)
+		}
+
+		if cfg.Resolver != nil {
+			fmt.Printf(" [+] DNS:         %sRemote: %s (UDP+TCP)%s\n", AnsiGreen, cfg.Resolver.serverIP, AnsiReset)
+		} else {
+			fmt.Printf(" [+] DNS:         %sSystem default%s\n", AnsiYellow, AnsiReset)
+		}
+
+		if cfg.Crypto != nil {
+			fmt.Printf(" [+] Auth:        %sEnabled (XOR)%s\n", AnsiGreen, AnsiReset)
+		} else if cfg.Upstream == "" {
+			fmt.Printf(" [+] Auth:        %sDISABLED (--allow-open enabled — Open Proxy!)%s\n", AnsiRed, AnsiReset)
+		} else {
+			// Client mode without key: server may still accept unauthenticated
+			fmt.Printf(" [+] Auth:        %sDISABLED%s\n", AnsiYellow, AnsiReset)
+		}
+
+		bufKB := cfg.BufferSize / 1024
+		bufInfo := fmt.Sprintf("%d KB", bufKB)
+		if cfg.SocketBuffer > 0 {
+			bufInfo += fmt.Sprintf(" (Socket: %d KB)", cfg.SocketBuffer)
+		}
+		fmt.Printf(" [+] Buffer:      %s\n", bufInfo)
+		fmt.Printf(" [+] Max Conns:   %d\n", cfg.MaxConns)
 	}
-	fmt.Printf(" [+] Buffer:      %s\n", bufInfo)
-	fmt.Printf(" [+] Max Conns:   %d\n", cfg.MaxConns)
 
 	cfg.TLSBase = &tls.Config{
 		InsecureSkipVerify: !cfg.VerifySSL,
@@ -703,8 +1005,10 @@ func main() {
 		},
 	}
 
-	fmt.Printf("%s%s%s\n", AnsiCyan, strings.Repeat("-", 60), AnsiReset)
-	fmt.Printf("%s[INFO] Proxy listening... (Press Ctrl+C to stop)%s\n\n", AnsiCyan, AnsiReset)
+	if !tuiEnabled {
+		fmt.Printf("%s%s%s\n", AnsiCyan, strings.Repeat("-", 60), AnsiReset)
+		fmt.Printf("%s[INFO] Proxy listening... (Press Ctrl+C to stop)%s\n\n", AnsiCyan, AnsiReset)
+	}
 
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
@@ -722,6 +1026,12 @@ func main() {
 		close(shutdown)
 		listener.Close()
 	}()
+
+	if tuiEnabled {
+		fmt.Print("\033[2J\033[?25l") // Clear screen & hide cursor
+		defer fmt.Print("\033[?25h\033[2J\033[H") // Restore cursor & clear screen on exit
+		go tuiRefreshLoop(&cfg, shutdown)
+	}
 
 	go monitorStats(shutdown)
 
@@ -757,7 +1067,11 @@ func main() {
 
 func monitorStats(shutdown <-chan struct{}) {
 	var lastUp, lastDown int64
-	ticker := time.NewTicker(3 * time.Second)
+	interval := 3 * time.Second
+	if tuiEnabled {
+		interval = 1 * time.Second
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -768,15 +1082,23 @@ func monitorStats(shutdown <-chan struct{}) {
 			currDown := atomic.LoadInt64(&stats.bytesDown)
 			active := atomic.LoadInt64(&stats.activeConns)
 
-			upSpeed := float64(currUp-lastUp) / 3.0 / 1024.0 / 1024.0
-			downSpeed := float64(currDown-lastDown) / 3.0 / 1024.0 / 1024.0
+			secs := interval.Seconds()
+			upSpeed := float64(currUp-lastUp) / secs / 1024.0 / 1024.0
+			downSpeed := float64(currDown-lastDown) / secs / 1024.0 / 1024.0
 
 			lastUp = currUp
 			lastDown = currDown
 
-			if globalLogLevel <= INFO {
-				fmt.Printf("\r%s[STATS] Conns: %d | Up: %.2f MB/s | Down: %.2f MB/s%s",
-					AnsiGrey, active, upSpeed, downSpeed, AnsiReset)
+			stats.speedUp = upSpeed
+			stats.speedDown = downSpeed
+
+			if !tuiEnabled {
+				if globalLogLevel <= INFO {
+					fmt.Printf("\r%s[STATS] Conns: %d | Up: %.2f MB/s | Down: %.2f MB/s%s",
+						AnsiGrey, active, upSpeed, downSpeed, AnsiReset)
+				}
+			} else {
+				triggerTuiRefresh()
 			}
 		}
 	}
