@@ -7,8 +7,8 @@
 Way Proxy 是一个**轻量级**、**高性能**的 HTTP/SOCKS5 转 WebSocket 代理工具，专为流媒体传输、高并发下载以及各种复杂网络环境设计。
 
 本项目包含两个语言的实现版本，它们具有相同的功能和参数用法：
-- 🐍 **Pyway**: 基于 Python `asyncio` 实现的异步高性能版本 (当前最新: v2.7.8G)。
-- 🐹 **Goway**: 基于 Go 语言实现的高并发、低延迟编译型版本 (当前最新: v1.1.15a)。
+- 🐍 **Pyway**: 基于 Python `asyncio` 实现的异步高性能版本 (当前最新: v1.3.2)。
+- 🐹 **Goway**: 基于 Go 语言实现的高并发、低延迟编译型版本 (当前最新: v1.3.2)。
 
 ---
 
@@ -46,10 +46,10 @@ Way Proxy 是一个**轻量级**、**高性能**的 HTTP/SOCKS5 转 WebSocket �
 ### 使用 Pyway (Python)
 
 1. **环境要求**: Python 3.7+
-2. **下载脚本**: 进入 `pyway` 目录，找到最新的脚本 (例如 `pyway2.7.1g.py`)
+2. **下载脚本**: 进入 `pyway` 目录，找到最新的脚本 (例如 `pyway1.3.2.py`)
 3. **运行**:
    ```bash
-   python pyway/pyway2.7.1g.py -p :8080
+   python pyway/pyway1.3.2.py -p :8080
    ```
 
 *推荐安装 `aiodns` 以获取更快的非阻塞解析性能: `pip install aiodns`*
@@ -63,7 +63,7 @@ Goway 提供更好的多线程性能与极低的运行内存。
 3. **编译并运行**:
    ```bash
    cd goway
-   go build -o goway goway1.1.8a.go
+   go build -ldflags="-s -w" -o goway goway1.3.2.go console_windows.go console_other.go
    ./goway -p :8080
    ```
 
@@ -80,7 +80,7 @@ Server 端不使用 `-up` 参数，仅监听一个端口提供 WebSocket 代理�
 ```bash
 # 示例：监听 8080 端口，并设置加密密钥为 "my_secret_key"
 # Python 版本
-python pyway/pyway2.7.1g.py -p :8080 -k "my_secret_key"
+python pyway/pyway1.3.2.py -p :8080 -k "my_secret_key"
 
 # Go 版本 (推荐用于 Server)
 ./goway -p :8080 -k "my_secret_key"
@@ -93,7 +93,7 @@ Client 端通过 `-up` 参数连接到 Server 端，并在本地暴露 HTTP/SOCK
 ```bash
 # 示例：在本地 1080 端口开启 HTTP/SOCKS5 代理，连接到 服务器 WS，带上密钥
 # Python 版本
-python pyway/pyway2.7.1g.py -p :1080 -up ws://<你的服务器IP>:8080 -k "my_secret_key"
+python pyway/pyway1.3.2.py -p :1080 -up ws://<你的服务器IP>:8080 -k "my_secret_key"
 
 # Go 版本
 ./goway -p :1080 -up ws://<你的服务器IP>:8080 -k "my_secret_key"
@@ -109,22 +109,24 @@ python pyway/pyway2.7.1g.py -p :1080 -up ws://<你的服务器IP>:8080 -k "my_se
 
 由于 Pyway 和 Goway 共享同一套设计架构，它们的命令行参数完全一致：
 
-| 参数 | 必需 | 默认值 | 描述 |
+| 参数 (Go / Python) | 必需 | 默认值 | 描述 / 隐式生效状态 |
 | :--- | :---: | :---: | :--- |
 | `-p` | ✅ | - | 监听的地址和端口 (如 `:8080` 或 `127.0.0.1:1080`)。 |
 | `-up` | ❌ | - | 上游的 WebSocket URL。如果指定了该参数，程序将作为 **客户端** 运行，否则作为 **服务器端** 运行。 |
 | `-k` | ✅* | - | 流量混淆/认证密钥。（*服务端模式必须，除非使用 `--allow-open`） |
-| `-fakehost`| ❌ | - | 伪造的 WS握手 `Host` 头以配合 CDN 或 Nginx 反代过白名单。 |
-| `--block-local`| ❌ | `false`| 客户端防回环/防死循环特性：主动拦截发往 `localhost` 及局域网的请求。 |
+| `-fakehost` | ❌ | - | 伪造的 WS握手 `Host` 头以配合 CDN 或 Nginx 反代过白名单。 |
+| `--block-local` / `-block-local` | ❌ | `true` | **默认启用**。客户端防回环/防死循环特性：主动拦截发往 `localhost` 及局域网的请求。在 Python 中可传入 `--no-block-local` 关闭。 |
 | `-log` | ❌ | `INFO` | 日志打印级别: `DEBUG`, `INFO`, `WARN`, `ERROR`。 |
-| `-W` | ❌ | `64` | 应用层缓冲区大小 (单位: KB)，视频流或大文件建议加大到 `256` 甚至 `512`。|
-| `--socket-buffer`| ❌ | `0`(系统默认) | 覆盖 OS 的 TCP Socket 缓冲区 (单位: KB)，用于进一步优化吞吐量。 |
-| `--max-conn` | ❌ | `1000` | 安全限制: 单实例最大并发连接数（DoS 防护）。 |
-| `--connection-timeout`| ❌ | `300` | 连接空闲超时时间，超过该秒数未活动的连接结构会被主动回收。 |
-| `--verify-ssl` | ❌ | `false`| 在客户端模式下启动时，是否对 `wss://` 连接进行严格的证书验证。 |
-| `--no-tcp-nodelay` | ❌ | `false`| 禁用 TCP_NODELAY 算法 (不推荐)。 |
-| `--no-tcp-keepalive` | ❌ | `false`| 禁用 TCP KeepAlive (不推荐)。 |
-| `--allow-open` | ❌ | `false`| 允许服务端模式在无密钥的情况下运行（不推荐，存在开放代理风险）。 |
+| `-W` | ❌ | `256` | **默认 256 KB**。应用层单次读取的缓冲区大小 (单位: KB)。 |
+| `--socket-buffer` / `-socket-buffer` | ❌ | `0` (系统默认) | 覆盖 OS 的 TCP Socket 缓冲区 (单位: KB)，若为 0 则使用系统自动调节。 |
+| `--max-conn` / `-max-conn` | ❌ | `1000` | 安全限制: 单实例最大并发连接数（DoS 防护）。 |
+| `--connection-timeout` / `-connection-timeout` | ❌ | `300` | 连接空闲超时时间（秒），超过该秒数未活动的连接结构会被主动回收。 |
+| `--verify-ssl` / `-verify-ssl` | ❌ | `false` | 在客户端模式下启动时，是否对 `wss://` 连接进行严格的证书验证。 |
+| `--no-tcp-nodelay` / `--no-tcp-nodelay` | ❌ | `false` | 禁用 TCP_NODELAY 算法 (不推荐)。 |
+| `--no-tcp-keepalive` / `--no-tcp-keepalive` | ❌ | `false` | 禁用 TCP KeepAlive (不推荐)。 |
+| `--allow-open` / `--allow-open` | ❌ | `false` | 允许服务端模式在无密钥的情况下运行（不推荐，存在开放代理风险）。 |
+| `--tui` / `-tui` | ❌ | `false` | 是否开启 GUI-Style 仪表盘面板进行仪表可视化展示。 |
+| `--version` / `-version` | ❌ | - | 打印版本号并退出。 |
 
 ---
 
@@ -135,7 +137,7 @@ python pyway/pyway2.7.1g.py -p :1080 -up ws://<你的服务器IP>:8080 -k "my_se
 
 ```bash
 # 启动本地客户端 (使用 512KB Socket 和应用缓冲)
-python pyway/pyway2.7.1g.py -p :9193 -up wss://vps-ip:443/ws -W 512 --socket-buffer 2048 -k "secret"
+python pyway/pyway1.3.2.py -p :9193 -up wss://vps-ip:443/ws -W 512 --socket-buffer 2048 -k "secret"
 
 # 使用 yt-dlp 通过该代理下载
 yt-dlp --proxy "http://127.0.0.1:9193" -f "bv*+ba/b" "YOUR_VIDEO_URL"
