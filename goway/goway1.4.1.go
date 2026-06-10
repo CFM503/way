@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	Version        = "1.4.0"
+	Version        = "1.4.1"
 	MaxWSFrameSize = 16 * 1024 * 1024 // 16MB
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -1157,6 +1157,29 @@ func main() {
 	}
 
 	cfg.Crypto = NewCrypto(cfg.Key)
+
+	// Parse upstream URL once at startup — avoids per-connection url.Parse alloc.
+	if cfg.Upstream != "" {
+		parsedUp, upErr := url.Parse(cfg.Upstream)
+		if upErr != nil {
+			fmt.Printf("Error: invalid upstream URL '%s': %v\n", cfg.Upstream, upErr)
+			os.Exit(1)
+		}
+		cfg.ParsedUpstream = parsedUp
+		cfg.UpstreamIsWSS = strings.EqualFold(parsedUp.Scheme, "wss")
+
+		upHost := parsedUp.Hostname()
+		upPort := parsedUp.Port()
+		if upPort == "" {
+			if cfg.UpstreamIsWSS {
+				upPort = "443"
+			} else {
+				upPort = "80"
+			}
+		}
+		cfg.UpstreamHost = upHost
+		cfg.UpstreamPort = upPort
+	}
 
 	// Server mode without authentication is an open proxy risk
 	if cfg.Upstream == "" && cfg.Crypto == nil && !cfg.AllowOpen {
