@@ -90,6 +90,14 @@ var (
 	tuiRefreshCh = make(chan struct{}, 1)
 )
 
+func initWindowsConsole() {
+	// No-op on single-file cross-platform version
+}
+
+func getTerminalSize() (width int, height int) {
+	return 80, 24
+}
+
 func addTuiLog(line string) {
 	tuiLogMu.Lock()
 	line = strings.TrimSpace(line)

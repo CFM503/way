@@ -63,7 +63,7 @@ Goway 提供更好的多线程性能与极低的运行内存。
 3. **编译并运行**:
    ```bash
    cd goway
-   go build -ldflags="-s -w" -o goway goway1.3.2.go console_windows.go console_other.go
+   go build -ldflags="-s -w" -o goway goway1.3.2.go
    ./goway -p :8080
    ```
 
