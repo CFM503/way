@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	mrand "math/rand"
 	"net"
 	"net/url"
@@ -29,7 +30,7 @@ import (
 )
 
 const (
-	Version        = "1.3.3"
+	Version        = "1.4.0"
 	MaxWSFrameSize = 16 * 1024 * 1024 // 16MB
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -39,7 +40,17 @@ const (
 var (
 	okBytes = []byte("OK\n")
 	crlfB   = []byte{'\r', '\n'}
+
+	// Pre-allocated static responses (avoid per-connection alloc)
+	socks5OKResp     = []byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
+	http200Resp      = []byte("HTTP/1.1 200 Connection Established\r\n\r\n")
+	http400Resp      = []byte("HTTP/1.1 400 Bad Request\r\n\r\n")
+	wsUpgradePrefix  = []byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ")
+	wsUpgradeSuffix  = []byte("\r\n\r\n")
 )
+
+// Small-frame stack threshold for readWSFrame pool optimization
+const smallFrameSize = 512
 
 // ANSI colors
 const (
@@ -53,13 +64,21 @@ const (
 )
 
 // --- Statistics ---
+// Cache-line layout: hot counters (written by every relay goroutine) separated
+// from speed floats (written once per second by monitorStats) to prevent
+// false sharing on multi-core CPUs.
 
 type Statistics struct {
+	// Hot path — written by every relay goroutine via atomic ops.
 	activeConns int64
 	bytesUp     int64
 	bytesDown   int64
-	speedUp     float64
-	speedDown   float64
+	_pad        [5]int64 // pad to 64-byte cache line boundary
+
+	// Written only by monitorStats (once/sec); stored as math/bits uint64
+	// to allow atomic load/store without a mutex.
+	speedUpBits   uint64 // math.Float64bits(MB/s)
+	speedDownBits uint64
 }
 
 var stats Statistics
@@ -80,12 +99,27 @@ func (s *Statistics) AddBytes(up, down int64) {
 		atomic.AddInt64(&s.bytesDown, down)
 	}
 }
+
+func (s *Statistics) SetSpeeds(up, down float64) {
+	atomic.StoreUint64(&s.speedUpBits, math.Float64bits(up))
+	atomic.StoreUint64(&s.speedDownBits, math.Float64bits(down))
+}
+
+func (s *Statistics) Speeds() (up, down float64) {
+	return math.Float64frombits(atomic.LoadUint64(&s.speedUpBits)),
+		math.Float64frombits(atomic.LoadUint64(&s.speedDownBits))
+}
 // --- TUI / GUI-Style CLI Implementation ---
 
 var (
-	tuiEnabled   bool
-	tuiLogMu     sync.Mutex
-	tuiLogBuffer []string
+	tuiEnabled bool
+	tuiLogMu   sync.Mutex
+
+	// Ring buffer for TUI logs — avoids O(n) slice-copy every 100 entries.
+	tuiRingBuf [100]string
+	tuiRingLen int // number of valid entries (≤ 100)
+	tuiRingPos int // index of next write slot
+
 	maxTuiLogs   = 12
 	tuiRefreshCh = make(chan struct{}, 1)
 )
@@ -101,12 +135,38 @@ func getTerminalSize() (width int, height int) {
 func addTuiLog(line string) {
 	tuiLogMu.Lock()
 	line = strings.TrimSpace(line)
-	tuiLogBuffer = append(tuiLogBuffer, line)
-	if len(tuiLogBuffer) > 100 {
-		tuiLogBuffer = tuiLogBuffer[len(tuiLogBuffer)-100:]
+	tuiRingBuf[tuiRingPos] = line
+	tuiRingPos = (tuiRingPos + 1) % len(tuiRingBuf)
+	if tuiRingLen < len(tuiRingBuf) {
+		tuiRingLen++
 	}
 	tuiLogMu.Unlock()
 	triggerTuiRefresh()
+}
+
+// tuiLogSlice returns the last n entries from the ring buffer in order.
+// Must be called with tuiLogMu held.
+func tuiLogSlice(n int) []string {
+	if n > tuiRingLen {
+		n = tuiRingLen
+	}
+	out := make([]string, n)
+	// oldest entry that falls within the window
+	start := (tuiRingPos - n + len(tuiRingBuf)) % len(tuiRingBuf)
+	for i := 0; i < n; i++ {
+		out[i] = tuiRingBuf[(start+i)%len(tuiRingBuf)]
+	}
+	return out
+}
+
+// spaces is a 200-char padding source; sliced instead of strings.Repeat per call.
+const spaces = "                                                                                                                                                                                                        "
+
+func padRight(s string, n int) string {
+	if n <= 0 || n > len(spaces) {
+		return s + spaces[:min(n, len(spaces))]
+	}
+	return s + spaces[:n]
 }
 
 func triggerTuiRefresh() {
@@ -115,6 +175,8 @@ func triggerTuiRefresh() {
 	default:
 	}
 }
+
+
 
 func visibleLength(s string) int {
 	inEscape := false
@@ -140,7 +202,11 @@ func padVisible(s string, width int) string {
 	if vl >= width {
 		return s
 	}
-	return s + strings.Repeat(" ", width-vl)
+	pad := width - vl
+	if pad > len(spaces) {
+		pad = len(spaces)
+	}
+	return s + spaces[:pad]
 }
 
 func truncateVisible(s string, maxLen int) string {
@@ -181,8 +247,12 @@ func drawTuiRow(buf *bytes.Buffer, content string, width int) {
 	buf.WriteString("│ ")
 	visibleLen := visibleLength(content)
 	buf.WriteString(content)
-	if visibleLen < width-4 {
-		buf.WriteString(strings.Repeat(" ", width-4-visibleLen))
+	pad := width - 4 - visibleLen
+	if pad > 0 {
+		if pad > len(spaces) {
+			pad = len(spaces)
+		}
+		buf.WriteString(spaces[:pad])
 	}
 	buf.WriteString(" │\n")
 }
@@ -223,20 +293,39 @@ func drawTUI(cfg *Config) {
 	innerWidth := boxWidth - 4
 	colWidth := innerWidth / 2
 
+	// Cache border strings (avoid strings.Repeat every 500ms)
+	if cfg.TUIBorderWidth != boxWidth {
+		hLine := strings.Repeat("─", boxWidth-2)
+		cfg.TUIBorderTop = "┌" + hLine + "┐\n"
+		cfg.TUIBorderMid = "├" + hLine + "┤\n"
+		cfg.TUIBorderBottom = "└" + hLine + "┘\n"
+		cfg.TUIBorderWidth = boxWidth
+	}
+
 	var buf bytes.Buffer
+	buf.Grow(boxWidth * (termHeight + 2)) // pre-allocate for full screen
 	buf.WriteString("\033[H\033[J")
 
 	// Top Border
-	buf.WriteString("┌" + strings.Repeat("─", boxWidth-2) + "┐\n")
+	buf.WriteString(cfg.TUIBorderTop)
 
-	// Title
+	// Title — use spaces slice instead of strings.Repeat
 	title := "GOWAY Proxy Dashboard (v" + Version + ")"
 	pad := (boxWidth - 2 - len(title)) / 2
 	if pad < 0 {
 		pad = 0
 	}
-	buf.WriteString("│" + strings.Repeat(" ", pad) + AnsiCyan + title + AnsiReset + strings.Repeat(" ", boxWidth-2-pad-len(title)) + "│\n")
-	buf.WriteString("├" + strings.Repeat("─", boxWidth-2) + "┤\n")
+	rpad := boxWidth - 2 - pad - len(title)
+	buf.WriteString("│")
+	if pad > 0 && pad <= len(spaces) {
+		buf.WriteString(spaces[:pad])
+	}
+	buf.WriteString(AnsiCyan + title + AnsiReset)
+	if rpad > 0 && rpad <= len(spaces) {
+		buf.WriteString(spaces[:rpad])
+	}
+	buf.WriteString("│\n")
+	buf.WriteString(cfg.TUIBorderMid)
 
 	// Config Panel
 	mode := "Server"
@@ -329,16 +418,17 @@ func drawTUI(cfg *Config) {
 		configLines = 7
 	}
 
-	buf.WriteString("├" + strings.Repeat("─", boxWidth-2) + "┤\n")
+	buf.WriteString(cfg.TUIBorderMid)
 
 	// Stats Panel
 	active := atomic.LoadInt64(&stats.activeConns)
 	currUp := atomic.LoadInt64(&stats.bytesUp)
 	currDown := atomic.LoadInt64(&stats.bytesDown)
+	speedUp, speedDown := stats.Speeds() // atomic load — no race
 
 	activeStr := fmt.Sprintf("%d / %d", active, cfg.MaxConns)
-	speedDownStr := fmt.Sprintf("%.2f MB/s", stats.speedDown)
-	speedUpStr := fmt.Sprintf("%.2f MB/s", stats.speedUp)
+	speedDownStr := fmt.Sprintf("%.2f MB/s", speedDown)
+	speedUpStr := fmt.Sprintf("%.2f MB/s", speedUp)
 	totalDownStr := formatBytes(currDown)
 	totalUpStr := formatBytes(currUp)
 
@@ -346,7 +436,7 @@ func drawTUI(cfg *Config) {
 	drawTuiRow(&buf, formatTwoColumns("Download:  ", speedDownStr, "Total Down:  ", totalDownStr, colWidth), boxWidth)
 	drawTuiRow(&buf, formatTwoColumns("Upload:    ", speedUpStr, "Total Up:    ", totalUpStr, colWidth), boxWidth)
 
-	buf.WriteString("├" + strings.Repeat("─", boxWidth-2) + "┤\n")
+	buf.WriteString(cfg.TUIBorderMid)
 
 	// Calculate remaining lines for logs
 	usedHeight := 3 + configLines + 4 + 2 + 1
@@ -355,29 +445,22 @@ func drawTUI(cfg *Config) {
 		maxTuiLogs = 5
 	}
 
-	// Logs Panel
+	// Logs Panel — read from ring buffer (no slice reallocation)
 	drawTuiRow(&buf, AnsiCyan+"Recent Logs:"+AnsiReset, boxWidth)
 	tuiLogMu.Lock()
-	numLogs := len(tuiLogBuffer)
-	startIdx := numLogs - maxTuiLogs
-	if startIdx < 0 {
-		startIdx = 0
-	}
-
-	printed := 0
-	for i := startIdx; i < numLogs; i++ {
-		line := tuiLogBuffer[i]
-		line = truncateVisible(line, innerWidth)
-		drawTuiRow(&buf, line, boxWidth)
-		printed++
-	}
-	for i := printed; i < maxTuiLogs; i++ {
-		drawTuiRow(&buf, "", boxWidth)
-	}
+	logs := tuiLogSlice(maxTuiLogs)
 	tuiLogMu.Unlock()
 
+	for _, line := range logs {
+		line = truncateVisible(line, innerWidth)
+		drawTuiRow(&buf, line, boxWidth)
+	}
+	for i := len(logs); i < maxTuiLogs; i++ {
+		drawTuiRow(&buf, "", boxWidth)
+	}
+
 	// Bottom Border
-	buf.WriteString("└" + strings.Repeat("─", boxWidth-2) + "┘\n")
+	buf.WriteString(cfg.TUIBorderBottom)
 
 	os.Stdout.Write(buf.Bytes())
 }
@@ -391,8 +474,26 @@ func tuiRefreshLoop(cfg *Config, shutdown <-chan struct{}) {
 		case <-shutdown:
 			return
 		case <-ticker.C:
+			// Drain any pending channel signals so we draw once, not many times.
+		drain:
+			for {
+				select {
+				case <-tuiRefreshCh:
+				default:
+					break drain
+				}
+			}
 			drawTUI(cfg)
 		case <-tuiRefreshCh:
+			// Coalesce burst: drain remaining signals before drawing.
+		drain2:
+			for {
+				select {
+				case <-tuiRefreshCh:
+				default:
+					break drain2
+				}
+			}
 			drawTUI(cfg)
 		}
 	}
@@ -469,20 +570,34 @@ type Config struct {
 	BufPool       *sync.Pool
 	HeaderBufPool *sync.Pool
 	TLSBase       *tls.Config
+
+	// Pre-parsed upstream URL (avoid per-connection url.Parse)
+	ParsedUpstream *url.URL
+	UpstreamHost   string
+	UpstreamPort   string
+	UpstreamIsWSS  bool
+
+	// TUI border cache
+	TUIBorderTop    string
+	TUIBorderMid    string
+	TUIBorderBottom string
+	TUIBorderWidth  int
 }
 
 // --- DNS Resolver ---
 
 type RemoteResolver struct {
-	serverIP string
-	resolver *net.Resolver
-	timeout  time.Duration
+	serverIP  string
+	resolver  *net.Resolver
+	sysResolv *net.Resolver // pre-allocated; avoids per-call allocation on fallback
+	timeout   time.Duration
 }
 
 func NewRemoteResolver(serverIP string) *RemoteResolver {
 	r := &RemoteResolver{
-		serverIP: serverIP,
-		timeout:  5 * time.Second,
+		serverIP:  serverIP,
+		timeout:   5 * time.Second,
+		sysResolv: &net.Resolver{PreferGo: false},
 	}
 	r.resolver = &net.Resolver{
 		PreferGo: true,
@@ -516,11 +631,10 @@ func (r *RemoteResolver) Resolve(host string) (string, error) {
 		logWarn("[DNS] Remote lookup returned no addresses for %s, falling back to system DNS", host)
 	}
 
-	// Fallback to system DNS
-	sysResolver := &net.Resolver{PreferGo: false}
+	// Fallback to pre-allocated system resolver (no heap alloc here)
 	sysCtx, sysCancel := context.WithTimeout(context.Background(), r.timeout)
 	defer sysCancel()
-	sysAddrs, sysErr := sysResolver.LookupHost(sysCtx, host)
+	sysAddrs, sysErr := r.sysResolv.LookupHost(sysCtx, host)
 	if sysErr != nil {
 		return "", fmt.Errorf("DNS resolution failed for %s: remote=%v, system=%v", host, err, sysErr)
 	}
@@ -561,9 +675,8 @@ func parseLogLevel(levelStr string) LogLevel {
 
 func logDebug(format string, v ...interface{}) {
 	if globalLogLevel <= DEBUG {
-		msg := fmt.Sprintf(format, v...)
 		if tuiEnabled {
-			addTuiLog(time.Now().Format("15:04:05") + " " + AnsiCyan + "[DEBUG] " + msg + AnsiReset)
+			addTuiLog(time.Now().Format("15:04:05") + " " + AnsiCyan + "[DEBUG] " + fmt.Sprintf(format, v...) + AnsiReset)
 		} else {
 			log.Printf(AnsiCyan+"[DEBUG] "+format+AnsiReset, v...)
 		}
@@ -572,9 +685,8 @@ func logDebug(format string, v ...interface{}) {
 
 func logInfo(format string, v ...interface{}) {
 	if globalLogLevel <= INFO {
-		msg := fmt.Sprintf(format, v...)
 		if tuiEnabled {
-			addTuiLog(time.Now().Format("15:04:05") + " " + AnsiGreen + "[INFO] " + msg + AnsiReset)
+			addTuiLog(time.Now().Format("15:04:05") + " " + AnsiGreen + "[INFO] " + fmt.Sprintf(format, v...) + AnsiReset)
 		} else {
 			log.Printf(AnsiGreen+"[INFO] "+format+AnsiReset, v...)
 		}
@@ -583,9 +695,8 @@ func logInfo(format string, v ...interface{}) {
 
 func logWarn(format string, v ...interface{}) {
 	if globalLogLevel <= WARN {
-		msg := fmt.Sprintf(format, v...)
 		if tuiEnabled {
-			addTuiLog(time.Now().Format("15:04:05") + " " + AnsiYellow + "[WARN] " + msg + AnsiReset)
+			addTuiLog(time.Now().Format("15:04:05") + " " + AnsiYellow + "[WARN] " + fmt.Sprintf(format, v...) + AnsiReset)
 		} else {
 			log.Printf(AnsiYellow+"[WARN] "+format+AnsiReset, v...)
 		}
@@ -594,9 +705,8 @@ func logWarn(format string, v ...interface{}) {
 
 func logError(format string, v ...interface{}) {
 	if globalLogLevel <= ERROR {
-		msg := fmt.Sprintf(format, v...)
 		if tuiEnabled {
-			addTuiLog(time.Now().Format("15:04:05") + " " + AnsiRed + "[ERROR] " + msg + AnsiReset)
+			addTuiLog(time.Now().Format("15:04:05") + " " + AnsiRed + "[ERROR] " + fmt.Sprintf(format, v...) + AnsiReset)
 		} else {
 			log.Printf(AnsiRed+"[ERROR] "+format+AnsiReset, v...)
 		}
@@ -705,6 +815,7 @@ func writeWSFrame(w io.Writer, data []byte, opcode byte, masked bool) error {
 	}
 
 	// Masked: single allocation for header + 4-byte maskKey + data
+	// Small frames (≤512B payload): stack buffer avoids heap alloc entirely
 	dl := len(data)
 	hdrLen := 2
 	if dl >= 65536 {
@@ -713,7 +824,13 @@ func writeWSFrame(w io.Writer, data []byte, opcode byte, masked bool) error {
 		hdrLen = 4
 	}
 	total := hdrLen + 4 + dl
-	frame := make([]byte, total)
+	var frame []byte
+	var stackBuf [smallFrameSize + 14]byte // max header(10) + mask(4) + payload(512)
+	if total <= len(stackBuf) {
+		frame = stackBuf[:total]
+	} else {
+		frame = make([]byte, total)
+	}
 
 	// Build header in-place (avoids getWSHeader stack→heap escape)
 	frame[0] = 0b10000000 | opcode
@@ -802,6 +919,18 @@ func setTCPReadDeadline(tcpConn *net.TCPConn, timeoutSec int) {
 	tcpConn.SetReadDeadline(time.Now().Add(time.Duration(timeoutSec) * time.Second))
 }
 
+// deadlineThrottle avoids calling SetReadDeadline on every relay iteration.
+// Returns true if the deadline should be updated (at most once per second).
+// time.Now() is ~20ns vs SetReadDeadline ~500ns syscall, so checking first saves ~96%.
+func deadlineThrottle(lastSet *time.Time) bool {
+	now := time.Now()
+	if now.Sub(*lastSet) >= time.Second {
+		*lastSet = now
+		return true
+	}
+	return false
+}
+
 func readUntilCRLFCRLF(br *bufio.Reader) ([]byte, error) {
 	var buf bytes.Buffer
 	buf.Grow(MaxHeaderSize)
@@ -822,6 +951,16 @@ func readUntilCRLFCRLF(br *bufio.Reader) ([]byte, error) {
 			return nil, errors.New("header too large")
 		}
 	}
+}
+
+// largeFramePool pools buffers for WS frames larger than smallFrameSize.
+// Stored as *[]byte so the pool can hold variable-length slices without
+// the type assertion overhead of interface{} wrapping a plain []byte.
+var largeFramePool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, 32*1024) // 32KB default; grown as needed
+		return &buf
+	},
 }
 
 func readWSFrame(r io.Reader, w io.Writer) ([]byte, error) {
@@ -860,8 +999,25 @@ func readWSFrame(r io.Reader, w io.Writer) ([]byte, error) {
 			}
 		}
 
-		payload := make([]byte, payloadLen)
+		var payload []byte
+		var stackBuf [smallFrameSize]byte
+		var poolPtr *[]byte
+
+		if payloadLen <= smallFrameSize {
+			payload = stackBuf[:payloadLen]
+		} else {
+			// Reuse pooled buffer; grow if needed.
+			poolPtr = largeFramePool.Get().(*[]byte)
+			if uint64(cap(*poolPtr)) < payloadLen {
+				*poolPtr = make([]byte, payloadLen)
+			}
+			payload = (*poolPtr)[:payloadLen]
+		}
+
 		if _, err := io.ReadFull(r, payload); err != nil {
+			if poolPtr != nil {
+				largeFramePool.Put(poolPtr)
+			}
 			return nil, err
 		}
 
@@ -880,14 +1036,35 @@ func readWSFrame(r io.Reader, w io.Writer) ([]byte, error) {
 
 		switch opcode {
 		case 0x0, 0x1, 0x2: // Text, Binary, Continuation
-			return payload, nil
+			if payloadLen <= smallFrameSize {
+				// Stack buffer: must copy to heap before returning.
+				heapPayload := make([]byte, payloadLen)
+				copy(heapPayload, payload)
+				return heapPayload, nil
+			}
+			// Pool buffer: return a fresh copy and recycle the pool buffer
+			// so the caller does not need to know about the pool lifetime.
+			heapPayload := make([]byte, payloadLen)
+			copy(heapPayload, payload)
+			largeFramePool.Put(poolPtr)
+			return heapPayload, nil
 		case 0x8: // Close
+			if poolPtr != nil {
+				largeFramePool.Put(poolPtr)
+			}
 			return nil, io.EOF
 		case 0x9: // Ping
 			if w != nil {
 				if err := writeWSFrame(w, payload, 0xA, true); err != nil {
+					if poolPtr != nil {
+						largeFramePool.Put(poolPtr)
+					}
 					return nil, err
 				}
+			}
+			if poolPtr != nil {
+				largeFramePool.Put(poolPtr)
+				poolPtr = nil
 			}
 		}
 	}
@@ -1043,9 +1220,11 @@ func main() {
 		MinVersion:         tls.VersionTLS12,
 	}
 
+	bufSize := cfg.BufferSize
 	cfg.BufPool = &sync.Pool{
 		New: func() interface{} {
-			buf := make([]byte, cfg.BufferSize); return &buf
+			buf := make([]byte, bufSize)
+			return &buf
 		},
 	}
 
@@ -1140,8 +1319,8 @@ func monitorStats(shutdown <-chan struct{}) {
 			lastUp = currUp
 			lastDown = currDown
 
-			stats.speedUp = upSpeed
-			stats.speedDown = downSpeed
+			// Atomic write — eliminates data race on speedUp/speedDown.
+			stats.SetSpeeds(upSpeed, downSpeed)
 
 			if !tuiEnabled {
 				if globalLogLevel <= INFO {
@@ -1174,12 +1353,12 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 	headerBytes, err := readUntilCRLFCRLF(br)
 	if err != nil {
 		logError("handleServer read headers err: %v", err)
-		wsConn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+		wsConn.Write(http400Resp)
 		return
 	}
 	if indexFold(headerBytes, "upgrade: websocket") < 0 {
 		logError("handleServer missing upgrade: websocket")
-		wsConn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+		wsConn.Write(http400Resp)
 		return
 	}
 
@@ -1203,12 +1382,12 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 	}
 
 	acc := computeAcceptKey(wsKey)
-	var respBuf bytes.Buffer
-	respBuf.Grow(150)
-	respBuf.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ")
-	respBuf.WriteString(acc)
-	respBuf.WriteString("\r\n\r\n")
-	if _, err := wsConn.Write(respBuf.Bytes()); err != nil {
+	// Pre-allocated prefix + accept key + suffix (avoids Buffer + 3 allocs)
+	respBuf := make([]byte, len(wsUpgradePrefix)+len(acc)+len(wsUpgradeSuffix))
+	copy(respBuf, wsUpgradePrefix)
+	copy(respBuf[len(wsUpgradePrefix):], acc)
+	copy(respBuf[len(wsUpgradePrefix)+len(acc):], wsUpgradeSuffix)
+	if _, err := wsConn.Write(respBuf); err != nil {
 		return
 	}
 
@@ -1272,12 +1451,15 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 
 	errCh := make(chan error, 2)
 
-	// WS -> TCP
+	// WS -> TCP (deadline throttled: SetReadDeadline ~500ns syscall, time.Now ~20ns)
 	go func() {
 		var err error
 		defer func() { errCh <- err }()
+		var lastDeadline time.Time
 		for {
-			setTCPReadDeadline(wsTCPConn, cfg.ConnTimeout)
+			if deadlineThrottle(&lastDeadline) {
+				setTCPReadDeadline(wsTCPConn, cfg.ConnTimeout)
+			}
 			data, errRead := readWSFrame(br, wsConn)
 			if errRead != nil {
 				err = errRead
@@ -1291,15 +1473,18 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 		}
 	}()
 
-	// TCP -> WS
+	// TCP -> WS (deadline throttled)
 	go func() {
 		var err error
 		defer func() { errCh <- err }()
 		bPtr := cfg.BufPool.Get().(*[]byte)
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
+		var lastDeadline time.Time
 		for {
-			setTCPReadDeadline(targetTCPConn, cfg.ConnTimeout)
+			if deadlineThrottle(&lastDeadline) {
+				setTCPReadDeadline(targetTCPConn, cfg.ConnTimeout)
+			}
 			nr, errRead := targetConn.Read(buf)
 			if errRead != nil {
 				err = errRead
@@ -1323,14 +1508,19 @@ func isLocalTarget(host string) bool {
 	}
 	// Private IPv4 always starts with '1' (10.x, 172.16+, 192.168.x).
 	// Skip ToLower allocation for the common case of public hostnames.
-	if len(host) > 0 && host[0] != '1' {
+	if len(host) == 0 || host[0] != '1' {
 		return false
 	}
-	h := strings.ToLower(host)
-	if strings.HasPrefix(h, "192.168.") || strings.HasPrefix(h, "10.") {
+	// Byte-level prefix check (zero allocation, no strings.ToLower)
+	h := host
+	if len(h) >= 8 && h[0] == '1' && h[1] == '9' && h[2] == '2' && h[3] == '.' &&
+		h[4] == '1' && h[5] == '6' && h[6] == '8' && h[7] == '.' {
 		return true
 	}
-	if strings.HasPrefix(h, "172.") {
+	if len(h) >= 3 && h[0] == '1' && h[1] == '0' && h[2] == '.' {
+		return true
+	}
+	if len(h) >= 4 && h[0] == '1' && h[1] == '7' && h[2] == '2' && h[3] == '.' {
 		if dot := strings.IndexByte(h[4:], '.'); dot >= 0 {
 			if b, err := strconv.Atoi(h[4 : 4+dot]); err == nil && b >= 16 && b <= 31 {
 				return true
@@ -1444,7 +1634,12 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		} else {
 			urlBytes = rest
 		}
-		method := string(buf[0]) + string(firstLine[:sp1])
+		// Reconstruct full method name: buf[0] is the first byte already read
+		// before HeaderBufPool.Get(), remaining method chars are in firstLine.
+		methodBytes := make([]byte, 1+sp1)
+		methodBytes[0] = buf[0]
+		copy(methodBytes[1:], firstLine[:sp1])
+		method := string(methodBytes)
 		urlPart := string(urlBytes)
 		if method == "CONNECT" {
 			if strings.Contains(urlPart, ":") {
@@ -1519,23 +1714,11 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		return
 	}
 
-	// Connect Upstream WS
-	wsURL, err := url.Parse(cfg.Upstream)
-	if err != nil {
-		logError("Invalid upstream URL: %v", err)
-		return
-	}
+	// Connect Upstream WS (use pre-parsed URL from startup)
 	var wsConn net.Conn
-
-	wsHost := wsURL.Hostname()
-	wsPort := wsURL.Port()
-	if wsPort == "" {
-		if wsURL.Scheme == "wss" || wsURL.Scheme == "https" {
-			wsPort = "443"
-		} else {
-			wsPort = "80"
-		}
-	}
+	wsURL := cfg.ParsedUpstream
+	wsHost := cfg.UpstreamHost
+	wsPort := cfg.UpstreamPort
 
 	// Remote DNS resolution for upstream host
 	dialHost := wsHost
@@ -1553,7 +1736,8 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		sniHostname = sanitizeHeader(strings.Split(cfg.FakeHost, ":")[0])
 	}
 
-	if wsURL.Scheme == "wss" || wsURL.Scheme == "https" {
+	var err error
+	if cfg.UpstreamIsWSS {
 		conf := cfg.TLSBase.Clone()
 		conf.ServerName = sniHostname
 		wsConn, err = tls.Dial("tcp", dialAddr, conf)
@@ -1593,7 +1777,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 	userAgent := pickUA()
 	acceptLang := pickAcceptLang()
 	protocolScheme := "http"
-	if wsURL.Scheme == "wss" || wsURL.Scheme == "https" {
+	if cfg.UpstreamIsWSS {
 		protocolScheme = "https"
 	}
 
@@ -1648,10 +1832,13 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		return
 	}
 
-	targetPayload := []byte(targetHost + ":" + targetPort + "\n")
+	base := targetHost + ":" + targetPort + "\n"
 	padLen := 1 + mrand.Intn(40)
-	for i := 0; i < padLen; i++ {
-		targetPayload = append(targetPayload, ' ')
+	targetPayload := make([]byte, len(base)+padLen)
+	copy(targetPayload, base)
+	// fill padding with spaces (constant, no allocation)
+	for i := len(base); i < len(targetPayload); i++ {
+		targetPayload[i] = ' '
 	}
 
 	if cfg.Crypto != nil {
@@ -1676,11 +1863,11 @@ func handleClient(localConn net.Conn, cfg *Config) {
 	}
 
 	if ver == 0x05 {
-		if _, err := localConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
+		if _, err := localConn.Write(socks5OKResp); err != nil {
 			return
 		}
 	} else if initialPayload == nil {
-		if _, err := localConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+		if _, err := localConn.Write(http200Resp); err != nil {
 			return
 		}
 	}
@@ -1695,15 +1882,18 @@ func handleClient(localConn net.Conn, cfg *Config) {
 
 	errCh := make(chan error, 2)
 
-	// Local -> WS (UPLOAD)
+	// Local -> WS (UPLOAD) — deadline throttled
 	go func() {
 		var err error
 		defer func() { errCh <- err }()
 		bPtr := cfg.BufPool.Get().(*[]byte)
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
+		var lastDeadline time.Time
 		for {
-			setTCPReadDeadline(localTCPConn, cfg.ConnTimeout)
+			if deadlineThrottle(&lastDeadline) {
+				setTCPReadDeadline(localTCPConn, cfg.ConnTimeout)
+			}
 			nr, errRead := localConn.Read(buf)
 			if errRead != nil {
 				err = errRead
@@ -1718,12 +1908,15 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		}
 	}()
 
-	// WS -> Local (DOWNLOAD)
+	// WS -> Local (DOWNLOAD) — deadline throttled
 	go func() {
 		var err error
 		defer func() { errCh <- err }()
+		var lastDeadline time.Time
 		for {
-			setTCPReadDeadline(wsTCPConn, cfg.ConnTimeout)
+			if deadlineThrottle(&lastDeadline) {
+				setTCPReadDeadline(wsTCPConn, cfg.ConnTimeout)
+			}
 			data, errRead := readWSFrame(br, wsConn)
 			if errRead != nil {
 				err = errRead
@@ -1740,11 +1933,21 @@ func handleClient(localConn net.Conn, cfg *Config) {
 	<-errCh
 }
 
+// wsGUID is the WebSocket magic GUID per RFC 6455.
+var wsGUID = []byte("258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+
 func computeAcceptKey(challenge string) string {
-	h := sha1.New()
-	h.Write([]byte(challenge))
-	h.Write([]byte("258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
-	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+	// Use fixed-size array to avoid heap alloc from sha1.New()
+	var h [20]byte
+	sha1buf := make([]byte, 0, len(challenge)+len(wsGUID))
+	sha1buf = append(sha1buf, challenge...)
+	sha1buf = append(sha1buf, wsGUID...)
+	sum := sha1.Sum(sha1buf)
+	copy(h[:], sum[:])
+	// Pre-allocate exact base64 output size (28 bytes for 20-byte SHA1)
+	var b64 [28]byte
+	base64.StdEncoding.Encode(b64[:], h[:])
+	return string(b64[:])
 }
 
 func asciiToLower(b byte) byte {
