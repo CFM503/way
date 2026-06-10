@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	Version        = "1.4.1"
+	Version        = "1.4.2"
 	MaxWSFrameSize = 16 * 1024 * 1024 // 16MB
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -466,35 +466,21 @@ func drawTUI(cfg *Config) {
 }
 
 func tuiRefreshLoop(cfg *Config, shutdown <-chan struct{}) {
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	drawTUI(cfg)
+	dirty := false
 	for {
 		select {
 		case <-shutdown:
 			return
-		case <-ticker.C:
-			// Drain any pending channel signals so we draw once, not many times.
-		drain:
-			for {
-				select {
-				case <-tuiRefreshCh:
-				default:
-					break drain
-				}
-			}
-			drawTUI(cfg)
 		case <-tuiRefreshCh:
-			// Coalesce burst: drain remaining signals before drawing.
-		drain2:
-			for {
-				select {
-				case <-tuiRefreshCh:
-				default:
-					break drain2
-				}
+			dirty = true
+		case <-ticker.C:
+			if dirty {
+				drawTUI(cfg)
+				dirty = false
 			}
-			drawTUI(cfg)
 		}
 	}
 }
@@ -514,8 +500,8 @@ func NewCrypto(key string) *Crypto {
 	}
 	hash := sha256.Sum256([]byte(key))
 	kl := len(hash)
-	// Pre-expand key to cryptoChunkSize for single-loop bulk XOR
-	ek := bytes.Repeat(hash[:], cryptoChunkSize/kl+1)[:cryptoChunkSize]
+	// Pre-expand key to cryptoChunkSize + 8 for single-loop bulk XOR (prevents panic at end boundary)
+	ek := bytes.Repeat(hash[:], (cryptoChunkSize+8)/kl+1)[:cryptoChunkSize+8]
 	return &Crypto{
 		keyBytes:    hash[:],
 		expandedKey: ek,
@@ -806,6 +792,69 @@ func getWSHeader(dataLen int, opcode byte, masked bool) []byte {
 	return buf[:n]
 }
 
+func writeWSFramePreallocated(w io.Writer, buf []byte, payloadOffset int, payloadLen int, opcode byte, masked bool) error {
+	hdrLen := 2
+	if payloadLen >= 65536 {
+		hdrLen = 10
+	} else if payloadLen >= 126 {
+		hdrLen = 4
+	}
+
+	var frameStart int
+	if masked {
+		frameStart = payloadOffset - 4 - hdrLen
+	} else {
+		frameStart = payloadOffset - hdrLen
+	}
+
+	if frameStart < 0 {
+		return errors.New("buffer pre-padding is insufficient")
+	}
+
+	buf[frameStart] = 0b10000000 | opcode
+	maskBit := byte(0)
+	if masked {
+		maskBit = 128
+	}
+
+	if payloadLen < 126 {
+		buf[frameStart+1] = byte(payloadLen) | maskBit
+	} else if payloadLen < 65536 {
+		buf[frameStart+1] = 126 | maskBit
+		binary.BigEndian.PutUint16(buf[frameStart+2:frameStart+4], uint16(payloadLen))
+	} else {
+		buf[frameStart+1] = 127 | maskBit
+		binary.BigEndian.PutUint64(buf[frameStart+2:frameStart+10], uint64(payloadLen))
+	}
+
+	if masked {
+		mkOffset := frameStart + hdrLen
+		mk := buf[mkOffset : mkOffset+4]
+		rand.Read(mk)
+		maskWord := binary.NativeEndian.Uint32(mk)
+
+		payload := buf[payloadOffset : payloadOffset+payloadLen]
+		i := 0
+		for ; i+4 <= payloadLen; i += 4 {
+			binary.NativeEndian.PutUint32(payload[i:],
+				binary.NativeEndian.Uint32(payload[i:])^maskWord)
+		}
+		for ; i < payloadLen; i++ {
+			payload[i] ^= mk[i&3]
+		}
+	}
+
+	var totalLen int
+	if masked {
+		totalLen = hdrLen + 4 + payloadLen
+	} else {
+		totalLen = hdrLen + payloadLen
+	}
+
+	_, err := w.Write(buf[frameStart : frameStart+totalLen])
+	return err
+}
+
 func writeWSFrame(w io.Writer, data []byte, opcode byte, masked bool) error {
 	if !masked {
 		header := getWSHeader(len(data), opcode, false)
@@ -814,8 +863,6 @@ func writeWSFrame(w io.Writer, data []byte, opcode byte, masked bool) error {
 		return err
 	}
 
-	// Masked: single allocation for header + 4-byte maskKey + data
-	// Small frames (≤512B payload): stack buffer avoids heap alloc entirely
 	dl := len(data)
 	hdrLen := 2
 	if dl >= 65536 {
@@ -825,14 +872,13 @@ func writeWSFrame(w io.Writer, data []byte, opcode byte, masked bool) error {
 	}
 	total := hdrLen + 4 + dl
 	var frame []byte
-	var stackBuf [smallFrameSize + 14]byte // max header(10) + mask(4) + payload(512)
+	var stackBuf [smallFrameSize + 14]byte
 	if total <= len(stackBuf) {
 		frame = stackBuf[:total]
 	} else {
 		frame = make([]byte, total)
 	}
 
-	// Build header in-place (avoids getWSHeader stack→heap escape)
 	frame[0] = 0b10000000 | opcode
 	if dl < 126 {
 		frame[1] = byte(dl) | 128
@@ -844,15 +890,12 @@ func writeWSFrame(w io.Writer, data []byte, opcode byte, masked bool) error {
 		binary.BigEndian.PutUint64(frame[2:10], uint64(dl))
 	}
 
-	// Generate mask key directly into frame
 	mk := frame[hdrLen : hdrLen+4]
 	rand.Read(mk)
 	maskWord := binary.NativeEndian.Uint32(mk)
 
-	// Copy data after header+mask
 	copy(frame[hdrLen+4:], data)
 
-	// XOR mask data in-place (4-byte batches + tail)
 	payload := frame[hdrLen+4:]
 	i := 0
 	for ; i+4 <= dl; i += 4 {
@@ -963,7 +1006,83 @@ var largeFramePool = sync.Pool{
 	},
 }
 
+func readWSFrameInto(r io.Reader, w io.Writer, buf []byte) ([]byte, error) {
+	for {
+		var head [2]byte
+		if _, err := io.ReadFull(r, head[:]); err != nil {
+			return nil, err
+		}
+
+		opcode := head[0] & 0x0F
+		masked := (head[1] & 0x80) != 0
+		payloadLen := uint64(head[1] & 0x7F)
+
+		if payloadLen == 126 {
+			var b [2]byte
+			if _, err := io.ReadFull(r, b[:]); err != nil {
+				return nil, err
+			}
+			payloadLen = uint64(binary.BigEndian.Uint16(b[:]))
+		} else if payloadLen == 127 {
+			var b [8]byte
+			if _, err := io.ReadFull(r, b[:]); err != nil {
+				return nil, err
+			}
+			payloadLen = binary.BigEndian.Uint64(b[:])
+		}
+
+		if payloadLen > uint64(MaxWSFrameSize) {
+			return nil, errors.New("frame too large")
+		}
+
+		var maskKey [4]byte
+		if masked {
+			if _, err := io.ReadFull(r, maskKey[:]); err != nil {
+				return nil, err
+			}
+		}
+
+		var payload []byte
+		if payloadLen <= uint64(len(buf)) {
+			payload = buf[:payloadLen]
+		} else {
+			payload = make([]byte, payloadLen)
+		}
+
+		if _, err := io.ReadFull(r, payload); err != nil {
+			return nil, err
+		}
+
+		if masked {
+			mk := maskKey[:]
+			maskWord := binary.NativeEndian.Uint32(mk)
+			i := 0
+			for ; i+4 <= len(payload); i += 4 {
+				binary.NativeEndian.PutUint32(payload[i:],
+					binary.NativeEndian.Uint32(payload[i:])^maskWord)
+			}
+			for ; i < len(payload); i++ {
+				payload[i] ^= mk[i&3]
+			}
+		}
+
+		switch opcode {
+		case 0x0, 0x1, 0x2: // Text, Binary, Continuation
+			return payload, nil
+		case 0x8: // Close
+			return nil, io.EOF
+		case 0x9: // Ping
+			if w != nil {
+				if err := writeWSFrame(w, payload, 0xA, true); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+}
+
 func readWSFrame(r io.Reader, w io.Writer) ([]byte, error) {
+	// Standard wrapper using largeFramePool (kept for backward compatibility during handshake)
 	for {
 		var head [2]byte
 		if _, err := io.ReadFull(r, head[:]); err != nil {
@@ -1006,7 +1125,6 @@ func readWSFrame(r io.Reader, w io.Writer) ([]byte, error) {
 		if payloadLen <= smallFrameSize {
 			payload = stackBuf[:payloadLen]
 		} else {
-			// Reuse pooled buffer; grow if needed.
 			poolPtr = largeFramePool.Get().(*[]byte)
 			if uint64(cap(*poolPtr)) < payloadLen {
 				*poolPtr = make([]byte, payloadLen)
@@ -1036,17 +1154,11 @@ func readWSFrame(r io.Reader, w io.Writer) ([]byte, error) {
 
 		switch opcode {
 		case 0x0, 0x1, 0x2: // Text, Binary, Continuation
-			if payloadLen <= smallFrameSize {
-				// Stack buffer: must copy to heap before returning.
-				heapPayload := make([]byte, payloadLen)
-				copy(heapPayload, payload)
-				return heapPayload, nil
-			}
-			// Pool buffer: return a fresh copy and recycle the pool buffer
-			// so the caller does not need to know about the pool lifetime.
 			heapPayload := make([]byte, payloadLen)
 			copy(heapPayload, payload)
-			largeFramePool.Put(poolPtr)
+			if poolPtr != nil {
+				largeFramePool.Put(poolPtr)
+			}
 			return heapPayload, nil
 		case 0x8: // Close
 			if poolPtr != nil {
@@ -1064,7 +1176,6 @@ func readWSFrame(r io.Reader, w io.Writer) ([]byte, error) {
 			}
 			if poolPtr != nil {
 				largeFramePool.Put(poolPtr)
-				poolPtr = nil
 			}
 		}
 	}
@@ -1243,7 +1354,7 @@ func main() {
 		MinVersion:         tls.VersionTLS12,
 	}
 
-	bufSize := cfg.BufferSize
+	bufSize := cfg.BufferSize + 14
 	cfg.BufPool = &sync.Pool{
 		New: func() interface{} {
 			buf := make([]byte, bufSize)
@@ -1478,12 +1589,16 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 	go func() {
 		var err error
 		defer func() { errCh <- err }()
+		bPtr := cfg.BufPool.Get().(*[]byte)
+		defer cfg.BufPool.Put(bPtr)
+		buf := *bPtr
 		var lastDeadline time.Time
 		for {
 			if deadlineThrottle(&lastDeadline) {
 				setTCPReadDeadline(wsTCPConn, cfg.ConnTimeout)
 			}
-			data, errRead := readWSFrame(br, wsConn)
+			// Read directly into preallocated buffer (excluding padding)
+			data, errRead := readWSFrameInto(br, wsConn, buf[14:])
 			if errRead != nil {
 				err = errRead
 				return
@@ -1508,12 +1623,14 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 			if deadlineThrottle(&lastDeadline) {
 				setTCPReadDeadline(targetTCPConn, cfg.ConnTimeout)
 			}
-			nr, errRead := targetConn.Read(buf)
+			// Read starting at offset 14 (pre-padding space of 14 bytes for WebSocket header)
+			nr, errRead := targetConn.Read(buf[14:])
 			if errRead != nil {
 				err = errRead
 				return
 			}
-			if errWrite := writeWSFrame(wsConn, buf[:nr], 0x2, false); errWrite != nil {
+			// writeWSFramePreallocated avoids allocations and copies (masked = false for server-to-client)
+			if errWrite := writeWSFramePreallocated(wsConn, buf, 14, nr, 0x2, false); errWrite != nil {
 				err = errWrite
 				return
 			}
@@ -1527,6 +1644,11 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 func isLocalTarget(host string) bool {
 	if strings.EqualFold(host, "localhost") ||
 		host == "127.0.0.1" || host == "::1" || host == "[::1]" || host == "0.0.0.0" {
+		return true
+	}
+	// IPv6 local address ranges check (link-local and unique local)
+	if strings.HasPrefix(host, "fe80:") || strings.HasPrefix(host, "fc00:") || strings.HasPrefix(host, "fd00:") ||
+		strings.HasPrefix(host, "[fe80:") || strings.HasPrefix(host, "[fc00:") || strings.HasPrefix(host, "[fd00:") {
 		return true
 	}
 	// Private IPv4 always starts with '1' (10.x, 172.16+, 192.168.x).
@@ -1657,12 +1779,28 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		} else {
 			urlBytes = rest
 		}
-		// Reconstruct full method name: buf[0] is the first byte already read
-		// before HeaderBufPool.Get(), remaining method chars are in firstLine.
-		methodBytes := make([]byte, 1+sp1)
-		methodBytes[0] = buf[0]
-		copy(methodBytes[1:], firstLine[:sp1])
-		method := string(methodBytes)
+		// Reconstruct full method name with allocation-free fast-path matching
+		var method string
+		firstPart := firstLine[:sp1]
+		if buf[0] == 'G' && bytes.Equal(firstPart, []byte("ET")) {
+			method = "GET"
+		} else if buf[0] == 'C' && bytes.Equal(firstPart, []byte("ONNECT")) {
+			method = "CONNECT"
+		} else if buf[0] == 'P' && bytes.Equal(firstPart, []byte("OST")) {
+			method = "POST"
+		} else if buf[0] == 'P' && bytes.Equal(firstPart, []byte("UT")) {
+			method = "PUT"
+		} else if buf[0] == 'D' && bytes.Equal(firstPart, []byte("ELETE")) {
+			method = "DELETE"
+		} else if buf[0] == 'H' && bytes.Equal(firstPart, []byte("EAD")) {
+			method = "HEAD"
+		} else if buf[0] == 'O' && bytes.Equal(firstPart, []byte("PTIONS")) {
+			method = "OPTIONS"
+		} else if buf[0] == 'P' && bytes.Equal(firstPart, []byte("ATCH")) {
+			method = "PATCH"
+		} else {
+			method = string(buf[0]) + string(firstPart)
+		}
 		urlPart := string(urlBytes)
 		if method == "CONNECT" {
 			if strings.Contains(urlPart, ":") {
@@ -1917,13 +2055,14 @@ func handleClient(localConn net.Conn, cfg *Config) {
 			if deadlineThrottle(&lastDeadline) {
 				setTCPReadDeadline(localTCPConn, cfg.ConnTimeout)
 			}
-			nr, errRead := localConn.Read(buf)
+			// Read starting at offset 14 (pre-padding space of 14 bytes for WebSocket header)
+			nr, errRead := localConn.Read(buf[14:])
 			if errRead != nil {
 				err = errRead
 				return
 			}
-			data := buf[:nr]
-			if errWrite := writeWSFrame(wsConn, data, 0x2, true); errWrite != nil {
+			// writeWSFramePreallocated avoids allocations and copies (masked = true for client-to-server)
+			if errWrite := writeWSFramePreallocated(wsConn, buf, 14, nr, 0x2, true); errWrite != nil {
 				err = errWrite
 				return
 			}
@@ -1935,12 +2074,16 @@ func handleClient(localConn net.Conn, cfg *Config) {
 	go func() {
 		var err error
 		defer func() { errCh <- err }()
+		bPtr := cfg.BufPool.Get().(*[]byte)
+		defer cfg.BufPool.Put(bPtr)
+		buf := *bPtr
 		var lastDeadline time.Time
 		for {
 			if deadlineThrottle(&lastDeadline) {
 				setTCPReadDeadline(wsTCPConn, cfg.ConnTimeout)
 			}
-			data, errRead := readWSFrame(br, wsConn)
+			// Read directly into preallocated buffer (excluding padding)
+			data, errRead := readWSFrameInto(br, wsConn, buf[14:])
 			if errRead != nil {
 				err = errRead
 				return
