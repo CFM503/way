@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	Version        = "1.4.2"
+	Version        = "1.4.3"
 	MaxWSFrameSize = 16 * 1024 * 1024 // 16MB
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -699,45 +699,160 @@ func logError(format string, v ...interface{}) {
 	}
 }
 
-// --- User-Agent Pool ---
+// --- Browser Profile System ---
+// Each profile bundles UA, TLS cipher/curve preferences, and HTTP headers
+// that must match each other. Cloudflare cross-checks these signals.
 
-var uaPool = []string{
-	// Chrome 136 - Windows/Mac/Linux
-	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-	// Firefox 138 - Windows/Mac/Linux
-	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:138.0) Gecko/20100101 Firefox/138.0",
-	"Mozilla/5.0 (Macintosh; Intel Mac OS X 14.7; rv:138.0) Gecko/20100101 Firefox/138.0",
-	"Mozilla/5.0 (X11; Linux x86_64; rv:138.0) Gecko/20100101 Firefox/138.0",
-	// Edge 136
-	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0",
-	// Safari 18.4 - macOS
-	"Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Safari/605.1.15",
-	// Mobile: iOS Safari 18.4
-	"Mozilla/5.0 (iPhone; CPU iPhone OS 18_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Mobile/15E148 Safari/604.1",
-	"Mozilla/5.0 (iPad; CPU OS 18_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Mobile/15E148 Safari/604.1",
-	// Mobile: Android Chrome 136
-	"Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36",
-	"Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36",
-	// Mobile: Android WebView (common in apps)
-	"Mozilla/5.0 (Linux; Android 14; Pixel 7 Build/AP2A.240405.002) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/136.0.0.0 Mobile Safari/537.36",
+type BrowserProfile struct {
+	UA           string
+	AcceptLang   string
+	SecChUA      string   // Chrome Client Hints; empty for Firefox/Safari
+	SecChUAMob   string   // "?0" desktop, "?1" mobile
+	SecChUAPlat  string   // e.g. `"Windows"`, `"macOS"`, `"Android"`
+	IsChromium   bool     // drives TLS cipher ordering
+	IsMobile     bool
+	// TLS tuning
+	CipherSuites    []uint16
+	CurvePrefs      []tls.CurveID
 }
 
-var acceptLangPool = []string{
-	"en-US,en;q=0.9",
-	"en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
-	"en-GB,en;q=0.9,en-US;q=0.8",
-	"zh-CN,zh;q=0.9,en;q=0.8",
-	"en-US,en;q=0.9,ja;q=0.8",
+// tlsCiphersChrome136 mirrors Chrome 136 ClientHello cipher suite order.
+// Verified against: https://tls.peet.ws/api/all (Chrome 136 / Win10)
+var tlsCiphersChrome136 = []uint16{
+	tls.TLS_AES_128_GCM_SHA256,
+	tls.TLS_AES_256_GCM_SHA384,
+	tls.TLS_CHACHA20_POLY1305_SHA256,
+	tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+	tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+	tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+	tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+	tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+	tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+	tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+	tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+	tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+	tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+	tls.TLS_RSA_WITH_AES_128_CBC_SHA,
+	tls.TLS_RSA_WITH_AES_256_CBC_SHA,
 }
 
-func pickUA() string {
-	return uaPool[mrand.Intn(len(uaPool))]
+// tlsCiphersFirefox138 mirrors Firefox 138 ClientHello cipher suite order.
+var tlsCiphersFirefox138 = []uint16{
+	tls.TLS_AES_128_GCM_SHA256,
+	tls.TLS_CHACHA20_POLY1305_SHA256,
+	tls.TLS_AES_256_GCM_SHA384,
+	tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+	tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+	tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+	tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+	tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+	tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+	tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+	tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+	tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+	tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+	tls.TLS_RSA_WITH_AES_128_CBC_SHA,
+	tls.TLS_RSA_WITH_AES_256_CBC_SHA,
 }
 
-func pickAcceptLang() string {
-	return acceptLangPool[mrand.Intn(len(acceptLangPool))]
+// curvePrefsChrome mirrors Chrome's ECDH named group preference order.
+var curvePrefsChrome = []tls.CurveID{
+	tls.X25519,
+	tls.CurveP256,
+	tls.CurveP384,
+}
+
+// curvePrefsFirefox mirrors Firefox's group preference order.
+var curvePrefsFirefox = []tls.CurveID{
+	tls.X25519,
+	tls.CurveP256,
+	tls.CurveP384,
+	tls.CurveP521,
+}
+
+var browserProfiles = []BrowserProfile{
+	// --- Chrome 136 Windows ---
+	{
+		UA:          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+		AcceptLang:  "en-US,en;q=0.9",
+		SecChUA:     `"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"`,
+		SecChUAMob:  "?0",
+		SecChUAPlat: `"Windows"`,
+		IsChromium:  true,
+		CipherSuites: tlsCiphersChrome136,
+		CurvePrefs:   curvePrefsChrome,
+	},
+	// --- Chrome 136 macOS ---
+	{
+		UA:          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+		AcceptLang:  "en-US,en;q=0.9",
+		SecChUA:     `"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"`,
+		SecChUAMob:  "?0",
+		SecChUAPlat: `"macOS"`,
+		IsChromium:  true,
+		CipherSuites: tlsCiphersChrome136,
+		CurvePrefs:   curvePrefsChrome,
+	},
+	// --- Chrome 136 Windows (zh-CN user) ---
+	{
+		UA:          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+		AcceptLang:  "zh-CN,zh;q=0.9,en;q=0.8",
+		SecChUA:     `"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"`,
+		SecChUAMob:  "?0",
+		SecChUAPlat: `"Windows"`,
+		IsChromium:  true,
+		CipherSuites: tlsCiphersChrome136,
+		CurvePrefs:   curvePrefsChrome,
+	},
+	// --- Edge 136 Windows ---
+	{
+		UA:          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0",
+		AcceptLang:  "en-US,en;q=0.9",
+		SecChUA:     `"Chromium";v="136", "Microsoft Edge";v="136", "Not.A/Brand";v="99"`,
+		SecChUAMob:  "?0",
+		SecChUAPlat: `"Windows"`,
+		IsChromium:  true,
+		CipherSuites: tlsCiphersChrome136,
+		CurvePrefs:   curvePrefsChrome,
+	},
+	// --- Firefox 138 Windows ---
+	{
+		UA:          "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:138.0) Gecko/20100101 Firefox/138.0",
+		AcceptLang:  "en-US,en;q=0.5",
+		SecChUA:     "", // Firefox does not send sec-ch-ua
+		SecChUAMob:  "",
+		SecChUAPlat: "",
+		IsChromium:  false,
+		CipherSuites: tlsCiphersFirefox138,
+		CurvePrefs:   curvePrefsFirefox,
+	},
+	// --- Firefox 138 macOS ---
+	{
+		UA:          "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.7; rv:138.0) Gecko/20100101 Firefox/138.0",
+		AcceptLang:  "en-US,en;q=0.5",
+		SecChUA:     "",
+		SecChUAMob:  "",
+		SecChUAPlat: "",
+		IsChromium:  false,
+		CipherSuites: tlsCiphersFirefox138,
+		CurvePrefs:   curvePrefsFirefox,
+	},
+	// --- Chrome 136 Android (mobile) ---
+	{
+		UA:          "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36",
+		AcceptLang:  "en-US,en;q=0.9",
+		SecChUA:     `"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"`,
+		SecChUAMob:  "?1",
+		SecChUAPlat: `"Android"`,
+		IsChromium:  true,
+		IsMobile:    true,
+		CipherSuites: tlsCiphersChrome136,
+		CurvePrefs:   curvePrefsChrome,
+	},
+}
+
+func pickBrowserProfile() BrowserProfile {
+	return browserProfiles[mrand.Intn(len(browserProfiles))]
 }
 
 // --- Header Sanitization ---
@@ -1322,7 +1437,7 @@ func main() {
 				verifyCol = AnsiGreen
 			}
 			fmt.Printf(" [+] SSL Verify:  %s%s%s\n", verifyCol, verifyStr, AnsiReset)
-			fmt.Printf(" [+] User-Agent:  %sRandomized (Sticky)%s\n", AnsiGreen, AnsiReset)
+			fmt.Printf(" [+] User-Agent:  %sBrowser Profile (Sticky TLS+UA)%s\n", AnsiGreen, AnsiReset)
 		}
 
 		if cfg.Resolver != nil {
@@ -1352,6 +1467,7 @@ func main() {
 	cfg.TLSBase = &tls.Config{
 		InsecureSkipVerify: !cfg.VerifySSL,
 		MinVersion:         tls.VersionTLS12,
+		MaxVersion:         tls.VersionTLS13,
 	}
 
 	bufSize := cfg.BufferSize + 14
@@ -1897,10 +2013,20 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		sniHostname = sanitizeHeader(strings.Split(cfg.FakeHost, ":")[0])
 	}
 
+	// Pick a consistent browser profile for this connection.
+	// TLS ciphers/curves + HTTP headers must come from the same profile
+	// to avoid cross-signal inconsistencies that Cloudflare detects.
+	profile := pickBrowserProfile()
+
 	var err error
 	if cfg.UpstreamIsWSS {
 		conf := cfg.TLSBase.Clone()
 		conf.ServerName = sniHostname
+		conf.CipherSuites = profile.CipherSuites
+		conf.CurvePreferences = profile.CurvePrefs
+		// ALPN: advertise HTTP/1.1 only — we speak HTTP/1.1 WebSocket upgrade.
+		// Advertising h2 while sending an HTTP/1.1 handshake is a detectable mismatch.
+		conf.NextProtos = []string{"http/1.1"}
 		wsConn, err = tls.Dial("tcp", dialAddr, conf)
 	} else {
 		wsConn, err = net.Dial("tcp", dialAddr)
@@ -1935,44 +2061,77 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		hostHeader = sanitizeHeader(cfg.FakeHost)
 	}
 
-	userAgent := pickUA()
-	acceptLang := pickAcceptLang()
 	protocolScheme := "http"
 	if cfg.UpstreamIsWSS {
 		protocolScheme = "https"
 	}
 
-	secFetch := "websocket"
+	// Determine Sec-Fetch-Site: same-origin when Origin host == Host, else cross-site
+	secFetchSite := "cross-site"
+	if sniHostname == strings.Split(hostHeader, ":")[0] {
+		secFetchSite = "same-origin"
+	}
 
 	reqLine := "GET " + path + " HTTP/1.1\r\n"
-	headers := []string{
+
+	// Build the ordered header set for this profile.
+	// Chromium-based browsers send sec-ch-ua hints; Firefox does not.
+	// Headers are split into two groups:
+	//   fixedTop    — must always appear before the shuffled block (Host, Connection, Upgrade)
+	//   shufflable  — can be reordered freely; matches real browser non-determinism
+	//   fixedBottom — WebSocket-specific headers that logically close the handshake
+
+	fixedTop := []string{
 		"Host: " + hostHeader,
 		"Connection: Upgrade",
+		"Upgrade: websocket",
+	}
+
+	shufflable := []string{
 		"Pragma: no-cache",
 		"Cache-Control: no-cache",
-		"User-Agent: " + userAgent,
-		"Upgrade: websocket",
+		"User-Agent: " + profile.UA,
+		"Accept-Language: " + profile.AcceptLang,
+		"Accept-Encoding: gzip, deflate, br, zstd",
 		"Origin: " + protocolScheme + "://" + sniHostname,
+	}
+
+	// Add Chromium-specific Client Hint headers when applicable
+	if profile.IsChromium && profile.SecChUA != "" {
+		shufflable = append(shufflable,
+			"sec-ch-ua: "+profile.SecChUA,
+			"sec-ch-ua-mobile: "+profile.SecChUAMob,
+			"sec-ch-ua-platform: "+profile.SecChUAPlat,
+		)
+	}
+
+	fixedBottom := []string{
 		"Sec-WebSocket-Version: 13",
 		"Sec-WebSocket-Key: " + wsKeyStr,
 		"Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits",
-		"Accept-Language: " + acceptLang,
-		"Accept-Encoding: gzip, deflate, br, zstd",
-		"Sec-Fetch-Dest: " + secFetch,
+		"Sec-Fetch-Dest: websocket",
 		"Sec-Fetch-Mode: websocket",
-		"Sec-Fetch-Site: cross-site",
+		"Sec-Fetch-Site: " + secFetchSite,
 	}
 
-	// Fisher-Yates shuffle
-	for i := len(headers) - 1; i > 0; i-- {
+	// Fisher-Yates shuffle on the shufflable block only
+	for i := len(shufflable) - 1; i > 0; i-- {
 		j := mrand.Intn(i + 1)
-		headers[i], headers[j] = headers[j], headers[i]
+		shufflable[i], shufflable[j] = shufflable[j], shufflable[i]
 	}
 
 	var handshakeBuf bytes.Buffer
-	handshakeBuf.Grow(len(reqLine) + len(headers)*80 + 2)
+	handshakeBuf.Grow(512)
 	handshakeBuf.WriteString(reqLine)
-	for _, h := range headers {
+	for _, h := range fixedTop {
+		handshakeBuf.WriteString(h)
+		handshakeBuf.WriteString("\r\n")
+	}
+	for _, h := range shufflable {
+		handshakeBuf.WriteString(h)
+		handshakeBuf.WriteString("\r\n")
+	}
+	for _, h := range fixedBottom {
 		handshakeBuf.WriteString(h)
 		handshakeBuf.WriteString("\r\n")
 	}
