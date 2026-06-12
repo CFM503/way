@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	Version        = "1.4.4"
+	Version        = "1.4.6"
 	MaxWSFrameSize = 16 * 1024 * 1024 // 16MB
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -161,7 +161,6 @@ var (
 	tuiRingLen int // number of valid entries (≤ 100)
 	tuiRingPos int // index of next write slot
 
-	maxTuiLogs   = 12
 	tuiRefreshCh = make(chan struct{}, 1)
 )
 
@@ -204,8 +203,11 @@ func tuiLogSlice(n int) []string {
 const spaces = "                                                                                                                                                                                                        "
 
 func padRight(s string, n int) string {
-	if n <= 0 || n > len(spaces) {
-		return s + spaces[:min(n, len(spaces))]
+	if n <= 0 {
+		return s
+	}
+	if n > len(spaces) {
+		n = len(spaces)
 	}
 	return s + spaces[:n]
 }
@@ -479,24 +481,24 @@ func drawTUI(cfg *Config) {
 
 	buf.WriteString(cfg.TUIBorderMid)
 
-	// Calculate remaining lines for logs
+	// Calculate remaining lines for logs — local variable, never touches shared state.
 	usedHeight := 3 + configLines + 4 + 2 + 1
-	maxTuiLogs = termHeight - usedHeight
-	if maxTuiLogs < 5 {
-		maxTuiLogs = 5
+	logLines := termHeight - usedHeight
+	if logLines < 5 {
+		logLines = 5
 	}
 
 	// Logs Panel — read from ring buffer (no slice reallocation)
 	drawTuiRow(&buf, AnsiCyan+"Recent Logs:"+AnsiReset, boxWidth)
 	tuiLogMu.Lock()
-	logs := tuiLogSlice(maxTuiLogs)
+	logs := tuiLogSlice(logLines)
 	tuiLogMu.Unlock()
 
 	for _, line := range logs {
 		line = truncateVisible(line, innerWidth)
 		drawTuiRow(&buf, line, boxWidth)
 	}
-	for i := len(logs); i < maxTuiLogs; i++ {
+	for i := len(logs); i < logLines; i++ {
 		drawTuiRow(&buf, "", boxWidth)
 	}
 
@@ -1209,6 +1211,11 @@ var largeFramePool = sync.Pool{
 	},
 }
 
+// readWSFrameInto reads one WebSocket data frame from r, writing any Ping replies
+// to w. buf is used as scratch space; if the payload fits it is returned as a
+// sub-slice of buf (zero alloc). If not, a heap slice is allocated.
+// For the handshake path (readWSFrame), pass a nil buf — the function falls back
+// to largeFramePool for large frames and returns a heap-owned copy.
 func readWSFrameInto(r io.Reader, w io.Writer, buf []byte) ([]byte, error) {
 	for {
 		var head [2]byte
@@ -1245,94 +1252,32 @@ func readWSFrameInto(r io.Reader, w io.Writer, buf []byte) ([]byte, error) {
 			}
 		}
 
-		var payload []byte
-		if payloadLen <= uint64(len(buf)) {
-			payload = buf[:payloadLen]
-		} else {
-			payload = make([]byte, payloadLen)
-		}
-
-		if _, err := io.ReadFull(r, payload); err != nil {
-			return nil, err
-		}
-
-		if masked {
-			mk := maskKey[:]
-			maskWord := binary.NativeEndian.Uint32(mk)
-			i := 0
-			for ; i+4 <= len(payload); i += 4 {
-				binary.NativeEndian.PutUint32(payload[i:],
-					binary.NativeEndian.Uint32(payload[i:])^maskWord)
-			}
-			for ; i < len(payload); i++ {
-				payload[i] ^= mk[i&3]
-			}
-		}
-
-		switch opcode {
-		case 0x0, 0x1, 0x2: // Text, Binary, Continuation
-			return payload, nil
-		case 0x8: // Close
-			return nil, io.EOF
-		case 0x9: // Ping
-			if w != nil {
-				if err := writeWSFrame(w, payload, 0xA, true); err != nil {
-					return nil, err
-				}
-			}
-		}
-	}
-}
-
-func readWSFrame(r io.Reader, w io.Writer) ([]byte, error) {
-	// Standard wrapper using largeFramePool (kept for backward compatibility during handshake)
-	for {
-		var head [2]byte
-		if _, err := io.ReadFull(r, head[:]); err != nil {
-			return nil, err
-		}
-
-		opcode := head[0] & 0x0F
-		masked := (head[1] & 0x80) != 0
-		payloadLen := uint64(head[1] & 0x7F)
-
-		if payloadLen == 126 {
-			var b [2]byte
-			if _, err := io.ReadFull(r, b[:]); err != nil {
-				return nil, err
-			}
-			payloadLen = uint64(binary.BigEndian.Uint16(b[:]))
-		} else if payloadLen == 127 {
-			var b [8]byte
-			if _, err := io.ReadFull(r, b[:]); err != nil {
-				return nil, err
-			}
-			payloadLen = binary.BigEndian.Uint64(b[:])
-		}
-
-		if payloadLen > uint64(MaxWSFrameSize) {
-			return nil, errors.New("frame too large")
-		}
-
-		var maskKey [4]byte
-		if masked {
-			if _, err := io.ReadFull(r, maskKey[:]); err != nil {
-				return nil, err
-			}
-		}
-
+		// Buffer selection:
+		//   relay path  (buf != nil): use caller's buf if it fits, else heap-alloc.
+		//   handshake path (buf == nil): use stack for small frames, largeFramePool
+		//   for large ones, then copy to heap before returning.
 		var payload []byte
 		var stackBuf [smallFrameSize]byte
 		var poolPtr *[]byte
 
-		if payloadLen <= smallFrameSize {
-			payload = stackBuf[:payloadLen]
-		} else {
-			poolPtr = largeFramePool.Get().(*[]byte)
-			if uint64(cap(*poolPtr)) < payloadLen {
-				*poolPtr = make([]byte, payloadLen)
+		if buf != nil {
+			// relay path — zero-copy into caller's buffer when possible
+			if payloadLen <= uint64(len(buf)) {
+				payload = buf[:payloadLen]
+			} else {
+				payload = make([]byte, payloadLen)
 			}
-			payload = (*poolPtr)[:payloadLen]
+		} else {
+			// handshake path — pool-backed temporary buffer
+			if payloadLen <= smallFrameSize {
+				payload = stackBuf[:payloadLen]
+			} else {
+				poolPtr = largeFramePool.Get().(*[]byte)
+				if uint64(cap(*poolPtr)) < payloadLen {
+					*poolPtr = make([]byte, payloadLen)
+				}
+				payload = (*poolPtr)[:payloadLen]
+			}
 		}
 
 		if _, err := io.ReadFull(r, payload); err != nil {
@@ -1357,6 +1302,11 @@ func readWSFrame(r io.Reader, w io.Writer) ([]byte, error) {
 
 		switch opcode {
 		case 0x0, 0x1, 0x2: // Text, Binary, Continuation
+			if buf != nil {
+				// relay path — payload already lives in caller's buffer
+				return payload, nil
+			}
+			// handshake path — must return heap-owned slice
 			heapPayload := make([]byte, payloadLen)
 			copy(heapPayload, payload)
 			if poolPtr != nil {
@@ -1382,6 +1332,11 @@ func readWSFrame(r io.Reader, w io.Writer) ([]byte, error) {
 			}
 		}
 	}
+}
+
+// readWSFrame is the handshake-path wrapper: no caller buffer, returns heap copy.
+func readWSFrame(r io.Reader, w io.Writer) ([]byte, error) {
+	return readWSFrameInto(r, w, nil)
 }
 
 // --- Main Logic ---
@@ -1942,6 +1897,9 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		atyp := reqHead[3]
 
 		if cmd != 0x01 {
+			// RFC 1928 §6: reply with "command not supported" (0x07) so the
+			// client fails fast instead of hanging waiting for a response.
+			localConn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 			return
 		}
 
@@ -2393,16 +2351,13 @@ func handleClient(localConn net.Conn, cfg *Config) {
 var wsGUID = []byte("258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
 
 func computeAcceptKey(challenge string) string {
-	// Use fixed-size array to avoid heap alloc from sha1.New()
-	var h [20]byte
 	sha1buf := make([]byte, 0, len(challenge)+len(wsGUID))
 	sha1buf = append(sha1buf, challenge...)
 	sha1buf = append(sha1buf, wsGUID...)
 	sum := sha1.Sum(sha1buf)
-	copy(h[:], sum[:])
 	// Pre-allocate exact base64 output size (28 bytes for 20-byte SHA1)
 	var b64 [28]byte
-	base64.StdEncoding.Encode(b64[:], h[:])
+	base64.StdEncoding.Encode(b64[:], sum[:])
 	return string(b64[:])
 }
 
