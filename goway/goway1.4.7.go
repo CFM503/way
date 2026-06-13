@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	Version        = "1.4.6"
+	Version        = "1.4.7"
 	MaxWSFrameSize = 16 * 1024 * 1024 // 16MB
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -1715,7 +1715,7 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 		}
 	}
 
-	targetConn, err := net.DialTimeout("tcp4", targetStr, time.Duration(cfg.ConnTimeout)*time.Second)
+	targetConn, err := net.DialTimeout("tcp", targetStr, time.Duration(cfg.ConnTimeout)*time.Second)
 	if err != nil {
 		logError("handleServer net.DialTimeout err: %v", err)
 		return
@@ -1870,7 +1870,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 	if ver == 0x05 {
 		// SOCKS5
 		var nmBuf [1]byte
-		if _, err := localConn.Read(nmBuf[:]); err != nil {
+		if _, err := io.ReadFull(localConn, nmBuf[:]); err != nil {
 			return
 		}
 		nmethods := int(nmBuf[0])
@@ -1881,7 +1881,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		} else {
 			discard = make([]byte, nmethods)
 		}
-		if _, err := localConn.Read(discard); err != nil {
+		if _, err := io.ReadFull(localConn, discard); err != nil {
 			return
 		}
 
@@ -1890,7 +1890,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		}
 
 		var reqHead [4]byte
-		if _, err := localConn.Read(reqHead[:]); err != nil {
+		if _, err := io.ReadFull(localConn, reqHead[:]); err != nil {
 			return
 		}
 		cmd := reqHead[1]
