@@ -30,8 +30,8 @@ import (
 )
 
 const (
-	Version        = "1.4.7"
-	MaxWSFrameSize = 16 * 1024 * 1024 // 16MB
+	Version        = "1.5.1"
+	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
 	CRLFCRLF       = "\r\n\r\n"
@@ -529,7 +529,7 @@ func tuiRefreshLoop(cfg *Config, shutdown <-chan struct{}) {
 }
 // --- Crypto ---
 
-const cryptoChunkSize = 65536 // 64KB pre-expanded key chunk
+const cryptoChunkSize = 262144 // 256KB pre-expanded key chunk (increased from 64KB)
 
 type Crypto struct {
 	keyBytes    []byte
@@ -615,11 +615,19 @@ type Config struct {
 
 // --- DNS Resolver ---
 
+type dnsCacheEntry struct {
+	ip      string
+	expires time.Time
+}
+
 type RemoteResolver struct {
 	serverIP  string
 	resolver  *net.Resolver
 	sysResolv *net.Resolver // pre-allocated; avoids per-call allocation on fallback
 	timeout   time.Duration
+	cache     map[string]dnsCacheEntry
+	cacheMu   sync.RWMutex
+	cacheTTL  time.Duration
 }
 
 func NewRemoteResolver(serverIP string) *RemoteResolver {
@@ -627,6 +635,8 @@ func NewRemoteResolver(serverIP string) *RemoteResolver {
 		serverIP:  serverIP,
 		timeout:   5 * time.Second,
 		sysResolv: &net.Resolver{PreferGo: false},
+		cache:     make(map[string]dnsCacheEntry),
+		cacheTTL:  5 * time.Minute,
 	}
 	r.resolver = &net.Resolver{
 		PreferGo: true,
@@ -644,6 +654,14 @@ func (r *RemoteResolver) Resolve(host string) (string, error) {
 		return host, nil
 	}
 
+	// Check cache first
+	r.cacheMu.RLock()
+	if entry, ok := r.cache[host]; ok && time.Now().Before(entry.expires) {
+		r.cacheMu.RUnlock()
+		return entry.ip, nil
+	}
+	r.cacheMu.RUnlock()
+
 	// Try remote DNS with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
 	defer cancel()
@@ -651,6 +669,10 @@ func (r *RemoteResolver) Resolve(host string) (string, error) {
 	addrs, err := r.resolver.LookupHost(ctx, host)
 	if err == nil && len(addrs) > 0 {
 		logInfo("[DNS] %s -> %s (remote: %s)", host, addrs[0], r.serverIP)
+		// Cache the result
+		r.cacheMu.Lock()
+		r.cache[host] = dnsCacheEntry{ip: addrs[0], expires: time.Now().Add(r.cacheTTL)}
+		r.cacheMu.Unlock()
 		return addrs[0], nil
 	}
 
@@ -671,6 +693,10 @@ func (r *RemoteResolver) Resolve(host string) (string, error) {
 		return "", fmt.Errorf("DNS resolution returned no addresses for %s", host)
 	}
 	logInfo("[DNS] %s -> %s (system fallback)", host, sysAddrs[0])
+	// Cache the system fallback result too
+	r.cacheMu.Lock()
+	r.cache[host] = dnsCacheEntry{ip: sysAddrs[0], expires: time.Now().Add(r.cacheTTL)}
+	r.cacheMu.Unlock()
 	return sysAddrs[0], nil
 }
 
@@ -896,6 +922,24 @@ var browserProfiles = []BrowserProfile{
 
 func pickBrowserProfile() BrowserProfile {
 	return browserProfiles[mrand.Intn(len(browserProfiles))]
+}
+
+// Pre-built TLS configs for each browser profile (avoids per-connection clone)
+var profileTLSConfigs []*tls.Config
+
+func initProfileTLSConfigs(base *tls.Config) {
+	profileTLSConfigs = make([]*tls.Config, len(browserProfiles))
+	for i, p := range browserProfiles {
+		conf := base.Clone()
+		conf.CipherSuites = p.CipherSuites
+		conf.CurvePreferences = p.CurvePrefs
+		conf.NextProtos = []string{"http/1.1"}
+		profileTLSConfigs[i] = conf
+	}
+}
+
+func pickProfileTLSConfig() *tls.Config {
+	return profileTLSConfigs[mrand.Intn(len(profileTLSConfigs))]
 }
 
 // --- Header Sanitization ---
@@ -1168,11 +1212,11 @@ func setTCPReadDeadline(tcpConn *net.TCPConn, timeoutSec int) {
 }
 
 // deadlineThrottle avoids calling SetReadDeadline on every relay iteration.
-// Returns true if the deadline should be updated (at most once per second).
+// Returns true if the deadline should be updated (at most once per 500ms).
 // time.Now() is ~20ns vs SetReadDeadline ~500ns syscall, so checking first saves ~96%.
 func deadlineThrottle(lastSet *time.Time) bool {
 	now := time.Now()
-	if now.Sub(*lastSet) >= time.Second {
+	if now.Sub(*lastSet) >= 500*time.Millisecond {
 		*lastSet = now
 		return true
 	}
@@ -1210,6 +1254,288 @@ var largeFramePool = sync.Pool{
 		return &buf
 	},
 }
+
+// handshakeBufPool pools bytes.Buffer for WebSocket handshake requests.
+// Avoids per-connection allocation of ~512 byte buffers.
+var handshakeBufPool = sync.Pool{
+	New: func() interface{} {
+		buf := bytes.NewBuffer(make([]byte, 0, 512))
+		return buf
+	},
+}
+
+// --- Connection Pool ---
+// Pre-established WebSocket connections to reduce per-connection setup overhead.
+// Each pooled connection has completed TCP+TLS+WS handshake but has NOT sent
+// the target frame yet. When grabbed from the pool, the target frame is sent
+// and the connection becomes ready for data relay.
+
+type PooledConn struct {
+	wsConn    net.Conn
+	br        *bufio.Reader
+	created   time.Time
+	lastUsed  time.Time
+}
+
+type ConnPool struct {
+	conns       []*PooledConn
+	mu          sync.Mutex
+	cfg         *Config
+	maxSize     int
+	maxAge      time.Duration
+	idleTimeout time.Duration
+	closed      bool
+}
+
+func NewConnPool(cfg *Config, maxSize int) *ConnPool {
+	p := &ConnPool{
+		conns:       make([]*PooledConn, 0, maxSize),
+		cfg:         cfg,
+		maxSize:     maxSize,
+		maxAge:      5 * time.Minute,
+		idleTimeout: 30 * time.Second,
+	}
+	// Start background goroutine to maintain pool
+	go p.maintainLoop()
+	return p
+}
+
+func (p *ConnPool) maintainLoop() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		p.cleanup()
+		// Fill pool to half capacity
+		for i := 0; i < p.maxSize/2; i++ {
+			p.mu.Lock()
+			if p.closed || len(p.conns) >= p.maxSize/2 {
+				p.mu.Unlock()
+				break
+			}
+			p.mu.Unlock()
+			conn := p.createConn()
+			if conn == nil {
+				break
+			}
+			p.mu.Lock()
+			if p.closed || len(p.conns) >= p.maxSize {
+				p.mu.Unlock()
+				conn.wsConn.Close()
+				break
+			}
+			p.conns = append(p.conns, conn)
+			p.mu.Unlock()
+		}
+	}
+}
+
+func (p *ConnPool) cleanup() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	valid := p.conns[:0]
+	for _, c := range p.conns {
+		if now.Sub(c.created) > p.maxAge || now.Sub(c.lastUsed) > p.idleTimeout {
+			c.wsConn.Close()
+		} else {
+			valid = append(valid, c)
+		}
+	}
+	p.conns = valid
+}
+
+func (p *ConnPool) createConn() *PooledConn {
+	cfg := p.cfg
+	wsURL := cfg.ParsedUpstream
+	wsHost := cfg.UpstreamHost
+	wsPort := cfg.UpstreamPort
+
+	// DNS resolution
+	dialHost := wsHost
+	if cfg.Resolver != nil {
+		if resolvedIP, resolveErr := cfg.Resolver.Resolve(wsHost); resolveErr == nil {
+			dialHost = resolvedIP
+		} else {
+			return nil
+		}
+	}
+
+	dialAddr := net.JoinHostPort(dialHost, wsPort)
+	sniHostname := sanitizeHeader(wsHost)
+	if cfg.FakeHost != "" {
+		sniHostname = sanitizeHeader(strings.Split(cfg.FakeHost, ":")[0])
+	}
+
+	var wsConn net.Conn
+	var err error
+	if cfg.UpstreamIsWSS {
+		conf := pickProfileTLSConfig().Clone()
+		conf.ServerName = sniHostname
+		wsConn, err = tls.Dial("tcp", dialAddr, conf)
+	} else {
+		wsConn, err = net.Dial("tcp", dialAddr)
+	}
+	if err != nil {
+		return nil
+	}
+
+	optimizeSocket(wsConn, cfg)
+	br := bufio.NewReaderSize(wsConn, MaxHeaderSize)
+
+	// WebSocket handshake
+	profile := pickBrowserProfile()
+	path := wsURL.Path
+	if path == "" {
+		path = "/"
+	}
+	var wsKey [16]byte
+	if _, err := rand.Read(wsKey[:]); err != nil {
+		wsConn.Close()
+		return nil
+	}
+	wsKeyStr := base64.StdEncoding.EncodeToString(wsKey[:])
+
+	hostHeader := sanitizeHeader(wsHost)
+	if cfg.FakeHost != "" {
+		hostHeader = sanitizeHeader(cfg.FakeHost)
+	}
+
+	protocolScheme := "http"
+	if cfg.UpstreamIsWSS {
+		protocolScheme = "https"
+	}
+
+	secFetchSite := "cross-site"
+	if sniHostname == strings.Split(hostHeader, ":")[0] {
+		secFetchSite = "same-origin"
+	}
+
+	reqLine := "GET " + path + " HTTP/1.1\r\n"
+
+	fixedTop := []string{
+		"Host: " + hostHeader,
+		"Connection: Upgrade",
+		"Upgrade: websocket",
+	}
+
+	shufflable := []string{
+		"Pragma: no-cache",
+		"Cache-Control: no-cache",
+		"User-Agent: " + profile.UA,
+		"Accept-Language: " + profile.AcceptLang,
+		"Accept-Encoding: gzip, deflate, br, zstd",
+		"Origin: " + protocolScheme + "://" + sniHostname,
+	}
+
+	if profile.IsChromium && profile.SecChUA != "" {
+		shufflable = append(shufflable,
+			"sec-ch-ua: "+profile.SecChUA,
+			"sec-ch-ua-mobile: "+profile.SecChUAMob,
+			"sec-ch-ua-platform: "+profile.SecChUAPlat,
+		)
+	}
+
+	fixedBottom := []string{
+		"Sec-WebSocket-Version: 13",
+		"Sec-WebSocket-Key: " + wsKeyStr,
+		"Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits",
+		"Sec-Fetch-Dest: websocket",
+		"Sec-Fetch-Mode: websocket",
+		"Sec-Fetch-Site: " + secFetchSite,
+	}
+
+	for i := len(shufflable) - 1; i > 0; i-- {
+		j := mrand.Intn(i + 1)
+		shufflable[i], shufflable[j] = shufflable[j], shufflable[i]
+	}
+
+	handshakeBuf := handshakeBufPool.Get().(*bytes.Buffer)
+	handshakeBuf.Reset()
+	handshakeBuf.WriteString(reqLine)
+	for _, h := range fixedTop {
+		handshakeBuf.WriteString(h)
+		handshakeBuf.WriteString("\r\n")
+	}
+	for _, h := range shufflable {
+		handshakeBuf.WriteString(h)
+		handshakeBuf.WriteString("\r\n")
+	}
+	for _, h := range fixedBottom {
+		handshakeBuf.WriteString(h)
+		handshakeBuf.WriteString("\r\n")
+	}
+	handshakeBuf.WriteString("\r\n")
+
+	if _, err := wsConn.Write(handshakeBuf.Bytes()); err != nil {
+		handshakeBufPool.Put(handshakeBuf)
+		wsConn.Close()
+		return nil
+	}
+	handshakeBufPool.Put(handshakeBuf)
+
+	// Read handshake response
+	wsTCPConn := extractTCPConn(wsConn)
+	setTCPReadDeadline(wsTCPConn, cfg.ConnTimeout)
+	respBytes, err := readUntilCRLFCRLF(br)
+	if err != nil || !bytes.Contains(respBytes, []byte("101")) {
+		wsConn.Close()
+		return nil
+	}
+
+	return &PooledConn{
+		wsConn:   wsConn,
+		br:       br,
+		created:  time.Now(),
+		lastUsed: time.Now(),
+	}
+}
+
+func (p *ConnPool) Get() *PooledConn {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.closed || len(p.conns) == 0 {
+		return nil
+	}
+
+	// Pop last connection
+	n := len(p.conns)
+	conn := p.conns[n-1]
+	p.conns = p.conns[:n-1]
+	conn.lastUsed = time.Now()
+	return conn
+}
+
+func (p *ConnPool) Put(conn *PooledConn) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.closed || len(p.conns) >= p.maxSize {
+		conn.wsConn.Close()
+		return
+	}
+
+	// Check if connection is still valid
+	if time.Since(conn.created) > p.maxAge {
+		conn.wsConn.Close()
+		return
+	}
+
+	p.conns = append(p.conns, conn)
+}
+
+func (p *ConnPool) Close() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.closed = true
+	for _, c := range p.conns {
+		c.wsConn.Close()
+	}
+	p.conns = nil
+}
+
+// Global connection pool (initialized in main)
+var connPool *ConnPool
 
 // readWSFrameInto reads one WebSocket data frame from r, writing any Ping replies
 // to w. buf is used as scratch space; if the payload fits it is returned as a
@@ -1349,11 +1675,11 @@ func main() {
 	kFlag := flag.String("k", "", "Authentication Key")
 	logFlag := flag.String("log", "INFO", "Log Level")
 	fakeHostFlag := flag.String("fakehost", "", "Spoofing Hostname")
-	wFlag := flag.Int("W", 256, "App Buffer Size in KB")
+	wFlag := flag.Int("W", 1024, "App Buffer Size in KB (default 1MB)")
 	noDelayFlag := flag.Bool("no-tcp-nodelay", false, "Disable TCP_NODELAY")
 	keepAliveFlag := flag.Bool("no-tcp-keepalive", false, "Disable TCP KeepAlive")
-	sockBufFlag := flag.Int("socket-buffer", 0, "Kernel Socket Buffer")
-	connTimeoutFlag := flag.Int("connection-timeout", 300, "Connection Timeout")
+	sockBufFlag := flag.Int("socket-buffer", 8192, "Kernel Socket Buffer in KB (default 8MB)")
+	connTimeoutFlag := flag.Int("connection-timeout", 60, "Connection Timeout in seconds (default 60s)")
 	verifySSLFlag := flag.Bool("verify-ssl", false, "Enable SSL Verification")
 	maxConnFlag := flag.Int("max-conn", 1000, "Max Concurrent Connections")
 	blockLocalFlag := flag.Bool("block-local", true, "Drop local/LAN traffic (Client mode)")
@@ -1382,7 +1708,7 @@ func main() {
 		Upstream:       *upFlag,
 		FakeHost:       *fakeHostFlag,
 		Key:            *kFlag,
-		BufferSize:     262144,
+		BufferSize:     1048576, // 1MB default (increased from 256KB for better throughput)
 		NoTcpNoDelay:   *noDelayFlag,
 		NoTcpKeepAlive: *keepAliveFlag,
 		SocketBuffer:   *sockBufFlag,
@@ -1511,6 +1837,12 @@ func main() {
 		InsecureSkipVerify: !cfg.VerifySSL,
 		MinVersion:         tls.VersionTLS12,
 		MaxVersion:         tls.VersionTLS13,
+		ClientSessionCache: tls.NewLRUClientSessionCache(128), // TLS session resumption
+	}
+
+	// Pre-build TLS configs for each browser profile
+	if cfg.Upstream != "" && cfg.UpstreamIsWSS {
+		initProfileTLSConfigs(cfg.TLSBase)
 	}
 
 	bufSize := cfg.BufferSize + 14
@@ -1526,6 +1858,11 @@ func main() {
 			buf := make([]byte, MaxHeaderSize)
 			return &buf
 		},
+	}
+
+	// Initialize connection pool for client mode (pre-establish WebSocket connections)
+	if cfg.Upstream != "" {
+		connPool = NewConnPool(&cfg, 10) // Pool of 10 pre-established connections
 	}
 
 	if !tuiEnabled {
@@ -2060,164 +2397,166 @@ func handleClient(localConn net.Conn, cfg *Config) {
 
 	// Connect Upstream WS (use pre-parsed URL from startup)
 	var wsConn net.Conn
+	var wsTCPConn *net.TCPConn
+	var br *bufio.Reader
 	wsURL := cfg.ParsedUpstream
 	wsHost := cfg.UpstreamHost
 	wsPort := cfg.UpstreamPort
+	profile := pickBrowserProfile()
 
-	// Remote DNS resolution for upstream host
-	dialHost := wsHost
-	if cfg.Resolver != nil {
-		if resolvedIP, resolveErr := cfg.Resolver.Resolve(wsHost); resolveErr == nil {
-			dialHost = resolvedIP
+	// Try connection pool first (pre-established connections)
+	var pooledConn *PooledConn
+	if connPool != nil {
+		pooledConn = connPool.Get()
+	}
+
+	if pooledConn != nil {
+		// Use pre-established connection from pool (skips TCP+TLS+WS handshake)
+		wsConn = pooledConn.wsConn
+		br = pooledConn.br
+		wsTCPConn = extractTCPConn(wsConn)
+		logDebug("[CLIENT] Using pooled connection")
+	} else {
+		// Create new connection (original path)
+		dialHost := wsHost
+		if cfg.Resolver != nil {
+			if resolvedIP, resolveErr := cfg.Resolver.Resolve(wsHost); resolveErr == nil {
+				dialHost = resolvedIP
+			} else {
+				logError("[DNS] Failed to resolve upstream %s: %v", wsHost, resolveErr)
+			}
+		}
+
+		dialAddr := net.JoinHostPort(dialHost, wsPort)
+		sniHostname := sanitizeHeader(wsHost)
+		if cfg.FakeHost != "" {
+			sniHostname = sanitizeHeader(strings.Split(cfg.FakeHost, ":")[0])
+		}
+
+		var err error
+		if cfg.UpstreamIsWSS {
+			conf := pickProfileTLSConfig().Clone()
+			conf.ServerName = sniHostname
+			wsConn, err = tls.Dial("tcp", dialAddr, conf)
 		} else {
-			logError("[DNS] Failed to resolve upstream %s: %v", wsHost, resolveErr)
+			wsConn, err = net.Dial("tcp", dialAddr)
+		}
+
+		if err != nil {
+			logError("Upstream fail: %v", err)
+			return
+		}
+
+		optimizeSocket(wsConn, cfg)
+		wsTCPConn = extractTCPConn(wsConn)
+		br = bufio.NewReaderSize(wsConn, MaxHeaderSize)
+
+		// WebSocket handshake
+		path := wsURL.Path
+		if path == "" {
+			path = "/"
+		}
+		var wsKey [16]byte
+		if _, err := rand.Read(wsKey[:]); err != nil {
+			return
+		}
+		wsKeyStr := base64.StdEncoding.EncodeToString(wsKey[:])
+
+		hostHeader := sanitizeHeader(wsHost)
+		if cfg.FakeHost != "" {
+			hostHeader = sanitizeHeader(cfg.FakeHost)
+		}
+
+		protocolScheme := "http"
+		if cfg.UpstreamIsWSS {
+			protocolScheme = "https"
+		}
+
+		secFetchSite := "cross-site"
+		if sniHostname == strings.Split(hostHeader, ":")[0] {
+			secFetchSite = "same-origin"
+		}
+
+		reqLine := "GET " + path + " HTTP/1.1\r\n"
+
+		fixedTop := []string{
+			"Host: " + hostHeader,
+			"Connection: Upgrade",
+			"Upgrade: websocket",
+		}
+
+		shufflable := []string{
+			"Pragma: no-cache",
+			"Cache-Control: no-cache",
+			"User-Agent: " + profile.UA,
+			"Accept-Language: " + profile.AcceptLang,
+			"Accept-Encoding: gzip, deflate, br, zstd",
+			"Origin: " + protocolScheme + "://" + sniHostname,
+		}
+
+		if profile.IsChromium && profile.SecChUA != "" {
+			shufflable = append(shufflable,
+				"sec-ch-ua: "+profile.SecChUA,
+				"sec-ch-ua-mobile: "+profile.SecChUAMob,
+				"sec-ch-ua-platform: "+profile.SecChUAPlat,
+			)
+		}
+
+		fixedBottom := []string{
+			"Sec-WebSocket-Version: 13",
+			"Sec-WebSocket-Key: " + wsKeyStr,
+			"Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits",
+			"Sec-Fetch-Dest: websocket",
+			"Sec-Fetch-Mode: websocket",
+			"Sec-Fetch-Site: " + secFetchSite,
+		}
+
+		for i := len(shufflable) - 1; i > 0; i-- {
+			j := mrand.Intn(i + 1)
+			shufflable[i], shufflable[j] = shufflable[j], shufflable[i]
+		}
+
+		handshakeBuf := handshakeBufPool.Get().(*bytes.Buffer)
+		handshakeBuf.Reset()
+		handshakeBuf.WriteString(reqLine)
+		for _, h := range fixedTop {
+			handshakeBuf.WriteString(h)
+			handshakeBuf.WriteString("\r\n")
+		}
+		for _, h := range shufflable {
+			handshakeBuf.WriteString(h)
+			handshakeBuf.WriteString("\r\n")
+		}
+		for _, h := range fixedBottom {
+			handshakeBuf.WriteString(h)
+			handshakeBuf.WriteString("\r\n")
+		}
+		handshakeBuf.WriteString("\r\n")
+
+		if _, err := wsConn.Write(handshakeBuf.Bytes()); err != nil {
+			handshakeBufPool.Put(handshakeBuf)
+			return
+		}
+		handshakeBufPool.Put(handshakeBuf)
+
+		setTCPReadDeadline(wsTCPConn, cfg.ConnTimeout)
+		respBytes, err := readUntilCRLFCRLF(br)
+		if err != nil {
+			logError("Handshake read failed: %v", err)
+			return
+		}
+		if !bytes.Contains(respBytes, []byte("101")) {
+			logError("Handshake failed status: %s", string(respBytes))
+			return
 		}
 	}
 
-	dialAddr := net.JoinHostPort(dialHost, wsPort)
-	sniHostname := sanitizeHeader(wsHost)
-	if cfg.FakeHost != "" {
-		sniHostname = sanitizeHeader(strings.Split(cfg.FakeHost, ":")[0])
-	}
-
-	// Pick a consistent browser profile for this connection.
-	// TLS ciphers/curves + HTTP headers must come from the same profile
-	// to avoid cross-signal inconsistencies that Cloudflare detects.
-	profile := pickBrowserProfile()
-
-	var err error
-	if cfg.UpstreamIsWSS {
-		conf := cfg.TLSBase.Clone()
-		conf.ServerName = sniHostname
-		conf.CipherSuites = profile.CipherSuites
-		conf.CurvePreferences = profile.CurvePrefs
-		// ALPN: advertise HTTP/1.1 only — we speak HTTP/1.1 WebSocket upgrade.
-		// Advertising h2 while sending an HTTP/1.1 handshake is a detectable mismatch.
-		conf.NextProtos = []string{"http/1.1"}
-		wsConn, err = tls.Dial("tcp", dialAddr, conf)
-	} else {
-		wsConn, err = net.Dial("tcp", dialAddr)
-	}
-
-	if err != nil {
-		logError("Upstream fail: %v", err)
-		return
-	}
-	defer wsConn.Close()
+	defer func() {
+		wsConn.Close()
+	}()
 
 	optimizeSocket(localConn, cfg)
-	optimizeSocket(wsConn, cfg)
-
 	localTCPConn := extractTCPConn(localConn)
-	wsTCPConn := extractTCPConn(wsConn)
-
-	br := bufio.NewReaderSize(wsConn, MaxHeaderSize)
-
-	path := wsURL.Path
-	if path == "" {
-		path = "/"
-	}
-	var wsKey [16]byte
-	if _, err := rand.Read(wsKey[:]); err != nil {
-		return
-	}
-	wsKeyStr := base64.StdEncoding.EncodeToString(wsKey[:])
-
-	hostHeader := sanitizeHeader(wsHost)
-	if cfg.FakeHost != "" {
-		hostHeader = sanitizeHeader(cfg.FakeHost)
-	}
-
-	protocolScheme := "http"
-	if cfg.UpstreamIsWSS {
-		protocolScheme = "https"
-	}
-
-	// Determine Sec-Fetch-Site: same-origin when Origin host == Host, else cross-site
-	secFetchSite := "cross-site"
-	if sniHostname == strings.Split(hostHeader, ":")[0] {
-		secFetchSite = "same-origin"
-	}
-
-	reqLine := "GET " + path + " HTTP/1.1\r\n"
-
-	// Build the ordered header set for this profile.
-	// Chromium-based browsers send sec-ch-ua hints; Firefox does not.
-	// Headers are split into two groups:
-	//   fixedTop    — must always appear before the shuffled block (Host, Connection, Upgrade)
-	//   shufflable  — can be reordered freely; matches real browser non-determinism
-	//   fixedBottom — WebSocket-specific headers that logically close the handshake
-
-	fixedTop := []string{
-		"Host: " + hostHeader,
-		"Connection: Upgrade",
-		"Upgrade: websocket",
-	}
-
-	shufflable := []string{
-		"Pragma: no-cache",
-		"Cache-Control: no-cache",
-		"User-Agent: " + profile.UA,
-		"Accept-Language: " + profile.AcceptLang,
-		"Accept-Encoding: gzip, deflate, br, zstd",
-		"Origin: " + protocolScheme + "://" + sniHostname,
-	}
-
-	// Add Chromium-specific Client Hint headers when applicable
-	if profile.IsChromium && profile.SecChUA != "" {
-		shufflable = append(shufflable,
-			"sec-ch-ua: "+profile.SecChUA,
-			"sec-ch-ua-mobile: "+profile.SecChUAMob,
-			"sec-ch-ua-platform: "+profile.SecChUAPlat,
-		)
-	}
-
-	fixedBottom := []string{
-		"Sec-WebSocket-Version: 13",
-		"Sec-WebSocket-Key: " + wsKeyStr,
-		"Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits",
-		"Sec-Fetch-Dest: websocket",
-		"Sec-Fetch-Mode: websocket",
-		"Sec-Fetch-Site: " + secFetchSite,
-	}
-
-	// Fisher-Yates shuffle on the shufflable block only
-	for i := len(shufflable) - 1; i > 0; i-- {
-		j := mrand.Intn(i + 1)
-		shufflable[i], shufflable[j] = shufflable[j], shufflable[i]
-	}
-
-	var handshakeBuf bytes.Buffer
-	handshakeBuf.Grow(512)
-	handshakeBuf.WriteString(reqLine)
-	for _, h := range fixedTop {
-		handshakeBuf.WriteString(h)
-		handshakeBuf.WriteString("\r\n")
-	}
-	for _, h := range shufflable {
-		handshakeBuf.WriteString(h)
-		handshakeBuf.WriteString("\r\n")
-	}
-	for _, h := range fixedBottom {
-		handshakeBuf.WriteString(h)
-		handshakeBuf.WriteString("\r\n")
-	}
-	handshakeBuf.WriteString("\r\n")
-
-	if _, err := wsConn.Write(handshakeBuf.Bytes()); err != nil {
-		return
-	}
-
-	setTCPReadDeadline(wsTCPConn, cfg.ConnTimeout)
-	respBytes, err := readUntilCRLFCRLF(br)
-	if err != nil {
-		logError("Handshake read failed: %v", err)
-		return
-	}
-	if !bytes.Contains(respBytes, []byte("101")) {
-		logError("Handshake failed status: %s", string(respBytes))
-		return
-	}
 
 	base := targetHost + ":" + targetPort + "\n"
 	padLen := 1 + mrand.Intn(40)
@@ -2297,14 +2636,30 @@ func handleClient(localConn net.Conn, cfg *Config) {
 				err = errRead
 				return
 			}
-			if errWrite := writeWSFramePreallocatedFast(wsConn, buf, 14, nr, 0x2, prng); errWrite != nil {
+
+			// Write coalescing: try to read more data before writing
+			// This reduces the number of small WebSocket frames
+			totalRead := nr
+			for totalRead < len(buf)-14 {
+				// Set a short read deadline to check for more data
+				localConn.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
+				moreRead, moreErr := localConn.Read(buf[14+totalRead:])
+				if moreErr != nil || moreRead == 0 {
+					break
+				}
+				totalRead += moreRead
+			}
+			// Restore the original deadline
+			setTCPReadDeadline(localTCPConn, cfg.ConnTimeout)
+
+			if errWrite := writeWSFramePreallocatedFast(wsConn, buf, 14, totalRead, 0x2, prng); errWrite != nil {
 				if localUp > 0 {
 					stats.AddBytes(localUp, 0)
 				}
 				err = errWrite
 				return
 			}
-			localUp += int64(nr)
+			localUp += int64(totalRead)
 		}
 	}()
 
@@ -2333,6 +2688,9 @@ func handleClient(localConn net.Conn, cfg *Config) {
 				err = errRead
 				return
 			}
+
+			// Write coalescing: try to write data immediately
+			// For download direction, we write as-is since data comes from WebSocket frames
 			if _, errWrite := localConn.Write(data); errWrite != nil {
 				if localDown > 0 {
 					stats.AddBytes(0, localDown)
