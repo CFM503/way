@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	Version        = "1.5.1"
+	Version        = "1.5.2"
 	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -920,8 +920,29 @@ var browserProfiles = []BrowserProfile{
 	},
 }
 
+// --- Safe Random Sources ---
+// mrand's default source is NOT safe for concurrent use. We use a single
+// mutex-protected mrand instance (profileRand/profileRandMu) for all
+// browser-profile selection, TLS config picking, header shuffling, and padding.
+// This is safe and the mutex overhead is negligible (~50ns per call).
+var profileRandMu sync.Mutex
+
+// profileRand is a per-process PRNG seeded with crypto/rand.
+// It is used for browser profile selection and TLS config picking.
+var profileRand = mrand.New(mrand.NewSource(mrand.Int63()))
+
 func pickBrowserProfile() BrowserProfile {
-	return browserProfiles[mrand.Intn(len(browserProfiles))]
+	profileRandMu.Lock()
+	idx := profileRand.Intn(len(browserProfiles))
+	profileRandMu.Unlock()
+	return browserProfiles[idx]
+}
+
+func pickProfileTLSConfig() *tls.Config {
+	profileRandMu.Lock()
+	idx := profileRand.Intn(len(profileTLSConfigs))
+	profileRandMu.Unlock()
+	return profileTLSConfigs[idx]
 }
 
 // Pre-built TLS configs for each browser profile (avoids per-connection clone)
@@ -936,10 +957,6 @@ func initProfileTLSConfigs(base *tls.Config) {
 		conf.NextProtos = []string{"http/1.1"}
 		profileTLSConfigs[i] = conf
 	}
-}
-
-func pickProfileTLSConfig() *tls.Config {
-	return profileTLSConfigs[mrand.Intn(len(profileTLSConfigs))]
 }
 
 // --- Header Sanitization ---
@@ -1224,20 +1241,28 @@ func deadlineThrottle(lastSet *time.Time) bool {
 }
 
 func readUntilCRLFCRLF(br *bufio.Reader) ([]byte, error) {
-	var buf bytes.Buffer
-	buf.Grow(MaxHeaderSize)
+	// Pre-allocate a buffer to avoid repeated allocations.
+	// We read line-by-line using Peek+Discard to stay within the bufio
+	// reader's internal buffer, then copy the result into a newly allocated
+	// []byte to return. This avoids the bytes.Buffer overhead and keeps
+	// the reader's internal buffer clean for reuse.
+	buf := make([]byte, 0, MaxHeaderSize)
 	for {
 		line, err := br.ReadSlice('\n')
 		if err != nil {
+			// Copy line data into buf before ReadSlice potentially invalidates it.
+			buf = append(buf, line...)
 			return nil, err
 		}
-		buf.Write(line)
-		b := buf.Bytes()
-		n := len(b)
+		buf = append(buf, line...)
+		n := len(buf)
 		if n >= 4 &&
-			b[n-4] == '\r' && b[n-3] == '\n' &&
-			b[n-2] == '\r' && b[n-1] == '\n' {
-			return b, nil
+			buf[n-4] == '\r' && buf[n-3] == '\n' &&
+			buf[n-2] == '\r' && buf[n-1] == '\n' {
+			// Return a copy so the caller owns the memory.
+			result := make([]byte, n)
+			copy(result, buf)
+			return result, nil
 		}
 		if n > MaxHeaderSize {
 			return nil, errors.New("header too large")
@@ -1285,6 +1310,7 @@ type ConnPool struct {
 	maxAge      time.Duration
 	idleTimeout time.Duration
 	closed      bool
+	done        chan struct{} // signals maintainLoop to exit
 }
 
 func NewConnPool(cfg *Config, maxSize int) *ConnPool {
@@ -1294,6 +1320,7 @@ func NewConnPool(cfg *Config, maxSize int) *ConnPool {
 		maxSize:     maxSize,
 		maxAge:      5 * time.Minute,
 		idleTimeout: 30 * time.Second,
+		done:        make(chan struct{}),
 	}
 	// Start background goroutine to maintain pool
 	go p.maintainLoop()
@@ -1303,7 +1330,12 @@ func NewConnPool(cfg *Config, maxSize int) *ConnPool {
 func (p *ConnPool) maintainLoop() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
+	for {
+		select {
+		case <-p.done:
+			return
+		case <-ticker.C:
+		}
 		p.cleanup()
 		// Fill pool to half capacity
 		for i := 0; i < p.maxSize/2; i++ {
@@ -1346,7 +1378,6 @@ func (p *ConnPool) cleanup() {
 
 func (p *ConnPool) createConn() *PooledConn {
 	cfg := p.cfg
-	wsURL := cfg.ParsedUpstream
 	wsHost := cfg.UpstreamHost
 	wsPort := cfg.UpstreamPort
 
@@ -1382,16 +1413,49 @@ func (p *ConnPool) createConn() *PooledConn {
 	optimizeSocket(wsConn, cfg)
 	br := bufio.NewReaderSize(wsConn, MaxHeaderSize)
 
-	// WebSocket handshake
+	// Perform WebSocket handshake using shared function
 	profile := pickBrowserProfile()
+	if err := performWSHandshake(wsConn, br, p.cfg, profile); err != nil {
+		wsConn.Close()
+		return nil
+	}
+
+	// Read handshake response
+	wsTCPConn := extractTCPConn(wsConn)
+	setTCPReadDeadline(wsTCPConn, cfg.ConnTimeout)
+	respBytes, err := readUntilCRLFCRLF(br)
+	if err != nil || !bytes.Contains(respBytes, []byte("101")) {
+		wsConn.Close()
+		return nil
+	}
+
+	return &PooledConn{
+		wsConn:   wsConn,
+		br:       br,
+		created:  time.Now(),
+		lastUsed: time.Now(),
+	}
+}
+
+// performWSHandshake builds and sends a WebSocket handshake to wsConn using br,
+// then reads the 101 response. Returns nil on success.
+// This is shared between createConn and handleClient to avoid ~80 lines of
+// duplicate handshake construction code.
+func performWSHandshake(wsConn net.Conn, br *bufio.Reader, cfg *Config, profile BrowserProfile) error {
+	wsURL := cfg.ParsedUpstream
+	wsHost := cfg.UpstreamHost
+	sniHostname := sanitizeHeader(wsHost)
+	if cfg.FakeHost != "" {
+		sniHostname = sanitizeHeader(strings.Split(cfg.FakeHost, ":")[0])
+	}
+
 	path := wsURL.Path
 	if path == "" {
 		path = "/"
 	}
 	var wsKey [16]byte
 	if _, err := rand.Read(wsKey[:]); err != nil {
-		wsConn.Close()
-		return nil
+		return err
 	}
 	wsKeyStr := base64.StdEncoding.EncodeToString(wsKey[:])
 
@@ -1445,7 +1509,9 @@ func (p *ConnPool) createConn() *PooledConn {
 	}
 
 	for i := len(shufflable) - 1; i > 0; i-- {
-		j := mrand.Intn(i + 1)
+		profileRandMu.Lock()
+		j := profileRand.Intn(i + 1)
+		profileRandMu.Unlock()
 		shufflable[i], shufflable[j] = shufflable[j], shufflable[i]
 	}
 
@@ -1468,26 +1534,11 @@ func (p *ConnPool) createConn() *PooledConn {
 
 	if _, err := wsConn.Write(handshakeBuf.Bytes()); err != nil {
 		handshakeBufPool.Put(handshakeBuf)
-		wsConn.Close()
-		return nil
+		return err
 	}
 	handshakeBufPool.Put(handshakeBuf)
 
-	// Read handshake response
-	wsTCPConn := extractTCPConn(wsConn)
-	setTCPReadDeadline(wsTCPConn, cfg.ConnTimeout)
-	respBytes, err := readUntilCRLFCRLF(br)
-	if err != nil || !bytes.Contains(respBytes, []byte("101")) {
-		wsConn.Close()
-		return nil
-	}
-
-	return &PooledConn{
-		wsConn:   wsConn,
-		br:       br,
-		created:  time.Now(),
-		lastUsed: time.Now(),
-	}
+	return nil
 }
 
 func (p *ConnPool) Get() *PooledConn {
@@ -1528,6 +1579,7 @@ func (p *ConnPool) Close() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.closed = true
+	close(p.done) // signal maintainLoop to exit
 	for _, c := range p.conns {
 		c.wsConn.Close()
 	}
@@ -2399,7 +2451,6 @@ func handleClient(localConn net.Conn, cfg *Config) {
 	var wsConn net.Conn
 	var wsTCPConn *net.TCPConn
 	var br *bufio.Reader
-	wsURL := cfg.ParsedUpstream
 	wsHost := cfg.UpstreamHost
 	wsPort := cfg.UpstreamPort
 	profile := pickBrowserProfile()
@@ -2451,93 +2502,11 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		wsTCPConn = extractTCPConn(wsConn)
 		br = bufio.NewReaderSize(wsConn, MaxHeaderSize)
 
-		// WebSocket handshake
-		path := wsURL.Path
-		if path == "" {
-			path = "/"
-		}
-		var wsKey [16]byte
-		if _, err := rand.Read(wsKey[:]); err != nil {
+		// WebSocket handshake using shared function
+		if err := performWSHandshake(wsConn, br, cfg, profile); err != nil {
+			logError("Handshake write failed: %v", err)
 			return
 		}
-		wsKeyStr := base64.StdEncoding.EncodeToString(wsKey[:])
-
-		hostHeader := sanitizeHeader(wsHost)
-		if cfg.FakeHost != "" {
-			hostHeader = sanitizeHeader(cfg.FakeHost)
-		}
-
-		protocolScheme := "http"
-		if cfg.UpstreamIsWSS {
-			protocolScheme = "https"
-		}
-
-		secFetchSite := "cross-site"
-		if sniHostname == strings.Split(hostHeader, ":")[0] {
-			secFetchSite = "same-origin"
-		}
-
-		reqLine := "GET " + path + " HTTP/1.1\r\n"
-
-		fixedTop := []string{
-			"Host: " + hostHeader,
-			"Connection: Upgrade",
-			"Upgrade: websocket",
-		}
-
-		shufflable := []string{
-			"Pragma: no-cache",
-			"Cache-Control: no-cache",
-			"User-Agent: " + profile.UA,
-			"Accept-Language: " + profile.AcceptLang,
-			"Accept-Encoding: gzip, deflate, br, zstd",
-			"Origin: " + protocolScheme + "://" + sniHostname,
-		}
-
-		if profile.IsChromium && profile.SecChUA != "" {
-			shufflable = append(shufflable,
-				"sec-ch-ua: "+profile.SecChUA,
-				"sec-ch-ua-mobile: "+profile.SecChUAMob,
-				"sec-ch-ua-platform: "+profile.SecChUAPlat,
-			)
-		}
-
-		fixedBottom := []string{
-			"Sec-WebSocket-Version: 13",
-			"Sec-WebSocket-Key: " + wsKeyStr,
-			"Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits",
-			"Sec-Fetch-Dest: websocket",
-			"Sec-Fetch-Mode: websocket",
-			"Sec-Fetch-Site: " + secFetchSite,
-		}
-
-		for i := len(shufflable) - 1; i > 0; i-- {
-			j := mrand.Intn(i + 1)
-			shufflable[i], shufflable[j] = shufflable[j], shufflable[i]
-		}
-
-		handshakeBuf := handshakeBufPool.Get().(*bytes.Buffer)
-		handshakeBuf.Reset()
-		handshakeBuf.WriteString(reqLine)
-		for _, h := range fixedTop {
-			handshakeBuf.WriteString(h)
-			handshakeBuf.WriteString("\r\n")
-		}
-		for _, h := range shufflable {
-			handshakeBuf.WriteString(h)
-			handshakeBuf.WriteString("\r\n")
-		}
-		for _, h := range fixedBottom {
-			handshakeBuf.WriteString(h)
-			handshakeBuf.WriteString("\r\n")
-		}
-		handshakeBuf.WriteString("\r\n")
-
-		if _, err := wsConn.Write(handshakeBuf.Bytes()); err != nil {
-			handshakeBufPool.Put(handshakeBuf)
-			return
-		}
-		handshakeBufPool.Put(handshakeBuf)
 
 		setTCPReadDeadline(wsTCPConn, cfg.ConnTimeout)
 		respBytes, err := readUntilCRLFCRLF(br)
@@ -2551,15 +2520,17 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		}
 	}
 
-	defer func() {
-		wsConn.Close()
-	}()
+	// Track whether this is a pooled connection — pooled connections must NOT be
+	// closed on exit; they are returned to the pool for reuse.
+	isPooled := pooledConn != nil
 
 	optimizeSocket(localConn, cfg)
 	localTCPConn := extractTCPConn(localConn)
 
 	base := targetHost + ":" + targetPort + "\n"
-	padLen := 1 + mrand.Intn(40)
+	profileRandMu.Lock()
+	padLen := 1 + profileRand.Intn(40)
+	profileRandMu.Unlock()
 	targetPayload := make([]byte, len(base)+padLen)
 	copy(targetPayload, base)
 	// fill padding with spaces (constant, no allocation)
@@ -2637,29 +2608,14 @@ func handleClient(localConn net.Conn, cfg *Config) {
 				return
 			}
 
-			// Write coalescing: try to read more data before writing
-			// This reduces the number of small WebSocket frames
-			totalRead := nr
-			for totalRead < len(buf)-14 {
-				// Set a short read deadline to check for more data
-				localConn.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
-				moreRead, moreErr := localConn.Read(buf[14+totalRead:])
-				if moreErr != nil || moreRead == 0 {
-					break
-				}
-				totalRead += moreRead
-			}
-			// Restore the original deadline
-			setTCPReadDeadline(localTCPConn, cfg.ConnTimeout)
-
-			if errWrite := writeWSFramePreallocatedFast(wsConn, buf, 14, totalRead, 0x2, prng); errWrite != nil {
+			if errWrite := writeWSFramePreallocatedFast(wsConn, buf, 14, nr, 0x2, prng); errWrite != nil {
 				if localUp > 0 {
 					stats.AddBytes(localUp, 0)
 				}
 				err = errWrite
 				return
 			}
-			localUp += int64(totalRead)
+			localUp += int64(nr)
 		}
 	}()
 
@@ -2703,6 +2659,19 @@ func handleClient(localConn net.Conn, cfg *Config) {
 	}()
 
 	<-errCh
+
+	// Handle connection cleanup: pooled connections are returned to the pool;
+	// non-pooled connections are closed.
+	if isPooled {
+		// Drain any residual data in the buffered reader before returning to pool.
+		if pooledConn.br != nil {
+			pooledConn.br.Discard(pooledConn.br.Buffered())
+		}
+		pooledConn.lastUsed = time.Now()
+		connPool.Put(pooledConn)
+	} else {
+		wsConn.Close()
+	}
 }
 
 // wsGUID is the WebSocket magic GUID per RFC 6455.

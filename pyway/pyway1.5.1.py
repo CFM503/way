@@ -15,9 +15,9 @@ import time
 import threading
 import shutil
 from typing import Optional, Tuple
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 CRLF = b"\r\n"
 CRLFCRLF = b"\r\n\r\n"
 MAX_WS_FRAME_SIZE = 64 * 1024 * 1024  # [v1.5.1] 64MB (increased from 10MB)
@@ -43,6 +43,7 @@ WS_UPGRADE_SUFFIX = b"\r\n\r\n"
 
 class Statistics:
     def __init__(self):
+        self._lock = threading.Lock()
         self.active_conns = 0
         self.bytes_up = 0
         self.bytes_down = 0
@@ -50,14 +51,19 @@ class Statistics:
         self.speed_down = 0.0
 
     def add_conn(self):
-        self.active_conns += 1
+        with self._lock:
+            self.active_conns += 1
 
     def remove_conn(self):
-        self.active_conns -= 1
+        with self._lock:
+            self.active_conns -= 1
 
     def add_bytes(self, up=0, down=0):
-        if up: self.bytes_up += up
-        if down: self.bytes_down += down
+        with self._lock:
+            if up:
+                self.bytes_up += up
+            if down:
+                self.bytes_down += down
 
 
 stats = Statistics()
@@ -236,8 +242,6 @@ class Config:
     upstream_host: str = ""
     upstream_port: str = ""
     upstream_is_wss: bool = False
-    # Buffer pool
-    buf_pool: list = field(default_factory=list)
     # Browser profile (sticky per connection)
     profile: Optional[BrowserProfile] = None
 
@@ -796,8 +800,9 @@ def is_local_target(host: str) -> bool:
         return True
     if h.startswith("fd00:") or h.startswith("[fd00:"):
         return True
-    # Fast rejection: most public hostnames don't start with these
-    if host[0] not in "10lL[":
+    # Fast rejection: private IPs start with '1' (10.x, 172.x, 192.168.x)
+    # and IPv6 brackets start with '['. Most public hostnames don't.
+    if host[0] not in "10[":
         return False
     if h.startswith("192.168.") or h.startswith("10."):
         return True
@@ -960,26 +965,6 @@ async def read_ws_frame(reader: asyncio.StreamReader, writer: Optional[asyncio.S
     except Exception as e:
         logger.debug("Read frame error: %s", e)
         return None
-
-
-# --- Buffer Pool ---
-_BUFFER_POOL_SIZE = 16
-_buffer_pool_lock = threading.Lock()
-
-
-def _get_buffer(config: Config) -> bytearray:
-    """Get a buffer from pool or allocate new one."""
-    with _buffer_pool_lock:
-        if config.buf_pool:
-            return config.buf_pool.pop()
-    return bytearray(config.buffer_size)
-
-
-def _put_buffer(config: Config, buf: bytearray):
-    """Return a buffer to the pool."""
-    with _buffer_pool_lock:
-        if len(config.buf_pool) < _BUFFER_POOL_SIZE:
-            config.buf_pool.append(buf)
 
 
 # --- Connection Pool (Client mode) ---
@@ -1169,14 +1154,19 @@ async def _do_ws_handshake(config: Config) -> Tuple[asyncio.StreamReader, asynci
 
     random.shuffle(shufflable)
 
-    handshake = req_line
+    # Build handshake as list then join once (avoids O(n) intermediate str allocations)
+    parts = [req_line]
     for h in fixed_top:
-        handshake += h + "\r\n"
+        parts.append(h)
+        parts.append("\r\n")
     for h in shufflable:
-        handshake += h + "\r\n"
+        parts.append(h)
+        parts.append("\r\n")
     for h in fixed_bottom:
-        handshake += h + "\r\n"
-    handshake += "\r\n"
+        parts.append(h)
+        parts.append("\r\n")
+    parts.append("\r\n")
+    handshake = "".join(parts)
 
     server_writer.write(handshake.encode())
     await server_writer.drain()
@@ -1256,11 +1246,16 @@ conn_semaphore: Optional[asyncio.Semaphore] = None
 async def handle_server(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, config: Config):
     global conn_semaphore
     if conn_semaphore:
-        if conn_semaphore.locked():
+        # [v1.5.2] Removed non-atomic locked() check. Semaphore.acquire() alone
+        # enforces the limit correctly. The old locked()+acquire() pattern had a
+        # TOCTOU race: between locked() returning False and acquire(), another
+        # coroutine could acquire and increment active_conns past max_connections.
+        try:
+            await asyncio.wait_for(conn_semaphore.acquire(), timeout=5.0)
+        except asyncio.TimeoutError:
             logger.warning("Max connections reached. Dropping %s", writer.get_extra_info('peername'))
             writer.close()
             return
-        await conn_semaphore.acquire()
 
     try:
         await asyncio.wait_for(
@@ -1393,10 +1388,12 @@ async def socks5_negotiate(reader: asyncio.StreamReader, writer: asyncio.StreamW
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, config: Config):
     global conn_semaphore
     if conn_semaphore:
-        if conn_semaphore.locked():
+        # [v1.5.2] Same TOCTOU fix as handle_server.
+        try:
+            await asyncio.wait_for(conn_semaphore.acquire(), timeout=5.0)
+        except asyncio.TimeoutError:
             writer.close()
             return
-        await conn_semaphore.acquire()
 
     peername = writer.get_extra_info('peername')
     logger.info("[CLIENT] Connection from %s", peername)
@@ -1451,7 +1448,8 @@ async def _handle_client_impl(reader: asyncio.StreamReader, writer: asyncio.Stre
             if method == 'CONNECT':
                 try:
                     await asyncio.wait_for(reader.readuntil(CRLFCRLF), timeout=5.0)
-                except: pass
+                except (asyncio.TimeoutError, Exception):
+                    pass
                 target_host, target_port = parse_host_port(target)
             else:
                 try:
@@ -1612,6 +1610,13 @@ async def ws_forward(ws_reader, ws_writer, tcp_reader, tcp_writer, client_side, 
         )
         for task in pending:
             task.cancel()
+        # Await cancelled tasks to ensure proper cleanup (suppresses CancelledError).
+        # This prevents ResourceWarning and ensures writers are properly drained.
+        for task in pending:
+            try:
+                await task
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
     finally:
         stats.remove_conn()
         await safe_close_streamwriter(ws_writer)
