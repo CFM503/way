@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	Version        = "1.5.2"
+	Version        = "1.5.3"
 	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -1731,7 +1731,7 @@ func main() {
 	noDelayFlag := flag.Bool("no-tcp-nodelay", false, "Disable TCP_NODELAY")
 	keepAliveFlag := flag.Bool("no-tcp-keepalive", false, "Disable TCP KeepAlive")
 	sockBufFlag := flag.Int("socket-buffer", 8192, "Kernel Socket Buffer in KB (default 8MB)")
-	connTimeoutFlag := flag.Int("connection-timeout", 60, "Connection Timeout in seconds (default 60s)")
+	connTimeoutFlag := flag.Int("connection-timeout", 300, "Connection Timeout in seconds (default 300s)")
 	verifySSLFlag := flag.Bool("verify-ssl", false, "Enable SSL Verification")
 	maxConnFlag := flag.Int("max-conn", 1000, "Max Concurrent Connections")
 	blockLocalFlag := flag.Bool("block-local", true, "Drop local/LAN traffic (Client mode)")
