@@ -1321,6 +1321,7 @@ type ConnPool struct {
 	maxAge      time.Duration
 	idleTimeout time.Duration
 	closed      bool
+	deadIPs     map[string]time.Time // cache unreachable IPs to avoid repeated timeouts
 }
 
 func NewConnPool(cfg *Config, maxSize int) *ConnPool {
@@ -1330,6 +1331,7 @@ func NewConnPool(cfg *Config, maxSize int) *ConnPool {
 		maxSize:     maxSize,
 		maxAge:      5 * time.Minute,
 		idleTimeout: 30 * time.Second,
+		deadIPs:     make(map[string]time.Time),
 	}
 	// Start background goroutine to maintain pool
 	go p.maintainLoop()
@@ -1405,6 +1407,19 @@ func (p *ConnPool) createConn() *PooledConn {
 
 	dialer := &net.Dialer{Timeout: time.Duration(cfg.ConnTimeout) * time.Second}
 
+	// Skip known-dead IPs (cached for 5 minutes after failure)
+	p.mu.Lock()
+	if deadAt, ok := p.deadIPs[dialHost]; ok {
+		p.mu.Unlock()
+		if time.Since(deadAt) < 5*time.Minute {
+			logDebug("[POOL] Skipping dead IP %s (failed %s ago)", dialHost, time.Since(deadAt).Round(time.Second))
+			return p.tryFallbackDial(dialer, wsHost, wsPort, sniHostname)
+		}
+		p.mu.Lock()
+		delete(p.deadIPs, dialHost)
+	}
+	p.mu.Unlock()
+
 	var wsConn net.Conn
 	var err error
 	if cfg.UpstreamIsWSS {
@@ -1416,6 +1431,10 @@ func (p *ConnPool) createConn() *PooledConn {
 	}
 	if err != nil {
 		logDebug("[POOL] Dial %s failed: %v", dialAddr, err)
+		// Mark IP as dead to avoid repeated timeouts
+		p.mu.Lock()
+		p.deadIPs[dialHost] = time.Now()
+		p.mu.Unlock()
 		if cfg.FakeHost != "" {
 			fallbackConn := p.tryFallbackDial(dialer, wsHost, wsPort, sniHostname)
 			if fallbackConn != nil {
@@ -1568,6 +1587,9 @@ func (p *ConnPool) tryFallbackDial(dialer *net.Dialer, wsHost, wsPort, sniHostna
 		}
 		if err != nil {
 			logDebug("[POOL] Fallback dial %s failed: %v", fallbackAddr, err)
+			p.mu.Lock()
+			p.deadIPs[ip.String()] = time.Now()
+			p.mu.Unlock()
 			continue
 		}
 		optimizeSocket(wsConn, cfg)
