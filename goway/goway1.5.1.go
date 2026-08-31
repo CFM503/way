@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	Version        = "1.5.1"
+	Version        = "1.6.0"
 	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -1264,6 +1264,42 @@ var handshakeBufPool = sync.Pool{
 	},
 }
 
+// tryClientFallbackDial attempts to resolve the fakehost domain to get
+// alternative Cloudflare edge IPs when the primary upstream IP is unreachable.
+func tryClientFallbackDial(dialer *net.Dialer, wsHost, wsPort, sniHostname string, cfg *Config) net.Conn {
+	if net.ParseIP(wsHost) == nil {
+		return nil
+	}
+	ips, err := net.LookupIP(sniHostname)
+	if err != nil || len(ips) == 0 {
+		return nil
+	}
+	for _, ip := range ips {
+		if ip4 := ip.To4(); ip4 == nil {
+			continue
+		}
+		fallbackAddr := net.JoinHostPort(ip.String(), wsPort)
+		if fallbackAddr == net.JoinHostPort(wsHost, wsPort) {
+			continue
+		}
+		logInfo("[DNS] Trying fallback Cloudflare edge: %s (fakehost: %s)", fallbackAddr, sniHostname)
+		var conn net.Conn
+		if cfg.UpstreamIsWSS {
+			conf := pickProfileTLSConfig().Clone()
+			conf.ServerName = sniHostname
+			conn, err = tls.DialWithDialer(dialer, "tcp", fallbackAddr, conf)
+		} else {
+			conn, err = dialer.Dial("tcp", fallbackAddr)
+		}
+		if err != nil {
+			logDebug("[DNS] Fallback dial %s failed: %v", fallbackAddr, err)
+			continue
+		}
+		return conn
+	}
+	return nil
+}
+
 // --- Connection Pool ---
 // Pre-established WebSocket connections to reduce per-connection setup overhead.
 // Each pooled connection has completed TCP+TLS+WS handshake but has NOT sent
@@ -1356,6 +1392,7 @@ func (p *ConnPool) createConn() *PooledConn {
 		if resolvedIP, resolveErr := cfg.Resolver.Resolve(wsHost); resolveErr == nil {
 			dialHost = resolvedIP
 		} else {
+			logDebug("[POOL] DNS resolve failed for upstream %s: %v", wsHost, resolveErr)
 			return nil
 		}
 	}
@@ -1366,16 +1403,25 @@ func (p *ConnPool) createConn() *PooledConn {
 		sniHostname = sanitizeHeader(strings.Split(cfg.FakeHost, ":")[0])
 	}
 
+	dialer := &net.Dialer{Timeout: time.Duration(cfg.ConnTimeout) * time.Second}
+
 	var wsConn net.Conn
 	var err error
 	if cfg.UpstreamIsWSS {
 		conf := pickProfileTLSConfig().Clone()
 		conf.ServerName = sniHostname
-		wsConn, err = tls.Dial("tcp", dialAddr, conf)
+		wsConn, err = tls.DialWithDialer(dialer, "tcp", dialAddr, conf)
 	} else {
-		wsConn, err = net.Dial("tcp", dialAddr)
+		wsConn, err = dialer.Dial("tcp", dialAddr)
 	}
 	if err != nil {
+		logDebug("[POOL] Dial %s failed: %v", dialAddr, err)
+		if cfg.FakeHost != "" {
+			fallbackConn := p.tryFallbackDial(dialer, wsHost, wsPort, sniHostname)
+			if fallbackConn != nil {
+				return fallbackConn
+			}
+		}
 		return nil
 	}
 
@@ -1479,6 +1525,156 @@ func (p *ConnPool) createConn() *PooledConn {
 	respBytes, err := readUntilCRLFCRLF(br)
 	if err != nil || !bytes.Contains(respBytes, []byte("101")) {
 		wsConn.Close()
+		return nil
+	}
+
+	return &PooledConn{
+		wsConn:   wsConn,
+		br:       br,
+		created:  time.Now(),
+		lastUsed: time.Now(),
+	}
+}
+
+// tryFallbackDial attempts to resolve the fakehost domain to get alternative
+// Cloudflare edge IPs when the primary upstream IP is unreachable.
+func (p *ConnPool) tryFallbackDial(dialer *net.Dialer, wsHost, wsPort, sniHostname string) *PooledConn {
+	cfg := p.cfg
+	// Only try fallback if wsHost is already an IP (no point retrying a domain)
+	if net.ParseIP(wsHost) == nil {
+		return nil
+	}
+	// Try resolving the sniHostname (fakehost) to get Cloudflare edge IPs
+	ips, err := net.LookupIP(sniHostname)
+	if err != nil || len(ips) == 0 {
+		return nil
+	}
+	for _, ip := range ips {
+		if ip4 := ip.To4(); ip4 == nil {
+			continue
+		}
+		fallbackAddr := net.JoinHostPort(ip.String(), wsPort)
+		if fallbackAddr == net.JoinHostPort(wsHost, wsPort) {
+			continue
+		}
+		logDebug("[POOL] Trying fallback Cloudflare edge: %s", fallbackAddr)
+		var wsConn net.Conn
+		if cfg.UpstreamIsWSS {
+			conf := pickProfileTLSConfig().Clone()
+			conf.ServerName = sniHostname
+			wsConn, err = tls.DialWithDialer(dialer, "tcp", fallbackAddr, conf)
+		} else {
+			wsConn, err = dialer.Dial("tcp", fallbackAddr)
+		}
+		if err != nil {
+			logDebug("[POOL] Fallback dial %s failed: %v", fallbackAddr, err)
+			continue
+		}
+		optimizeSocket(wsConn, cfg)
+		br := bufio.NewReaderSize(wsConn, MaxHeaderSize)
+		pConn := p.doHandshake(wsConn, br, cfg, sniHostname)
+		if pConn != nil {
+			return pConn
+		}
+		wsConn.Close()
+	}
+	return nil
+}
+
+func (p *ConnPool) doHandshake(wsConn net.Conn, br *bufio.Reader, cfg *Config, sniHostname string) *PooledConn {
+	wsURL := cfg.ParsedUpstream
+	profile := pickBrowserProfile()
+	path := wsURL.Path
+	if path == "" {
+		path = "/"
+	}
+	var wsKey [16]byte
+	if _, err := rand.Read(wsKey[:]); err != nil {
+		return nil
+	}
+	wsKeyStr := base64.StdEncoding.EncodeToString(wsKey[:])
+
+	hostHeader := sanitizeHeader(cfg.UpstreamHost)
+	if cfg.FakeHost != "" {
+		hostHeader = sanitizeHeader(cfg.FakeHost)
+	}
+
+	protocolScheme := "http"
+	if cfg.UpstreamIsWSS {
+		protocolScheme = "https"
+	}
+
+	secFetchSite := "cross-site"
+	if sniHostname == strings.Split(hostHeader, ":")[0] {
+		secFetchSite = "same-origin"
+	}
+
+	reqLine := "GET " + path + " HTTP/1.1\r\n"
+
+	fixedTop := []string{
+		"Host: " + hostHeader,
+		"Connection: Upgrade",
+		"Upgrade: websocket",
+	}
+
+	shufflable := []string{
+		"Pragma: no-cache",
+		"Cache-Control: no-cache",
+		"User-Agent: " + profile.UA,
+		"Accept-Language: " + profile.AcceptLang,
+		"Accept-Encoding: gzip, deflate, br, zstd",
+		"Origin: " + protocolScheme + "://" + sniHostname,
+	}
+
+	if profile.IsChromium && profile.SecChUA != "" {
+		shufflable = append(shufflable,
+			"sec-ch-ua: "+profile.SecChUA,
+			"sec-ch-ua-mobile: "+profile.SecChUAMob,
+			"sec-ch-ua-platform: "+profile.SecChUAPlat,
+		)
+	}
+
+	fixedBottom := []string{
+		"Sec-WebSocket-Version: 13",
+		"Sec-WebSocket-Key: " + wsKeyStr,
+		"Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits",
+		"Sec-Fetch-Dest: websocket",
+		"Sec-Fetch-Mode: websocket",
+		"Sec-Fetch-Site: " + secFetchSite,
+	}
+
+	for i := len(shufflable) - 1; i > 0; i-- {
+		j := mrand.Intn(i + 1)
+		shufflable[i], shufflable[j] = shufflable[j], shufflable[i]
+	}
+
+	handshakeBuf := handshakeBufPool.Get().(*bytes.Buffer)
+	handshakeBuf.Reset()
+	handshakeBuf.WriteString(reqLine)
+	for _, h := range fixedTop {
+		handshakeBuf.WriteString(h)
+		handshakeBuf.WriteString("\r\n")
+	}
+	for _, h := range shufflable {
+		handshakeBuf.WriteString(h)
+		handshakeBuf.WriteString("\r\n")
+	}
+	for _, h := range fixedBottom {
+		handshakeBuf.WriteString(h)
+		handshakeBuf.WriteString("\r\n")
+	}
+	handshakeBuf.WriteString("\r\n")
+
+	if _, err := wsConn.Write(handshakeBuf.Bytes()); err != nil {
+		handshakeBufPool.Put(handshakeBuf)
+		return nil
+	}
+	handshakeBufPool.Put(handshakeBuf)
+
+	wsTCPConn := extractTCPConn(wsConn)
+	setTCPReadDeadline(wsTCPConn, cfg.ConnTimeout)
+	respBytes, err := readUntilCRLFCRLF(br)
+	if err != nil || !bytes.Contains(respBytes, []byte("101")) {
 		return nil
 	}
 
@@ -2433,18 +2629,28 @@ func handleClient(localConn net.Conn, cfg *Config) {
 			sniHostname = sanitizeHeader(strings.Split(cfg.FakeHost, ":")[0])
 		}
 
+		dialer := &net.Dialer{Timeout: time.Duration(cfg.ConnTimeout) * time.Second}
 		var err error
 		if cfg.UpstreamIsWSS {
 			conf := pickProfileTLSConfig().Clone()
 			conf.ServerName = sniHostname
-			wsConn, err = tls.Dial("tcp", dialAddr, conf)
+			wsConn, err = tls.DialWithDialer(dialer, "tcp", dialAddr, conf)
 		} else {
-			wsConn, err = net.Dial("tcp", dialAddr)
+			wsConn, err = dialer.Dial("tcp", dialAddr)
 		}
 
 		if err != nil {
-			logError("Upstream fail: %v", err)
-			return
+			if cfg.FakeHost != "" {
+				wsConn = nil
+				fallbackConn := tryClientFallbackDial(dialer, wsHost, wsPort, sniHostname, cfg)
+				if fallbackConn != nil {
+					wsConn = fallbackConn
+				}
+			}
+			if wsConn == nil {
+				logError("Upstream fail: %v", err)
+				return
+			}
 		}
 
 		optimizeSocket(wsConn, cfg)

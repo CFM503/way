@@ -1,0 +1,74 @@
+name: Release GOWAY
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            output: goway-linux-amd64
+          - goos: linux
+            goarch: arm64
+            output: goway-linux-arm64
+          - goos: windows
+            goarch: amd64
+            output: goway-windows-amd64.exe
+          - goos: darwin
+            goarch: amd64
+            output: goway-darwin-amd64
+          - goos: darwin
+            goarch: arm64
+            output: goway-darwin-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          cd goway
+          go build -ldflags="-s -w" -o ../${{ matrix.output }} goway1.5.1.go
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.output }}
+          path: ${{ matrix.output }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/goway-linux-amd64/goway-linux-amd64
+            artifacts/goway-linux-arm64/goway-linux-arm64
+            artifacts/goway-windows-amd64.exe/goway-windows-amd64.exe
+            artifacts/goway-darwin-amd64/goway-darwin-amd64
+            artifacts/goway-darwin-arm64/goway-darwin-arm64
