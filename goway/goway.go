@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	Version        = "1.6.1"
+	Version        = "1.6.2"
 	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -713,6 +713,14 @@ const (
 
 var globalLogLevel = INFO
 
+// Log file support: circular buffer of last 10 plain-text entries
+var (
+	logFilePath string
+	logRingBuf  [10]string
+	logRingPos  int
+	logRingLen  int
+)
+
 func parseLogLevel(levelStr string) LogLevel {
 	switch strings.ToUpper(levelStr) {
 	case "DEBUG":
@@ -750,21 +758,61 @@ func logInfo(format string, v ...interface{}) {
 
 func logWarn(format string, v ...interface{}) {
 	if globalLogLevel <= WARN {
+		msg := fmt.Sprintf(format, v...)
 		if tuiEnabled {
-			addTuiLog(time.Now().Format("15:04:05") + " " + AnsiYellow + "[WARN] " + fmt.Sprintf(format, v...) + AnsiReset)
+			addTuiLog(time.Now().Format("15:04:05") + " " + AnsiYellow + "[WARN] " + msg + AnsiReset)
 		} else {
 			log.Printf(AnsiYellow+"[WARN] "+format+AnsiReset, v...)
 		}
+		addLogFileEntry("[WARN] " + msg)
 	}
 }
 
 func logError(format string, v ...interface{}) {
 	if globalLogLevel <= ERROR {
+		msg := fmt.Sprintf(format, v...)
 		if tuiEnabled {
-			addTuiLog(time.Now().Format("15:04:05") + " " + AnsiRed + "[ERROR] " + fmt.Sprintf(format, v...) + AnsiReset)
+			addTuiLog(time.Now().Format("15:04:05") + " " + AnsiRed + "[ERROR] " + msg + AnsiReset)
 		} else {
 			log.Printf(AnsiRed+"[ERROR] "+format+AnsiReset, v...)
 		}
+		addLogFileEntry("[ERROR] " + msg)
+	}
+}
+
+func addLogFileEntry(entry string) {
+	if logFilePath == "" {
+		return
+	}
+	ts := time.Now().Format("2006-01-02 15:04:05")
+	logRingBuf[logRingPos] = ts + " " + entry
+	logRingPos = (logRingPos + 1) % len(logRingBuf)
+	if logRingLen < len(logRingBuf) {
+		logRingLen++
+	}
+	// Write immediately so logs survive hard kills
+	var lines []string
+	start := (logRingPos - logRingLen + len(logRingBuf)) % len(logRingBuf)
+	for i := 0; i < logRingLen; i++ {
+		lines = append(lines, logRingBuf[(start+i)%len(logRingBuf)])
+	}
+	os.WriteFile(logFilePath, []byte(strings.Join(lines, "\n")+"\n"), 0644)
+}
+
+func saveLogFile() {
+	if logFilePath == "" || logRingLen == 0 {
+		return
+	}
+	var lines []string
+	start := (logRingPos - logRingLen + len(logRingBuf)) % len(logRingBuf)
+	for i := 0; i < logRingLen; i++ {
+		lines = append(lines, logRingBuf[(start+i)%len(logRingBuf)])
+	}
+	content := strings.Join(lines, "\n") + "\n"
+	if err := os.WriteFile(logFilePath, []byte(content), 0644); err != nil {
+		log.Printf("Failed to save log file: %v", err)
+	} else {
+		log.Printf("Log saved to %s (%d entries)", logFilePath, logRingLen)
 	}
 }
 
@@ -1321,7 +1369,7 @@ type ConnPool struct {
 	maxAge      time.Duration
 	idleTimeout time.Duration
 	closed      bool
-	deadIPs     map[string]time.Time // cache unreachable IPs to avoid repeated timeouts
+	deadIPs     map[string]bool // IPs that failed during session (permanent until exit)
 }
 
 func NewConnPool(cfg *Config, maxSize int) *ConnPool {
@@ -1331,7 +1379,7 @@ func NewConnPool(cfg *Config, maxSize int) *ConnPool {
 		maxSize:     maxSize,
 		maxAge:      5 * time.Minute,
 		idleTimeout: 30 * time.Second,
-		deadIPs:     make(map[string]time.Time),
+		deadIPs:     make(map[string]bool),
 	}
 	// Start background goroutine to maintain pool
 	go p.maintainLoop()
@@ -1407,16 +1455,11 @@ func (p *ConnPool) createConn() *PooledConn {
 
 	dialer := &net.Dialer{Timeout: time.Duration(cfg.ConnTimeout) * time.Second}
 
-	// Skip known-dead IPs (cached for 5 minutes after failure)
+	// Skip known-dead IPs (permanent for session)
 	p.mu.Lock()
-	if deadAt, ok := p.deadIPs[dialHost]; ok {
+	if p.deadIPs[dialHost] {
 		p.mu.Unlock()
-		if time.Since(deadAt) < 5*time.Minute {
-			logDebug("[POOL] Skipping dead IP %s (failed %s ago)", dialHost, time.Since(deadAt).Round(time.Second))
-			return p.tryFallbackDial(dialer, wsHost, wsPort, sniHostname)
-		}
-		p.mu.Lock()
-		delete(p.deadIPs, dialHost)
+		return p.tryFallbackDial(dialer, wsHost, wsPort, sniHostname)
 	}
 	p.mu.Unlock()
 
@@ -1431,9 +1474,9 @@ func (p *ConnPool) createConn() *PooledConn {
 	}
 	if err != nil {
 		logDebug("[POOL] Dial %s failed: %v", dialAddr, err)
-		// Mark IP as dead to avoid repeated timeouts
+		// Mark IP as dead for session
 		p.mu.Lock()
-		p.deadIPs[dialHost] = time.Now()
+		p.deadIPs[dialHost] = true
 		p.mu.Unlock()
 		if cfg.FakeHost != "" {
 			fallbackConn := p.tryFallbackDial(dialer, wsHost, wsPort, sniHostname)
@@ -1588,7 +1631,7 @@ func (p *ConnPool) tryFallbackDial(dialer *net.Dialer, wsHost, wsPort, sniHostna
 		if err != nil {
 			logDebug("[POOL] Fallback dial %s failed: %v", fallbackAddr, err)
 			p.mu.Lock()
-			p.deadIPs[ip.String()] = time.Now()
+			p.deadIPs[ip.String()] = true
 			p.mu.Unlock()
 			continue
 		}
@@ -1887,6 +1930,7 @@ func readWSFrame(r io.Reader, w io.Writer) ([]byte, error) {
 
 func main() {
 	initWindowsConsole()
+	defer saveLogFile()
 
 	pFlag := flag.String("p", "", "Listen Address (e.g. :8080)")
 	upFlag := flag.String("up", "", "Upstream WebSocket URL")
@@ -1904,6 +1948,7 @@ func main() {
 	allowOpenFlag := flag.Bool("allow-open", false, "Allow server mode without authentication key")
 	dnsFlag := flag.String("dns", "", "Remote DNS server IP (e.g. 8.8.8.8)")
 	tuiFlag := flag.Bool("tui", false, "Enable GUI-style Terminal User Interface")
+	logFileFlag := flag.String("log-file", "", "Save last 10 log entries to file on exit (e.g. goway.log)")
 	versionFlag := flag.Bool("version", false, "Print version and exit")
 
 	flag.Parse()
@@ -1915,6 +1960,7 @@ func main() {
 
 	globalLogLevel = parseLogLevel(*logFlag)
 	tuiEnabled = *tuiFlag
+	logFilePath = *logFileFlag
 
 	if *pFlag == "" {
 		fmt.Println("Error: -p is required")
@@ -2081,6 +2127,21 @@ func main() {
 	// Initialize connection pool for client mode (pre-establish WebSocket connections)
 	if cfg.Upstream != "" {
 		connPool = NewConnPool(&cfg, 10) // Pool of 10 pre-established connections
+
+		// Startup test: verify upstream IP is reachable (one-time check)
+		if net.ParseIP(cfg.UpstreamHost) != nil {
+			testDialer := &net.Dialer{Timeout: time.Duration(cfg.ConnTimeout) * time.Second}
+			testAddr := net.JoinHostPort(cfg.UpstreamHost, cfg.UpstreamPort)
+			if _, err := testDialer.Dial("tcp", testAddr); err != nil {
+				logWarn("Upstream IP %s is unreachable: %v", testAddr, err)
+				logWarn("All connections will use DNS-resolved Cloudflare edges via -fakehost")
+				connPool.mu.Lock()
+				connPool.deadIPs[cfg.UpstreamHost] = true
+				connPool.mu.Unlock()
+			} else {
+				logInfo("Upstream IP %s is reachable", testAddr)
+			}
+		}
 	}
 
 	if !tuiEnabled {
@@ -2101,6 +2162,7 @@ func main() {
 	go func() {
 		<-sigCh
 		logInfo("Received shutdown signal, closing listener...")
+		saveLogFile()
 		close(shutdown)
 		listener.Close()
 	}()
@@ -2141,6 +2203,7 @@ func main() {
 	}
 
 	logInfo("Proxy stopped.")
+	saveLogFile()
 }
 
 func monitorStats(shutdown <-chan struct{}) {

@@ -1,8 +1,27 @@
-# GOWAY v1.6.1
+# GOWAY v1.6.2
 
 GOWAY 是一个基于 WebSocket 隧道的高性能代理工具，支持 HTTP 和 SOCKS5 协议，具备浏览器指纹伪装能力，可有效绕过网络检测。
 
 ## 版本历史
+
+### v1.6.2 (2026-08-31) - 启动检测与日志系统
+
+#### 新增功能
+
+| 功能 | 说明 |
+|------|------|
+| **启动 IP 可达性检测** | 启动时测试用户指定的上游 IP，不可达时打印英文警告并自动切换到 DNS 解析的 Cloudflare 边缘 |
+| **死 IP 会话级标记** | 不可达 IP 在整个会话期间不再重试（移除5分钟TTL），避免重复超时 |
+| **日志文件 `-log-file`** | 新增 `-log-file` 参数，记录最近10条 WARN/ERROR 日志到文件，用于排查异常退出原因 |
+
+#### 启动警告示例
+
+```
+[WARN] Upstream IP 172.64.156.23:2052 is unreachable: dial tcp 172.64.156.23:2052: i/o timeout
+[WARN] All connections will use DNS-resolved Cloudflare edges via -fakehost
+```
+
+---
 
 ### v1.6.1 (2026-08-31) - 连接池性能优化
 
