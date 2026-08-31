@@ -1,32 +1,23 @@
-# GOWAY v1.6.0
+# GOWAY v1.6.1
 
 GOWAY 是一个基于 WebSocket 隧道的高性能代理工具，支持 HTTP 和 SOCKS5 协议，具备浏览器指纹伪装能力，可有效绕过网络检测。
 
 ## 版本历史
 
-### v1.6.0 (2026-08-31) - Windows 兼容性修复
+### v1.6.1 (2026-08-31) - 连接池性能优化
 
-#### 核心修复
+#### 核心优化
 
 | 问题 | 原因 | 修复方案 |
 |------|------|----------|
-| **客户端连接无超时** | `net.Dial` / `tls.Dial` 无超时，Windows 默认 TCP 超时可达 21+ 秒，导致连接挂死 | 改用 `net.Dialer{Timeout}` 和 `tls.DialWithDialer`，复用 `-connection-timeout` 参数 |
-| **Cloudflare 边缘 IP 不可达** | 用户硬编码的 Cloudflare anycast IP 可能因路由调整而不可达 | 新增 fallback 机制：当直连 IP 失败时，自动 DNS 解析 `-fakehost` 域名获取备选 Cloudflare 边缘 IP |
-| **连接池静默失败** | 连接池创建失败时无任何日志输出，无法调试 | 添加 `logDebug` 输出实际连接错误 |
+| **不可达 IP 重复超时** | 连接池每次重建连接都先尝试不可达的 Cloudflare IP，每次都等 26+ 秒超时 | 新增 `deadIPs` 缓存机制：IP 连接失败后标记 5 分钟，期间所有尝试直接跳过 |
 
-#### Fallback 工作流程
+#### 性能对比
 
-```
-1. 直连用户指定的 upstream IP (如 172.64.156.23)
-2. 失败 → DNS 解析 -fakehost 域名 (如 colo.4467107.xyz)
-3. 逐个尝试解析到的 Cloudflare 边缘 IP
-4. 第一个成功的连接用于 WebSocket 握手
-```
-
-#### 平台影响
-
-- **Windows**: 主要修复目标，解决了 Cloudflare 连接超时和挂死问题
-- **Linux/macOS**: 同样受益于超时和 fallback 机制改进
+| 场景 | v1.6.0 | v1.6.1 | 提升 |
+|------|--------|--------|------|
+| 首次请求 | 26+ 秒 | **< 1 秒** | **96%+** |
+| 后续请求 | 26+ 秒 | **< 1 秒** | **96%+** |
 
 ---
 
