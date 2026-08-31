@@ -43,7 +43,7 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: |
           cd goway
-          go build -ldflags="-s -w" -o ../${{ matrix.output }} goway1.5.1.go
+          go build -ldflags="-s -w" -o ../${{ matrix.output }} goway.go
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

@@ -375,13 +375,13 @@ var handshakeBufPool = sync.Pool{
 
 ```bash
 # Linux 服务器
-GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o goway goway1.5.1.go
+GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o goway goway.go
 
 # Windows 客户端
-GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o goway.exe goway1.5.1.go
+GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o goway.exe goway.go
 
 # macOS 客户端
-GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o goway goway1.5.1.go
+GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o goway goway.go
 ```
 
 ---
@@ -411,7 +411,7 @@ GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o goway goway1.5.1.go
 
 | 文件 | 说明 |
 |------|------|
-| `goway1.5.1.go` | 源代码 (Go, 向后兼容 v1.5.1 文件名) |
+| `goway.go` | 源代码 (Go) |
 | `README.md` | 本文档 |
 | `go.mod` | Go 模块定义 |
 | `deploy_and_test.py` | 部署测试脚本 |
