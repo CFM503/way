@@ -29,6 +29,35 @@ jobs:
           - goos: darwin
             goarch: arm64
             output: goway-darwin-arm64
+          # OpenWrt targets
+          - goos: linux
+            goarch: arm
+            goarm: '7'
+            output: goway-openwrt-arm7
+          - goos: linux
+            goarch: mips
+            gomips: softfloat
+            output: goway-openwrt-mips
+          - goos: linux
+            goarch: mipsle
+            gomips: softfloat
+            output: goway-openwrt-mipsle
+          - goos: linux
+            goarch: mips64
+            gomips64: softfloat
+            output: goway-openwrt-mips64
+          - goos: linux
+            goarch: mips64le
+            gomips64: softfloat
+            output: goway-openwrt-mips64le
+          # Android targets
+          - goos: android
+            goarch: arm
+            goarm: '7'
+            output: goway-android-arm7
+          - goos: android
+            goarch: arm64
+            output: goway-android-arm8
 
     steps:
       - uses: actions/checkout@v4
@@ -41,8 +70,15 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          GOMIPS: ${{ matrix.gomips }}
+          GOMIPS64: ${{ matrix.gomips64 }}
+          CGO_ENABLED: '0'
         run: |
           cd goway
+          [ -z "$GOARM" ] && unset GOARM
+          [ -z "$GOMIPS" ] && unset GOMIPS
+          [ -z "$GOMIPS64" ] && unset GOMIPS64
           go build -ldflags="-s -w" -o ../${{ matrix.output }} goway.go
 
       - name: Upload artifact
@@ -72,3 +108,10 @@ jobs:
             artifacts/goway-windows-amd64.exe/goway-windows-amd64.exe
             artifacts/goway-darwin-amd64/goway-darwin-amd64
             artifacts/goway-darwin-arm64/goway-darwin-arm64
+            artifacts/goway-openwrt-arm7/goway-openwrt-arm7
+            artifacts/goway-openwrt-mips/goway-openwrt-mips
+            artifacts/goway-openwrt-mipsle/goway-openwrt-mipsle
+            artifacts/goway-openwrt-mips64/goway-openwrt-mips64
+            artifacts/goway-openwrt-mips64le/goway-openwrt-mips64le
+            artifacts/goway-android-arm7/goway-android-arm7
+            artifacts/goway-android-arm8/goway-android-arm8

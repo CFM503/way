@@ -1,8 +1,26 @@
-# GOWAY v1.6.2
+# GOWAY v1.6.3
 
 GOWAY 是一个基于 WebSocket 隧道的高性能代理工具，支持 HTTP 和 SOCKS5 协议，具备浏览器指纹伪装能力，可有效绕过网络检测。
 
 ## 版本历史
+
+### v1.6.3 (2026-09-02) - 扩展 OpenWrt 与 Android 多架构跨平台支持
+
+#### 新增架构构建与发布
+
+GitHub Actions 编译发布工作流新增以下目标架构发布包：
+
+| 平台 / 架构 | 发布文件名 | 说明 |
+|-------------|------------|------|
+| **OpenWrt ARMv7** | `goway-openwrt-arm7` | 适用于 ARMv7 架构路由器（如 IPQ40xx 等，软硬浮点兼容） |
+| **OpenWrt MIPS** | `goway-openwrt-mips` | 适用于 MIPS 大端架构路由器（软浮点，如 Atheros/QCA） |
+| **OpenWrt MIPSLE** | `goway-openwrt-mipsle` | 适用于 MIPS 小端架构路由器（软浮点，如 MT7621/MT7628 等） |
+| **OpenWrt MIPS64** | `goway-openwrt-mips64` | 适用于 MIPS64 大端架构路由器（软浮点） |
+| **OpenWrt MIPS64LE** | `goway-openwrt-mips64le` | 适用于 MIPS64 小端架构路由器（软浮点） |
+| **Android ARMv7** | `goway-android-arm7` | 适用于 32 位 Android 终端环境（armeabi-v7a） |
+| **Android ARMv8** | `goway-android-arm8` | 适用于 64 位 Android 终端环境（arm64-v8a） |
+
+---
 
 ### v1.6.2 (2026-08-31) - 启动检测与日志系统
 
