@@ -12,6 +12,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
           - goos: linux
@@ -51,7 +52,7 @@ jobs:
             gomips64: softfloat
             output: goway-openwrt-mips64le
           # Android targets
-          - goos: android
+          - goos: linux
             goarch: arm
             goarm: '7'
             output: goway-android-arm7
