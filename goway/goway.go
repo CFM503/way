@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	Version        = "1.7.1"
+	Version        = "1.7.2"
 	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -1240,6 +1240,7 @@ func optimizeSocket(conn net.Conn, cfg *Config) {
 			logDebug("SetWriteBuffer failed: %v", err)
 		}
 	}
+	setPlatformSocketOptions(tcpConn)
 }
 
 // extractTCPConn extracts the underlying *net.TCPConn from a net.Conn
@@ -2161,7 +2162,7 @@ func main() {
 		fmt.Printf("%s[INFO] Proxy listening... (Press Ctrl+C to stop)%s\n\n", AnsiCyan, AnsiReset)
 	}
 
-	listener, err := net.Listen("tcp", listenAddr)
+	listener, err := listenWithReusePort("tcp", listenAddr)
 	if err != nil {
 		log.Fatalf("Failed to bind: %v", err)
 	}

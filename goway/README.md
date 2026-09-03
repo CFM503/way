@@ -1,8 +1,21 @@
-# GOWAY v1.7.1
+# GOWAY v1.7.2
 
-GOWAY 是一个基于 WebSocket 隧道的高性能代理工具，支持 HTTP 和完整 SOCKS5 (TCP + UDP) 协议，具备浏览器指纹伪装能力与 0-RTT 多路复用 (Mux) 架构。
+GOWAY 是一个基于 WebSocket 隧道的高性能代理工具，支持 HTTP 和完整 SOCKS5 (TCP + UDP) 协议，具备浏览器指纹伪装、0-RTT 多路复用 (Mux) 与 Linux 内核零拷贝特性。
 
 ## 版本历史
+
+### v1.7.2 (2026-09-03) - Linux 内核级零拷贝与平台级 Socket 深度调优
+
+#### 核心优化与新特性
+
+| 优化项 | 说明 | 效果 |
+|---|---|---|
+| **TCP_QUICKACK 调优** | 在 Linux 平台每个网络连接上强制启用 `TCP_QUICKACK` | **消除 Linux TCP 延迟确认 (Delayed ACK) 带来的 40ms 固有延迟卡顿** |
+| **SO_REUSEPORT 多核监听** | 在 Linux (3.9+) 开启 `SO_REUSEPORT` 内核负载均衡监听 | **消除高并发下单个监听套接字的 accept 互斥锁瓶颈，充分发挥多核性能** |
+| **内核零拷贝 Splice 引擎** | 引入平台隔离的 `sockopt_linux.go`，基于 Linux 原生 `splice(2)` 管道零拷贝 | **网卡与网卡之间在内核空间直接流转，大幅降低软路由与 VPS CPU 占用** |
+| **全平台构建解耦** | 条件编译自动适配 Windows / macOS / Linux / OpenWrt / Android | **无需任何 CGO 依赖，100% 纯 Go 极速跨平台编译构建** |
+
+---
 
 ### v1.7.1 (2026-09-03) - 0-RTT 长连接多路复用 (Mux 架构)
 
