@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	Version        = "1.7.0"
+	Version        = "1.7.1"
 	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -590,6 +590,7 @@ type Config struct {
 	BlockLocal     bool
 	AllowOpen      bool
 	TUI            bool
+	Mux            bool
 
 	// Internal derived
 	Crypto        *Crypto
@@ -599,6 +600,7 @@ type Config struct {
 	BufPool       *sync.Pool
 	HeaderBufPool *sync.Pool
 	TLSBase       *tls.Config
+	MuxPool       *MuxClientPool
 
 	// Pre-parsed upstream URL (avoid per-connection url.Parse)
 	ParsedUpstream *url.URL
@@ -1949,6 +1951,7 @@ func main() {
 	dnsFlag := flag.String("dns", "", "Remote DNS server IP (e.g. 8.8.8.8)")
 	tuiFlag := flag.Bool("tui", false, "Enable GUI-style Terminal User Interface")
 	logFileFlag := flag.String("log-file", "", "Save last 10 log entries to file on exit (e.g. goway.log)")
+	muxFlag := flag.Bool("mux", true, "Enable Connection Multiplexing (0-RTT Mux)")
 	versionFlag := flag.Bool("version", false, "Print version and exit")
 
 	flag.Parse()
@@ -1982,6 +1985,7 @@ func main() {
 		BlockLocal:     *blockLocalFlag,
 		AllowOpen:      *allowOpenFlag,
 		TUI:            tuiEnabled,
+		Mux:            *muxFlag,
 	}
 
 	if *dnsFlag != "" {
@@ -2071,6 +2075,11 @@ func main() {
 			}
 			fmt.Printf(" [+] SSL Verify:  %s%s%s\n", verifyCol, verifyStr, AnsiReset)
 			fmt.Printf(" [+] User-Agent:  %sBrowser Profile (Sticky TLS+UA)%s\n", AnsiGreen, AnsiReset)
+			muxStr := AnsiGreen + "Enabled (0-RTT Multiplexing)" + AnsiReset
+			if !cfg.Mux {
+				muxStr = AnsiYellow + "Disabled (1:1 Legacy)" + AnsiReset
+			}
+			fmt.Printf(" [+] Mux:         %s\n", muxStr)
 		}
 
 		if cfg.Resolver != nil {
@@ -2126,6 +2135,9 @@ func main() {
 
 	// Initialize connection pool for client mode (pre-establish WebSocket connections)
 	if cfg.Upstream != "" {
+		if cfg.Mux {
+			cfg.MuxPool = NewMuxClientPool(&cfg, 4)
+		}
 		connPool = NewConnPool(&cfg, 10) // Pool of 10 pre-established connections
 
 		// Startup test: verify upstream IP is reachable (one-time check)
@@ -2245,6 +2257,742 @@ func monitorStats(shutdown <-chan struct{}) {
 	}
 }
 
+// --- Mux (Multiplexing) Subsystem ---
+
+const (
+	MuxCmdSYN  byte = 0x01 // New Stream: [TargetLen uint16][TargetAddr string][InitialData...]
+	MuxCmdDATA byte = 0x02 // Stream Data: [Data...]
+	MuxCmdFIN  byte = 0x03 // Stream Half-Close / EOF
+	MuxCmdRST  byte = 0x04 // Stream Abrupt Reset / Error
+	MuxHeaderLen    = 7    // 4B StreamID + 1B Cmd + 2B PayloadLen
+)
+
+type MuxSessionInterface interface {
+	SendFrame(streamID uint32, cmd byte, payload []byte) error
+	RemoveStream(streamID uint32)
+}
+
+// MuxStream represents an individual multiplexed stream on the client side.
+type MuxStream struct {
+	id         uint32
+	session    MuxSessionInterface
+	readChan   chan []byte
+	readBuf    []byte
+	readPos    int
+	closeOnce  sync.Once
+	closed     chan struct{}
+	readClosed atomic.Bool
+}
+
+func newMuxStream(id uint32, session MuxSessionInterface) *MuxStream {
+	return &MuxStream{
+		id:       id,
+		session:  session,
+		readChan: make(chan []byte, 128),
+		closed:   make(chan struct{}),
+	}
+}
+
+func (s *MuxStream) PushData(data []byte) bool {
+	select {
+	case <-s.closed:
+		return false
+	case s.readChan <- data:
+		return true
+	}
+}
+
+func (s *MuxStream) PushEOF() {
+	s.readClosed.Store(true)
+	select {
+	case <-s.closed:
+	default:
+		select {
+		case s.readChan <- nil:
+		default:
+		}
+	}
+}
+
+func (s *MuxStream) Read(p []byte) (n int, err error) {
+	for {
+		if s.readPos < len(s.readBuf) {
+			n = copy(p, s.readBuf[s.readPos:])
+			s.readPos += n
+			return n, nil
+		}
+		if s.readClosed.Load() && len(s.readChan) == 0 {
+			return 0, io.EOF
+		}
+		select {
+		case <-s.closed:
+			if s.readClosed.Load() {
+				return 0, io.EOF
+			}
+			return 0, errors.New("stream closed")
+		case data, ok := <-s.readChan:
+			if !ok || data == nil {
+				return 0, io.EOF
+			}
+			s.readBuf = data
+			s.readPos = 0
+		}
+	}
+}
+
+func (s *MuxStream) Write(p []byte) (n int, err error) {
+	select {
+	case <-s.closed:
+		return 0, errors.New("stream closed")
+	default:
+	}
+	const maxChunk = 32 * 1024
+	total := len(p)
+	for len(p) > 0 {
+		chunk := len(p)
+		if chunk > maxChunk {
+			chunk = maxChunk
+		}
+		if err := s.session.SendFrame(s.id, MuxCmdDATA, p[:chunk]); err != nil {
+			return total - len(p), err
+		}
+		p = p[chunk:]
+	}
+	return total, nil
+}
+
+func (s *MuxStream) Close() error {
+	s.closeOnce.Do(func() {
+		close(s.closed)
+		s.session.SendFrame(s.id, MuxCmdFIN, nil)
+		s.session.RemoveStream(s.id)
+	})
+	return nil
+}
+
+func (s *MuxStream) Reset() {
+	s.closeOnce.Do(func() {
+		close(s.closed)
+		s.session.SendFrame(s.id, MuxCmdRST, nil)
+		s.session.RemoveStream(s.id)
+	})
+}
+
+// MuxClientSession handles a single WebSocket tunnel carrying multiple MuxStreams.
+type MuxClientSession struct {
+	wsConn       net.Conn
+	br           *bufio.Reader
+	wsTCPConn    *net.TCPConn
+	cfg          *Config
+	writeMu      sync.Mutex
+	streams      map[uint32]*MuxStream
+	streamsMu    sync.RWMutex
+	nextStreamID uint32
+	closed       chan struct{}
+	closeOnce    sync.Once
+	prng         *maskPRNG
+}
+
+func newMuxClientSession(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, cfg *Config) *MuxClientSession {
+	s := &MuxClientSession{
+		wsConn:    wsConn,
+		br:        br,
+		wsTCPConn: wsTCPConn,
+		cfg:       cfg,
+		streams:   make(map[uint32]*MuxStream),
+		closed:    make(chan struct{}),
+		prng:      maskPool.Get().(*maskPRNG),
+	}
+	go s.readLoop()
+	return s
+}
+
+func (s *MuxClientSession) IsAlive() bool {
+	select {
+	case <-s.closed:
+		return false
+	default:
+		return true
+	}
+}
+
+func (s *MuxClientSession) Close() {
+	s.closeOnce.Do(func() {
+		close(s.closed)
+		s.wsConn.Close()
+		s.streamsMu.Lock()
+		for _, st := range s.streams {
+			st.Reset()
+		}
+		s.streams = make(map[uint32]*MuxStream)
+		s.streamsMu.Unlock()
+		if s.prng != nil {
+			maskPool.Put(s.prng)
+			s.prng = nil
+		}
+	})
+}
+
+func (s *MuxClientSession) RemoveStream(streamID uint32) {
+	s.streamsMu.Lock()
+	delete(s.streams, streamID)
+	s.streamsMu.Unlock()
+}
+
+func (s *MuxClientSession) SendFrame(streamID uint32, cmd byte, payload []byte) error {
+	select {
+	case <-s.closed:
+		return errors.New("mux session closed")
+	default:
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	payloadLen := len(payload)
+	frameLen := MuxHeaderLen + payloadLen
+	bPtr := s.cfg.BufPool.Get().(*[]byte)
+	defer s.cfg.BufPool.Put(bPtr)
+	buf := *bPtr
+
+	if frameLen+14 > len(buf) {
+		return errors.New("mux frame exceeds buffer size")
+	}
+
+	frameStart := 14
+	binary.BigEndian.PutUint32(buf[frameStart:frameStart+4], streamID)
+	buf[frameStart+4] = cmd
+	binary.BigEndian.PutUint16(buf[frameStart+5:frameStart+7], uint16(payloadLen))
+	if payloadLen > 0 {
+		copy(buf[frameStart+7:frameStart+7+payloadLen], payload)
+	}
+
+	if s.cfg.Crypto != nil {
+		s.cfg.Crypto.TransformInPlace(buf[frameStart : frameStart+frameLen])
+	}
+
+	return writeWSFramePreallocatedFast(s.wsConn, buf, frameStart, frameLen, 0x2, s.prng)
+}
+
+func (s *MuxClientSession) readLoop() {
+	defer s.Close()
+	bPtr := s.cfg.BufPool.Get().(*[]byte)
+	defer s.cfg.BufPool.Put(bPtr)
+	buf := *bPtr
+	var lastDeadline time.Time
+
+	for {
+		if deadlineThrottle(&lastDeadline) {
+			setTCPReadDeadline(s.wsTCPConn, s.cfg.ConnTimeout)
+		}
+		data, err := readWSFrameInto(s.br, s.wsConn, buf[14:])
+		if err != nil {
+			return
+		}
+		if s.cfg.Crypto != nil {
+			s.cfg.Crypto.TransformInPlace(data)
+		}
+
+		if len(data) < MuxHeaderLen {
+			continue
+		}
+		streamID := binary.BigEndian.Uint32(data[:4])
+		cmd := data[4]
+		payloadLen := int(binary.BigEndian.Uint16(data[5:7]))
+		if len(data) < MuxHeaderLen+payloadLen {
+			continue
+		}
+		payload := data[MuxHeaderLen : MuxHeaderLen+payloadLen]
+
+		s.streamsMu.RLock()
+		st, ok := s.streams[streamID]
+		s.streamsMu.RUnlock()
+
+		if !ok {
+			continue
+		}
+
+		switch cmd {
+		case MuxCmdDATA:
+			if len(payload) > 0 {
+				dataCopy := make([]byte, len(payload))
+				copy(dataCopy, payload)
+				st.PushData(dataCopy)
+				stats.AddBytes(0, int64(len(payload)))
+			}
+		case MuxCmdFIN:
+			st.PushEOF()
+		case MuxCmdRST:
+			st.Reset()
+		}
+	}
+}
+
+// MuxClientPool manages active Mux sessions on the client side.
+type MuxClientPool struct {
+	cfg      *Config
+	sessions []*MuxClientSession
+	mu       sync.Mutex
+	maxSess  int
+	roundIdx uint32
+}
+
+func NewMuxClientPool(cfg *Config, maxSessions int) *MuxClientPool {
+	return &MuxClientPool{
+		cfg:      cfg,
+		maxSess:  maxSessions,
+		sessions: make([]*MuxClientSession, 0, maxSessions),
+	}
+}
+
+func (p *MuxClientPool) GetSession() (*MuxClientSession, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Filter out dead sessions
+	valid := p.sessions[:0]
+	for _, s := range p.sessions {
+		if s.IsAlive() {
+			valid = append(valid, s)
+		}
+	}
+	p.sessions = valid
+
+	if len(p.sessions) >= p.maxSess {
+		idx := atomic.AddUint32(&p.roundIdx, 1) % uint32(len(p.sessions))
+		return p.sessions[idx], nil
+	}
+
+	sess, err := p.dialNewSession()
+	if err != nil {
+		if len(p.sessions) > 0 {
+			idx := atomic.AddUint32(&p.roundIdx, 1) % uint32(len(p.sessions))
+			return p.sessions[idx], nil
+		}
+		return nil, err
+	}
+
+	p.sessions = append(p.sessions, sess)
+	return sess, nil
+}
+
+func (p *MuxClientPool) dialNewSession() (*MuxClientSession, error) {
+	wsConn, br, wsTCPConn, err := dialUpstreamWS(p.cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	base := "MUX\n"
+	padLen := 1 + mrand.Intn(40)
+	targetPayload := make([]byte, len(base)+padLen)
+	copy(targetPayload, base)
+	for i := len(base); i < len(targetPayload); i++ {
+		targetPayload[i] = ' '
+	}
+	if p.cfg.Crypto != nil {
+		p.cfg.Crypto.TransformInPlace(targetPayload)
+	}
+	if err := writeWSFrame(wsConn, targetPayload, 0x2, true); err != nil {
+		wsConn.Close()
+		return nil, err
+	}
+
+	setTCPReadDeadline(wsTCPConn, p.cfg.ConnTimeout)
+	okFrame, err := readWSFrame(br, wsConn)
+	if err != nil {
+		wsConn.Close()
+		return nil, err
+	}
+	if p.cfg.Crypto != nil {
+		p.cfg.Crypto.TransformInPlace(okFrame)
+	}
+	if !strings.HasPrefix(string(okFrame), "OK") {
+		wsConn.Close()
+		return nil, errors.New("mux auth rejected by server")
+	}
+
+	logInfo("[MUX] Client session established to upstream")
+	return newMuxClientSession(wsConn, br, wsTCPConn, p.cfg), nil
+}
+
+func (p *MuxClientPool) Close() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, s := range p.sessions {
+		s.Close()
+	}
+	p.sessions = nil
+}
+
+// relayMuxClient multiplexes a single user connection over an active MuxSession.
+func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetAddr string, cfg *Config) bool {
+	session, err := cfg.MuxPool.GetSession()
+	if err != nil || session == nil {
+		return false
+	}
+
+	streamID := atomic.AddUint32(&session.nextStreamID, 1)
+	stream := newMuxStream(streamID, session)
+
+	session.streamsMu.Lock()
+	session.streams[streamID] = stream
+	session.streamsMu.Unlock()
+
+	defer stream.Close()
+
+	tLen := len(targetAddr)
+	synPayload := make([]byte, 2+tLen+len(initialPayload))
+	binary.BigEndian.PutUint16(synPayload[:2], uint16(tLen))
+	copy(synPayload[2:2+tLen], targetAddr)
+	if len(initialPayload) > 0 {
+		copy(synPayload[2+tLen:], initialPayload)
+	}
+
+	if err := session.SendFrame(streamID, MuxCmdSYN, synPayload); err != nil {
+		logDebug("[CLIENT-MUX] Send SYN failed: %v", err)
+		session.RemoveStream(streamID)
+		return false
+	}
+
+	if ver == 0x05 {
+		if _, err := localConn.Write(socks5OKResp); err != nil {
+			stream.Close()
+			return true
+		}
+	} else if initialPayload == nil {
+		if _, err := localConn.Write(http200Resp); err != nil {
+			stream.Close()
+			return true
+		}
+	}
+
+	logDebug("[CLIENT-MUX] Stream %d -> %s (0-RTT)", streamID, targetAddr)
+
+	errCh := make(chan error, 2)
+
+	go func() {
+		bPtr := cfg.BufPool.Get().(*[]byte)
+		defer cfg.BufPool.Put(bPtr)
+		buf := *bPtr
+		for {
+			nr, errRead := localConn.Read(buf)
+			if nr > 0 {
+				if _, errWrite := stream.Write(buf[:nr]); errWrite != nil {
+					errCh <- errWrite
+					return
+				}
+				stats.AddBytes(int64(nr), 0)
+			}
+			if errRead != nil {
+				stream.Close()
+				errCh <- errRead
+				return
+			}
+		}
+	}()
+
+	go func() {
+		bPtr := cfg.BufPool.Get().(*[]byte)
+		defer cfg.BufPool.Put(bPtr)
+		buf := *bPtr
+		for {
+			nr, errRead := stream.Read(buf)
+			if nr > 0 {
+				if _, errWrite := localConn.Write(buf[:nr]); errWrite != nil {
+					errCh <- errWrite
+					return
+				}
+				stats.AddBytes(0, int64(nr))
+			}
+			if errRead != nil {
+				errCh <- errRead
+				return
+			}
+		}
+	}()
+
+	<-errCh
+	localConn.Close()
+	stream.Close()
+	return true
+}
+
+// MuxServerSession handles a single WebSocket tunnel on the server side.
+type MuxServerSession struct {
+	wsConn    net.Conn
+	br        *bufio.Reader
+	wsTCPConn *net.TCPConn
+	cfg       *Config
+	writeMu   sync.Mutex
+	streams   map[uint32]*MuxServerStream
+	streamsMu sync.RWMutex
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+type MuxServerStream struct {
+	id         uint32
+	session    *MuxServerSession
+	writeChan  chan []byte
+	targetConn net.Conn
+	closed     chan struct{}
+	closeOnce  sync.Once
+}
+
+func newMuxServerStream(id uint32, session *MuxServerSession) *MuxServerStream {
+	return &MuxServerStream{
+		id:        id,
+		session:   session,
+		writeChan: make(chan []byte, 256),
+		closed:    make(chan struct{}),
+	}
+}
+
+func (s *MuxServerStream) PushData(data []byte) {
+	select {
+	case <-s.closed:
+	case s.writeChan <- data:
+	}
+}
+
+func (s *MuxServerStream) Close() {
+	s.closeOnce.Do(func() {
+		close(s.closed)
+		if s.targetConn != nil {
+			s.targetConn.Close()
+		}
+	})
+}
+
+func (s *MuxServerSession) Close() {
+	s.closeOnce.Do(func() {
+		close(s.closed)
+		s.wsConn.Close()
+		s.streamsMu.Lock()
+		for _, st := range s.streams {
+			st.Close()
+		}
+		s.streams = make(map[uint32]*MuxServerStream)
+		s.streamsMu.Unlock()
+	})
+}
+
+func (s *MuxServerSession) SendFrame(streamID uint32, cmd byte, payload []byte) error {
+	select {
+	case <-s.closed:
+		return errors.New("mux server session closed")
+	default:
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	payloadLen := len(payload)
+	frameLen := MuxHeaderLen + payloadLen
+	bPtr := s.cfg.BufPool.Get().(*[]byte)
+	defer s.cfg.BufPool.Put(bPtr)
+	buf := *bPtr
+
+	if frameLen+14 > len(buf) {
+		return errors.New("mux server frame exceeds buffer")
+	}
+
+	frameStart := 14
+	binary.BigEndian.PutUint32(buf[frameStart:frameStart+4], streamID)
+	buf[frameStart+4] = cmd
+	binary.BigEndian.PutUint16(buf[frameStart+5:frameStart+7], uint16(payloadLen))
+	if payloadLen > 0 {
+		copy(buf[frameStart+7:frameStart+7+payloadLen], payload)
+	}
+
+	if s.cfg.Crypto != nil {
+		s.cfg.Crypto.TransformInPlace(buf[frameStart : frameStart+frameLen])
+	}
+
+	return writeWSFramePreallocated(s.wsConn, buf, frameStart, frameLen, 0x2, false)
+}
+
+func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, cfg *Config) {
+	logInfo("[SERVER] Mux Session requested")
+	var ok []byte
+	if cfg.Crypto != nil {
+		ok = make([]byte, 3)
+		copy(ok, "OK\n")
+		cfg.Crypto.TransformInPlace(ok)
+	} else {
+		ok = okBytes
+	}
+	if err := writeWSFrame(wsConn, ok, 0x2, false); err != nil {
+		return
+	}
+
+	session := &MuxServerSession{
+		wsConn:    wsConn,
+		br:        br,
+		wsTCPConn: wsTCPConn,
+		cfg:       cfg,
+		streams:   make(map[uint32]*MuxServerStream),
+		closed:    make(chan struct{}),
+	}
+	defer session.Close()
+
+	logInfo("[SERVER] Mux Session active")
+
+	bPtr := cfg.BufPool.Get().(*[]byte)
+	defer cfg.BufPool.Put(bPtr)
+	buf := *bPtr
+	var lastDeadline time.Time
+
+	for {
+		if deadlineThrottle(&lastDeadline) {
+			setTCPReadDeadline(wsTCPConn, cfg.ConnTimeout)
+		}
+		data, err := readWSFrameInto(br, wsConn, buf[14:])
+		if err != nil {
+			return
+		}
+		if cfg.Crypto != nil {
+			cfg.Crypto.TransformInPlace(data)
+		}
+
+		if len(data) < MuxHeaderLen {
+			continue
+		}
+		streamID := binary.BigEndian.Uint32(data[:4])
+		cmd := data[4]
+		payloadLen := int(binary.BigEndian.Uint16(data[5:7]))
+		if len(data) < MuxHeaderLen+payloadLen {
+			continue
+		}
+		payload := data[MuxHeaderLen : MuxHeaderLen+payloadLen]
+
+		switch cmd {
+		case MuxCmdSYN:
+			if len(payload) < 2 {
+				continue
+			}
+			tLen := int(binary.BigEndian.Uint16(payload[:2]))
+			if len(payload) < 2+tLen {
+				continue
+			}
+			targetStr := string(payload[2 : 2+tLen])
+			var initialData []byte
+			if len(payload) > 2+tLen {
+				initialData = make([]byte, len(payload)-(2+tLen))
+				copy(initialData, payload[2+tLen:])
+			}
+
+			st := newMuxServerStream(streamID, session)
+			session.streamsMu.Lock()
+			session.streams[streamID] = st
+			session.streamsMu.Unlock()
+
+			go session.handleNewStream(st, targetStr, initialData)
+
+		case MuxCmdDATA:
+			session.streamsMu.RLock()
+			st, ok := session.streams[streamID]
+			session.streamsMu.RUnlock()
+			if ok && len(payload) > 0 {
+				dataCopy := make([]byte, len(payload))
+				copy(dataCopy, payload)
+				st.PushData(dataCopy)
+			}
+
+		case MuxCmdFIN:
+			session.streamsMu.RLock()
+			st, ok := session.streams[streamID]
+			session.streamsMu.RUnlock()
+			if ok {
+				st.PushData(nil)
+			}
+
+		case MuxCmdRST:
+			session.streamsMu.RLock()
+			st, ok := session.streams[streamID]
+			session.streamsMu.RUnlock()
+			if ok {
+				st.Close()
+			}
+		}
+	}
+}
+
+func (s *MuxServerSession) handleNewStream(st *MuxServerStream, targetStr string, initialData []byte) {
+	defer func() {
+		st.Close()
+		s.streamsMu.Lock()
+		delete(s.streams, st.id)
+		s.streamsMu.Unlock()
+	}()
+
+	targetAddr := targetStr
+	if s.cfg.Resolver != nil {
+		host, port, splitErr := net.SplitHostPort(targetStr)
+		if splitErr == nil {
+			if resolvedIP, resolveErr := s.cfg.Resolver.Resolve(host); resolveErr == nil {
+				targetAddr = net.JoinHostPort(resolvedIP, port)
+			}
+		}
+	}
+
+	targetConn, err := net.DialTimeout("tcp", targetAddr, time.Duration(s.cfg.ConnTimeout)*time.Second)
+	if err != nil {
+		logDebug("[SERVER-MUX] Dial %s failed: %v", targetAddr, err)
+		s.SendFrame(st.id, MuxCmdRST, nil)
+		return
+	}
+
+	optimizeSocket(targetConn, s.cfg)
+	st.targetConn = targetConn
+
+	if len(initialData) > 0 {
+		targetConn.Write(initialData)
+		stats.AddBytes(int64(len(initialData)), 0)
+	}
+
+	logDebug("[SERVER-MUX] Stream %d -> %s", st.id, targetStr)
+
+	go func() {
+		for {
+			select {
+			case <-st.closed:
+				return
+			case data, ok := <-st.writeChan:
+				if !ok || data == nil {
+					if tc, ok := targetConn.(*net.TCPConn); ok {
+						tc.CloseWrite()
+					}
+					return
+				}
+				if _, err := targetConn.Write(data); err != nil {
+					st.Close()
+					return
+				}
+				stats.AddBytes(int64(len(data)), 0)
+			}
+		}
+	}()
+
+	buf := make([]byte, 32*1024)
+	for {
+		nr, errRead := targetConn.Read(buf)
+		if nr > 0 {
+			if errWrite := s.SendFrame(st.id, MuxCmdDATA, buf[:nr]); errWrite != nil {
+				return
+			}
+			stats.AddBytes(0, int64(nr))
+		}
+		if errRead != nil {
+			if errRead == io.EOF {
+				s.SendFrame(st.id, MuxCmdFIN, nil)
+			} else {
+				s.SendFrame(st.id, MuxCmdRST, nil)
+			}
+		}
+	}
+}
+
 func handleConnection(conn net.Conn, cfg *Config) {
 	defer conn.Close()
 
@@ -2323,6 +3071,10 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 
 	if strings.EqualFold(targetStr, "UDP") || strings.HasPrefix(strings.ToUpper(targetStr), "UDP") {
 		handleServerUDP(wsConn, br, wsTCPConn, cfg)
+		return
+	}
+	if strings.EqualFold(targetStr, "MUX") || strings.HasPrefix(strings.ToUpper(targetStr), "MUX") {
+		handleServerMux(wsConn, br, wsTCPConn, cfg)
 		return
 	}
 
@@ -3168,6 +3920,13 @@ func handleClient(localConn net.Conn, cfg *Config) {
 	if cfg.BlockLocal && isLocalTarget(targetHost) {
 		logWarn("[CLIENT] Blocked local traffic attempt: %s:%s", targetHost, targetPort)
 		return
+	}
+
+	targetAddr := net.JoinHostPort(targetHost, targetPort)
+	if cfg.Mux && cfg.MuxPool != nil {
+		if relayMuxClient(localConn, ver, initialPayload, targetAddr, cfg) {
+			return
+		}
 	}
 
 	// Connect Upstream WS (use pre-parsed URL from startup)
