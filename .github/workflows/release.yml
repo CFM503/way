@@ -80,7 +80,7 @@ jobs:
           [ -z "$GOARM" ] && unset GOARM
           [ -z "$GOMIPS" ] && unset GOMIPS
           [ -z "$GOMIPS64" ] && unset GOMIPS64
-          go build -ldflags="-s -w" -o ../${{ matrix.output }} .
+          go build -ldflags="-s -w" -o ../${{ matrix.output }} goway.go
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

@@ -4,18 +4,24 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"math"
+	"math/big"
 	mrand "math/rand"
 	"net"
 	"net/url"
@@ -27,10 +33,12 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/quic-go/quic-go"
 )
 
 const (
-	Version        = "1.7.2"
+	Version        = "1.7.3"
 	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -599,8 +607,10 @@ type Config struct {
 	Resolver      *RemoteResolver
 	BufPool       *sync.Pool
 	HeaderBufPool *sync.Pool
-	TLSBase       *tls.Config
-	MuxPool       *MuxClientPool
+	TLSBase        *tls.Config
+	MuxPool        *MuxClientPool
+	QUICPool       *QUICClientPool
+	IsQUICUpstream bool
 
 	// Pre-parsed upstream URL (avoid per-connection url.Parse)
 	ParsedUpstream *url.URL
@@ -1240,7 +1250,6 @@ func optimizeSocket(conn net.Conn, cfg *Config) {
 			logDebug("SetWriteBuffer failed: %v", err)
 		}
 	}
-	setPlatformSocketOptions(tcpConn)
 }
 
 // extractTCPConn extracts the underlying *net.TCPConn from a net.Conn
@@ -2030,12 +2039,14 @@ func main() {
 			os.Exit(1)
 		}
 		cfg.ParsedUpstream = parsedUp
-		cfg.UpstreamIsWSS = strings.EqualFold(parsedUp.Scheme, "wss")
+		scheme := strings.ToLower(parsedUp.Scheme)
+		cfg.IsQUICUpstream = (scheme == "quic" || scheme == "quic+tls")
+		cfg.UpstreamIsWSS = (scheme == "wss")
 
 		upHost := parsedUp.Hostname()
 		upPort := parsedUp.Port()
 		if upPort == "" {
-			if cfg.UpstreamIsWSS {
+			if cfg.UpstreamIsWSS || cfg.IsQUICUpstream {
 				upPort = "443"
 			} else {
 				upPort = "80"
@@ -2134,12 +2145,20 @@ func main() {
 		},
 	}
 
-	// Initialize connection pool for client mode (pre-establish WebSocket connections)
+	// Initialize connection pool for client mode
 	if cfg.Upstream != "" {
-		if cfg.Mux {
-			cfg.MuxPool = NewMuxClientPool(&cfg, 4)
+		if cfg.IsQUICUpstream {
+			qp, qErr := NewQUICClientPool(&cfg)
+			if qErr != nil {
+				log.Fatalf("Failed to initialize QUIC pool: %v", qErr)
+			}
+			cfg.QUICPool = qp
+		} else {
+			if cfg.Mux {
+				cfg.MuxPool = NewMuxClientPool(&cfg, 4)
+			}
+			connPool = NewConnPool(&cfg, 10) // Pool of 10 pre-established connections
 		}
-		connPool = NewConnPool(&cfg, 10) // Pool of 10 pre-established connections
 
 		// Startup test: verify upstream IP is reachable (one-time check)
 		if net.ParseIP(cfg.UpstreamHost) != nil {
@@ -2148,9 +2167,11 @@ func main() {
 			if _, err := testDialer.Dial("tcp", testAddr); err != nil {
 				logWarn("Upstream IP %s is unreachable: %v", testAddr, err)
 				logWarn("All connections will use DNS-resolved Cloudflare edges via -fakehost")
-				connPool.mu.Lock()
-				connPool.deadIPs[cfg.UpstreamHost] = true
-				connPool.mu.Unlock()
+				if connPool != nil {
+					connPool.mu.Lock()
+					connPool.deadIPs[cfg.UpstreamHost] = true
+					connPool.mu.Unlock()
+				}
 			} else {
 				logInfo("Upstream IP %s is reachable", testAddr)
 			}
@@ -2162,7 +2183,7 @@ func main() {
 		fmt.Printf("%s[INFO] Proxy listening... (Press Ctrl+C to stop)%s\n\n", AnsiCyan, AnsiReset)
 	}
 
-	listener, err := listenWithReusePort("tcp", listenAddr)
+	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		log.Fatalf("Failed to bind: %v", err)
 	}
@@ -2176,6 +2197,9 @@ func main() {
 		<-sigCh
 		logInfo("Received shutdown signal, closing listener...")
 		saveLogFile()
+		if cfg.QUICPool != nil {
+			cfg.QUICPool.Close()
+		}
 		close(shutdown)
 		listener.Close()
 	}()
@@ -2187,6 +2211,10 @@ func main() {
 	}
 
 	go monitorStats(shutdown)
+
+	if cfg.Upstream == "" {
+		go startQUICServer(listenAddr, &cfg, shutdown)
+	}
 
 	logInfo("Proxy listening on %s...", listenAddr)
 
@@ -3578,6 +3606,11 @@ func handleClientUDP(localConn net.Conn, cfg *Config) {
 		return
 	}
 
+	if cfg.IsQUICUpstream && cfg.QUICPool != nil {
+		handleClientUDPQUIC(localConn, boundAddr, udpListener, cfg)
+		return
+	}
+
 	wsConn, br, wsTCPConn, err := dialUpstreamWS(cfg)
 	if err != nil {
 		logError("[UDP] Upstream dial failed: %v", err)
@@ -3924,6 +3957,14 @@ func handleClient(localConn net.Conn, cfg *Config) {
 	}
 
 	targetAddr := net.JoinHostPort(targetHost, targetPort)
+
+	// If QUIC upstream is configured, relay via QUIC
+	if cfg.IsQUICUpstream && cfg.QUICPool != nil {
+		if relayQUICClient(localConn, ver, initialPayload, targetAddr, cfg) {
+			return
+		}
+	}
+
 	if cfg.Mux && cfg.MuxPool != nil {
 		if relayMuxClient(localConn, ver, initialPayload, targetAddr, cfg) {
 			return
@@ -4125,3 +4166,621 @@ func indexFold(data []byte, substr string) int {
 	}
 	return -1
 }
+
+// ==================== QUIC TRANSPORT SUBSYSTEM ====================
+
+// generateSelfSignedCert generates an in-memory ECDSA P-256 TLS 1.3 certificate for QUIC server.
+func generateSelfSignedCert() (tls.Certificate, error) {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	template := x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			Organization: []string{"GOWAY"},
+			CommonName:   "goway.internal",
+		},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(10 * 365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{"goway.internal", "localhost"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+	}
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	privBytes, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privBytes})
+	return tls.X509KeyPair(certPEM, keyPEM)
+}
+
+func defaultQUICConfig() *quic.Config {
+	return &quic.Config{
+		MaxIdleTimeout:                 60 * time.Second,
+		KeepAlivePeriod:                15 * time.Second,
+		InitialStreamReceiveWindow:     2 * 1024 * 1024,
+		MaxStreamReceiveWindow:         8 * 1024 * 1024,
+		InitialConnectionReceiveWindow: 4 * 1024 * 1024,
+		MaxConnectionReceiveWindow:     16 * 1024 * 1024,
+		EnableDatagrams:                true,
+	}
+}
+
+// --- QUIC Server ---
+
+func startQUICServer(listenAddr string, cfg *Config, shutdown <-chan struct{}) {
+	cert, err := generateSelfSignedCert()
+	if err != nil {
+		logError("[QUIC-SERVER] Failed to generate self-signed cert: %v", err)
+		return
+	}
+
+	tlsConf := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"goway-quic", "h3"},
+	}
+
+	listener, err := quic.ListenAddr(listenAddr, tlsConf, defaultQUICConfig())
+	if err != nil {
+		logError("[QUIC-SERVER] Failed to bind UDP %s: %v", listenAddr, err)
+		return
+	}
+	logInfo("[QUIC-SERVER] Listening on UDP %s (QUIC Mode)", listenAddr)
+
+	go func() {
+		<-shutdown
+		listener.Close()
+	}()
+
+	for {
+		conn, err := listener.Accept(context.Background())
+		if err != nil {
+			select {
+			case <-shutdown:
+				return
+			default:
+				logError("[QUIC-SERVER] Accept err: %v", err)
+				return
+			}
+		}
+
+		go handleQUICConnection(conn, cfg)
+	}
+}
+
+func handleQUICConnection(qConn quic.Connection, cfg *Config) {
+	defer qConn.CloseWithError(0, "connection closed")
+
+	for {
+		stream, err := qConn.AcceptStream(context.Background())
+		if err != nil {
+			return
+		}
+		stats.AddConn()
+		go func(st quic.Stream) {
+			defer stats.RemoveConn()
+			handleQUICStream(st, cfg)
+		}(stream)
+	}
+}
+
+func handleQUICStream(stream quic.Stream, cfg *Config) {
+	defer stream.Close()
+
+	br := bufio.NewReader(stream)
+	targetLine, err := br.ReadString('\n')
+	if err != nil {
+		return
+	}
+	targetStr := strings.TrimSpace(targetLine)
+
+	// Authentication check if key is set
+	if cfg.Key != "" {
+		parts := strings.SplitN(targetStr, " ", 2)
+		if len(parts) != 2 || parts[0] != cfg.Key {
+			logWarn("[QUIC-SERVER] Auth rejected for stream from %v", stream.StreamID())
+			stream.Write([]byte("ERR: AUTH_FAILED\n"))
+			return
+		}
+		targetStr = parts[1]
+	}
+
+	if strings.EqualFold(targetStr, "UDP") || strings.HasPrefix(strings.ToUpper(targetStr), "UDP") {
+		handleQUICServerUDP(stream, br, cfg)
+		return
+	}
+
+	// Remote DNS resolution for target address
+	targetAddr := targetStr
+	if cfg.Resolver != nil {
+		host, port, splitErr := net.SplitHostPort(targetStr)
+		if splitErr == nil {
+			if resolvedIP, resolveErr := cfg.Resolver.Resolve(host); resolveErr == nil {
+				targetAddr = net.JoinHostPort(resolvedIP, port)
+			}
+		}
+	}
+
+	targetConn, err := net.DialTimeout("tcp", targetAddr, time.Duration(cfg.ConnTimeout)*time.Second)
+	if err != nil {
+		logDebug("[QUIC-SERVER] Dial %s failed: %v", targetAddr, err)
+		stream.Write([]byte("ERR: DIAL_FAILED\n"))
+		return
+	}
+	defer targetConn.Close()
+	optimizeSocket(targetConn, cfg)
+
+	if _, err := stream.Write([]byte("OK\n")); err != nil {
+		return
+	}
+
+	logDebug("[QUIC-SERVER] Stream %d -> %s", stream.StreamID(), targetStr)
+
+	errCh := make(chan error, 2)
+
+	// Stream -> Target
+	go func() {
+		bPtr := cfg.BufPool.Get().(*[]byte)
+		defer cfg.BufPool.Put(bPtr)
+		buf := *bPtr
+		for {
+			nr, errRead := br.Read(buf)
+			if nr > 0 {
+				if _, errWrite := targetConn.Write(buf[:nr]); errWrite != nil {
+					errCh <- errWrite
+					return
+				}
+				stats.AddBytes(int64(nr), 0)
+			}
+			if errRead != nil {
+				if tc, ok := targetConn.(*net.TCPConn); ok {
+					tc.CloseWrite()
+				}
+				errCh <- errRead
+				return
+			}
+		}
+	}()
+
+	// Target -> Stream
+	go func() {
+		bPtr := cfg.BufPool.Get().(*[]byte)
+		defer cfg.BufPool.Put(bPtr)
+		buf := *bPtr
+		for {
+			nr, errRead := targetConn.Read(buf)
+			if nr > 0 {
+				if _, errWrite := stream.Write(buf[:nr]); errWrite != nil {
+					errCh <- errWrite
+					return
+				}
+				stats.AddBytes(0, int64(nr))
+			}
+			if errRead != nil {
+				stream.CancelRead(0)
+				errCh <- errRead
+				return
+			}
+		}
+	}()
+
+	<-errCh
+}
+
+func handleQUICServerUDP(stream quic.Stream, br *bufio.Reader, cfg *Config) {
+	if _, err := stream.Write([]byte("OK\n")); err != nil {
+		return
+	}
+
+	udpConn, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		logError("[QUIC-UDP] ListenUDP err: %v", err)
+		return
+	}
+	defer udpConn.Close()
+
+	errCh := make(chan error, 2)
+
+	// Stream -> UDP
+	go func() {
+		bPtr := cfg.BufPool.Get().(*[]byte)
+		defer cfg.BufPool.Put(bPtr)
+		buf := *bPtr
+		var lenBuf [2]byte
+		for {
+			if _, err := io.ReadFull(br, lenBuf[:]); err != nil {
+				errCh <- err
+				return
+			}
+			pLen := int(binary.BigEndian.Uint16(lenBuf[:]))
+			if pLen > len(buf) {
+				errCh <- errors.New("udp packet too large")
+				return
+			}
+			if _, err := io.ReadFull(br, buf[:pLen]); err != nil {
+				errCh <- err
+				return
+			}
+
+			data := buf[:pLen]
+			if len(data) < 10 {
+				continue
+			}
+			atyp := data[3]
+			var host string
+			var offset int
+			if atyp == 0x01 {
+				host = net.IP(data[4:8]).String()
+				offset = 8
+			} else if atyp == 0x03 {
+				nameLen := int(data[4])
+				offset = 5 + nameLen
+				if len(data) < offset+2 {
+					continue
+				}
+				host = string(data[5:offset])
+			} else if atyp == 0x04 {
+				host = net.IP(data[4:20]).String()
+				offset = 20
+			} else {
+				continue
+			}
+			if len(data) < offset+2 {
+				continue
+			}
+			port := int(binary.BigEndian.Uint16(data[offset : offset+2]))
+			payload := data[offset+2:]
+
+			targetIP := host
+			if cfg.Resolver != nil {
+				if resolvedIP, rErr := cfg.Resolver.Resolve(host); rErr == nil {
+					targetIP = resolvedIP
+				}
+			}
+			raddr, rErr := net.ResolveUDPAddr("udp", net.JoinHostPort(targetIP, fmt.Sprintf("%d", port)))
+			if rErr != nil {
+				continue
+			}
+			udpConn.WriteToUDP(payload, raddr)
+			stats.AddBytes(int64(len(payload)), 0)
+		}
+	}()
+
+	// UDP -> Stream
+	go func() {
+		rawBuf := make([]byte, 65535)
+		var lenBuf [2]byte
+		for {
+			n, raddr, errRead := udpConn.ReadFromUDP(rawBuf[10:])
+			if errRead != nil {
+				errCh <- errRead
+				return
+			}
+			rawBuf[0] = 0
+			rawBuf[1] = 0
+			rawBuf[2] = 0
+			var hdrLen int
+			ip4 := raddr.IP.To4()
+			if ip4 != nil {
+				rawBuf[3] = 0x01
+				copy(rawBuf[4:8], ip4)
+				binary.BigEndian.PutUint16(rawBuf[8:10], uint16(raddr.Port))
+				hdrLen = 10
+			} else {
+				copy(rawBuf[22:22+n], rawBuf[10:10+n])
+				rawBuf[3] = 0x04
+				copy(rawBuf[4:20], raddr.IP.To16())
+				binary.BigEndian.PutUint16(rawBuf[20:22], uint16(raddr.Port))
+				hdrLen = 22
+			}
+			totalLen := hdrLen + n
+			binary.BigEndian.PutUint16(lenBuf[:], uint16(totalLen))
+			if _, errWrite := stream.Write(lenBuf[:]); errWrite != nil {
+				errCh <- errWrite
+				return
+			}
+			if _, errWrite := stream.Write(rawBuf[:totalLen]); errWrite != nil {
+				errCh <- errWrite
+				return
+			}
+			stats.AddBytes(0, int64(n))
+		}
+	}()
+
+	<-errCh
+}
+
+// --- QUIC Client Pool ---
+
+type QUICClientPool struct {
+	cfg      *Config
+	conn     quic.Connection
+	mu       sync.Mutex
+	dialAddr string
+	tlsConf  *tls.Config
+}
+
+func NewQUICClientPool(cfg *Config) (*QUICClientPool, error) {
+	u, err := url.Parse(cfg.Upstream)
+	if err != nil {
+		return nil, err
+	}
+	host := u.Hostname()
+	port := u.Port()
+	if port == "" {
+		port = "443"
+	}
+	dialAddr := net.JoinHostPort(host, port)
+
+	sni := host
+	if cfg.FakeHost != "" {
+		sni = strings.Split(cfg.FakeHost, ":")[0]
+	}
+
+	tlsConf := &tls.Config{
+		ServerName:         sni,
+		NextProtos:         []string{"goway-quic", "h3"},
+		InsecureSkipVerify: !cfg.VerifySSL,
+	}
+
+	return &QUICClientPool{
+		cfg:      cfg,
+		dialAddr: dialAddr,
+		tlsConf:  tlsConf,
+	}, nil
+}
+
+func (p *QUICClientPool) GetStream() (quic.Stream, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(p.cfg.ConnTimeout)*time.Second)
+	defer cancel()
+
+	if p.conn != nil {
+		stream, err := p.conn.OpenStreamSync(ctx)
+		if err == nil {
+			return stream, nil
+		}
+		p.conn = nil
+	}
+
+	dialHost, dialPort, _ := net.SplitHostPort(p.dialAddr)
+	if p.cfg.Resolver != nil {
+		if resolvedIP, rErr := p.cfg.Resolver.Resolve(dialHost); rErr == nil {
+			dialHost = resolvedIP
+		}
+	}
+	actualAddr := net.JoinHostPort(dialHost, dialPort)
+
+	conn, err := quic.DialAddr(ctx, actualAddr, p.tlsConf, defaultQUICConfig())
+	if err != nil {
+		return nil, err
+	}
+	p.conn = conn
+
+	return conn.OpenStreamSync(ctx)
+}
+
+func (p *QUICClientPool) Close() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.conn != nil {
+		p.conn.CloseWithError(0, "client closed")
+		p.conn = nil
+	}
+}
+
+// relayQUICClient relays a client TCP connection through QUIC tunnel.
+func relayQUICClient(localConn net.Conn, ver byte, initialPayload []byte, targetAddr string, cfg *Config) bool {
+	if cfg.QUICPool == nil {
+		return false
+	}
+
+	stream, err := cfg.QUICPool.GetStream()
+	if err != nil {
+		logError("[CLIENT-QUIC] GetStream failed: %v", err)
+		return false
+	}
+	defer stream.Close()
+
+	header := targetAddr
+	if cfg.Key != "" {
+		header = cfg.Key + " " + targetAddr
+	}
+	header += "\n"
+
+	if _, err := stream.Write([]byte(header)); err != nil {
+		return false
+	}
+
+	br := bufio.NewReader(stream)
+	resp, err := br.ReadString('\n')
+	if err != nil || !strings.HasPrefix(resp, "OK") {
+		logError("[CLIENT-QUIC] Upstream rejected target: %v, resp: %s", err, resp)
+		return false
+	}
+
+	if ver == 0x05 {
+		if _, err := localConn.Write(socks5OKResp); err != nil {
+			return true
+		}
+	} else if initialPayload == nil {
+		if _, err := localConn.Write(http200Resp); err != nil {
+			return true
+		}
+	}
+
+	if len(initialPayload) > 0 {
+		if _, err := stream.Write(initialPayload); err != nil {
+			return true
+		}
+		stats.AddBytes(int64(len(initialPayload)), 0)
+	}
+
+	errCh := make(chan error, 2)
+
+	go func() {
+		bPtr := cfg.BufPool.Get().(*[]byte)
+		defer cfg.BufPool.Put(bPtr)
+		buf := *bPtr
+		for {
+			nr, errRead := localConn.Read(buf)
+			if nr > 0 {
+				if _, errWrite := stream.Write(buf[:nr]); errWrite != nil {
+					errCh <- errWrite
+					return
+				}
+				stats.AddBytes(int64(nr), 0)
+			}
+			if errRead != nil {
+				stream.CancelWrite(0)
+				errCh <- errRead
+				return
+			}
+		}
+	}()
+
+	go func() {
+		bPtr := cfg.BufPool.Get().(*[]byte)
+		defer cfg.BufPool.Put(bPtr)
+		buf := *bPtr
+		for {
+			nr, errRead := br.Read(buf)
+			if nr > 0 {
+				if _, errWrite := localConn.Write(buf[:nr]); errWrite != nil {
+					errCh <- errWrite
+					return
+				}
+				stats.AddBytes(0, int64(nr))
+			}
+			if errRead != nil {
+				errCh <- errRead
+				return
+			}
+		}
+	}()
+
+	<-errCh
+	localConn.Close()
+	return true
+}
+
+func handleClientUDPQUIC(localConn net.Conn, boundAddr *net.UDPAddr, udpListener *net.UDPConn, cfg *Config) {
+	stream, err := cfg.QUICPool.GetStream()
+	if err != nil {
+		logError("[CLIENT-QUIC-UDP] GetStream failed: %v", err)
+		return
+	}
+	defer stream.Close()
+
+	header := "UDP"
+	if cfg.Key != "" {
+		header = cfg.Key + " UDP"
+	}
+	header += "\n"
+
+	if _, err := stream.Write([]byte(header)); err != nil {
+		return
+	}
+
+	br := bufio.NewReader(stream)
+	resp, err := br.ReadString('\n')
+	if err != nil || !strings.HasPrefix(resp, "OK") {
+		logError("[CLIENT-QUIC-UDP] Auth rejected by server: %s", resp)
+		return
+	}
+
+	logInfo("[CLIENT-QUIC-UDP] Tunnel established on port %d", boundAddr.Port)
+
+	var clientUDPAddr atomic.Pointer[net.UDPAddr]
+	errCh := make(chan error, 2)
+
+	go func() {
+		bPtr := cfg.BufPool.Get().(*[]byte)
+		defer cfg.BufPool.Put(bPtr)
+		buf := *bPtr
+		var lenBuf [2]byte
+		for {
+			n, srcAddr, errRead := udpListener.ReadFromUDP(buf)
+			if errRead != nil {
+				errCh <- errRead
+				return
+			}
+			clientUDPAddr.Store(srcAddr)
+			binary.BigEndian.PutUint16(lenBuf[:], uint16(n))
+			if _, errWrite := stream.Write(lenBuf[:]); errWrite != nil {
+				errCh <- errWrite
+				return
+			}
+			if _, errWrite := stream.Write(buf[:n]); errWrite != nil {
+				errCh <- errWrite
+				return
+			}
+			stats.AddBytes(int64(n), 0)
+		}
+	}()
+
+	go func() {
+		rawBuf := make([]byte, 65535)
+		var lenBuf [2]byte
+		for {
+			if _, err := io.ReadFull(br, lenBuf[:]); err != nil {
+				errCh <- err
+				return
+			}
+			pLen := int(binary.BigEndian.Uint16(lenBuf[:]))
+			if pLen > len(rawBuf) {
+				errCh <- errors.New("udp packet too large")
+				return
+			}
+			if _, err := io.ReadFull(br, rawBuf[:pLen]); err != nil {
+				errCh <- err
+				return
+			}
+			cAddr := clientUDPAddr.Load()
+			if cAddr != nil {
+				if _, errWrite := udpListener.WriteToUDP(rawBuf[:pLen], cAddr); errWrite != nil {
+					logDebug("[CLIENT-QUIC-UDP] WriteToUDP failed: %v", errWrite)
+				} else {
+					stats.AddBytes(0, int64(pLen))
+				}
+			}
+		}
+	}()
+
+	tcpDone := make(chan struct{})
+	go func() {
+		var dummy [1]byte
+		for {
+			_, err := localConn.Read(dummy[:])
+			if err != nil {
+				break
+			}
+		}
+		close(tcpDone)
+	}()
+
+	select {
+	case <-tcpDone:
+	case <-errCh:
+	}
+
+	udpListener.Close()
+	stream.Close()
+	localConn.Close()
+}
+
