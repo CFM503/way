@@ -1,8 +1,21 @@
-# GOWAY v1.6.3
+# GOWAY v1.7.0
 
-GOWAY 是一个基于 WebSocket 隧道的高性能代理工具，支持 HTTP 和 SOCKS5 协议，具备浏览器指纹伪装能力，可有效绕过网络检测。
+GOWAY 是一个基于 WebSocket 隧道的高性能代理工具，支持 HTTP 和完整 SOCKS5 (TCP + UDP) 协议，具备浏览器指纹伪装能力，可有效绕过网络检测。
 
 ## 版本历史
+
+### v1.7.0 (2026-09-03) - 全面支持 SOCKS5 UDP 代理与极致低延迟优化
+
+#### 核心优化与新特性
+
+| 优化项 | 说明 | 效果 |
+|---|---|---|
+| **SOCKS5 UDP 代理** | 完整实现 RFC 1928 SOCKS5 UDP ASSOCIATE 协议，UDP 数据报经由 WebSocket 隧道透明转发 | **完美支持 HTTP/3 (QUIC)、YouTube/Google 极速加载、远程 DNS 与网络游戏** |
+| **消除 1ms 死等延迟** | 彻底移除上行数据链路中无谓的 `SetReadDeadline(+1ms)` 盲等循环 | **消除小包/首包 1ms 人为延迟，交互式应用与 TTFB 提速显著** |
+| **L2 Cache 优化内存池** | 默认应用缓冲区大小由 1MB 调整为 64KB，单连接内存开销降低 93% | **大幅提升 CPU L1/L2 缓存命中率，彻底解决 OpenWrt 路由器高并发 OOM** |
+| **内核 TCP 自动调谐** | 默认 Socket Buffer 设为 0（保持操作系统内核原生 Autotuning 开启） | **避免强制锁死 8MB 导致的 Linux 动态窗口失效与 Bufferbloat 问题** |
+
+---
 
 ### v1.6.3 (2026-09-02) - 扩展 OpenWrt 与 Android 多架构跨平台支持
 
