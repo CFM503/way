@@ -27,6 +27,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,7 +39,7 @@ import (
 )
 
 const (
-	Version        = "1.7.3"
+	Version        = "1.7.4"
 	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -1962,9 +1963,25 @@ func main() {
 	tuiFlag := flag.Bool("tui", false, "Enable GUI-style Terminal User Interface")
 	logFileFlag := flag.String("log-file", "", "Save last 10 log entries to file on exit (e.g. goway.log)")
 	muxFlag := flag.Bool("mux", true, "Enable Connection Multiplexing (0-RTT Mux)")
+	cpuProfileFlag := flag.String("cpuprofile", "", "Write cpu profile to file (for PGO)")
+	cpuProfileDurationFlag := flag.Int("cpuprofile-duration", 0, "Stop CPU profile after N seconds")
 	versionFlag := flag.Bool("version", false, "Print version and exit")
 
 	flag.Parse()
+
+	if *cpuProfileFlag != "" {
+		if f, err := os.Create(*cpuProfileFlag); err == nil {
+			_ = pprof.StartCPUProfile(f)
+			if *cpuProfileDurationFlag > 0 {
+				time.AfterFunc(time.Duration(*cpuProfileDurationFlag)*time.Second, func() {
+					pprof.StopCPUProfile()
+					_ = f.Close()
+				})
+			} else {
+				defer pprof.StopCPUProfile()
+			}
+		}
+	}
 
 	if *versionFlag {
 		fmt.Printf("GOWAY v%s\n", Version)
@@ -2200,6 +2217,7 @@ func main() {
 		if cfg.QUICPool != nil {
 			cfg.QUICPool.Close()
 		}
+		pprof.StopCPUProfile()
 		close(shutdown)
 		listener.Close()
 	}()
