@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	Version        = "1.7.9"
+	Version        = "1.8.0"
 	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -1523,6 +1523,7 @@ type ConnPool struct {
 	stopChan    chan struct{}
 	stopOnce    sync.Once
 	deadIPs     map[string]bool // IPs that failed during session (permanent until exit)
+	refillCh    chan struct{}
 }
 
 func NewConnPool(cfg *Config, maxSize int) *ConnPool {
@@ -1534,6 +1535,7 @@ func NewConnPool(cfg *Config, maxSize int) *ConnPool {
 		idleTimeout: 30 * time.Second,
 		deadIPs:     make(map[string]bool),
 		stopChan:    make(chan struct{}),
+		refillCh:    make(chan struct{}, 1),
 	}
 	// Start background goroutine to maintain pool
 	go p.maintainLoop()
@@ -1549,28 +1551,35 @@ func (p *ConnPool) maintainLoop() {
 			return
 		case <-ticker.C:
 			p.cleanup()
-			// Fill pool to capacity
-			for i := 0; i < p.maxSize; i++ {
-				p.mu.Lock()
-				if p.closed || len(p.conns) >= p.maxSize {
-					p.mu.Unlock()
-					break
-				}
-				p.mu.Unlock()
-				conn := p.createConn()
-				if conn == nil {
-					break
-				}
-				p.mu.Lock()
-				if p.closed || len(p.conns) >= p.maxSize {
-					p.mu.Unlock()
-					conn.wsConn.Close()
-					break
-				}
-				p.conns = append(p.conns, conn)
-				p.mu.Unlock()
-			}
+			p.refill()
+		case <-p.refillCh:
+			p.refill()
 		}
+	}
+}
+
+func (p *ConnPool) refill() {
+	for i := 0; i < p.maxSize; i++ {
+		p.mu.Lock()
+		if p.closed || len(p.conns) >= p.maxSize {
+			p.mu.Unlock()
+			break
+		}
+		p.mu.Unlock()
+
+		conn := p.createConn()
+		if conn == nil {
+			break
+		}
+
+		p.mu.Lock()
+		if p.closed || len(p.conns) >= p.maxSize {
+			p.mu.Unlock()
+			conn.wsConn.Close()
+			break
+		}
+		p.conns = append(p.conns, conn)
+		p.mu.Unlock()
 	}
 }
 
@@ -1687,9 +1696,9 @@ func (p *ConnPool) doHandshake(wsConn net.Conn, br *bufio.Reader, cfg *Config, s
 
 func (p *ConnPool) Get() *PooledConn {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	if p.closed || len(p.conns) == 0 {
+		p.mu.Unlock()
 		return nil
 	}
 
@@ -1698,6 +1707,14 @@ func (p *ConnPool) Get() *PooledConn {
 	conn := p.conns[n-1]
 	p.conns = p.conns[:n-1]
 	conn.lastUsed = time.Now()
+	p.mu.Unlock()
+
+	// Non-blocking signal to maintainLoop to refill pool immediately
+	select {
+	case p.refillCh <- struct{}{}:
+	default:
+	}
+
 	return conn
 }
 
@@ -2379,8 +2396,14 @@ const (
 	MuxCmdRST    byte = 0x04 // Stream Abrupt Reset / Error
 	MuxHeaderLen      = 7    // 4B StreamID + 1B Cmd + 2B PayloadLen
 
-	muxClientStreamBufferLimit = 4 * 1024 * 1024 // 4 MiB max queued buffer per client stream
-	muxServerStreamBufferLimit = 8 * 1024 * 1024 // 8 MiB max queued buffer per server stream
+	// Client-side Mux stream buffer limit.
+	// Kept lower to reduce per-stream memory usage on client instances.
+	muxClientStreamBufferLimit = 4 * 1024 * 1024
+
+	// Server-side Mux stream buffer limit.
+	// Kept higher to provide additional buffering headroom for
+	// downstream fan-out / asymmetric traffic patterns.
+	muxServerStreamBufferLimit = 8 * 1024 * 1024
 )
 
 // muxDataFrame encapsulates a payload slice along with ownership of a pooled buffer from sync.Pool.
@@ -2418,6 +2441,7 @@ type MuxStream struct {
 	bufMu       sync.Mutex
 	queuedBytes int64
 	hasSpace    chan struct{}
+	onClose     func()
 }
 
 func newMuxStream(id uint32, session MuxSessionInterface) *MuxStream {
@@ -2605,6 +2629,9 @@ func (s *MuxStream) Close() error {
 		s.session.SendFrame(s.id, MuxCmdFIN, nil)
 		s.session.RemoveStream(s.id)
 		s.cleanup()
+		if s.onClose != nil {
+			s.onClose()
+		}
 	})
 	return nil
 }
@@ -2615,22 +2642,34 @@ func (s *MuxStream) Reset() {
 		s.session.SendFrame(s.id, MuxCmdRST, nil)
 		s.session.RemoveStream(s.id)
 		s.cleanup()
+		if s.onClose != nil {
+			s.onClose()
+		}
 	})
 }
 
 // MuxClientSession handles a single WebSocket tunnel carrying multiple MuxStreams.
 type MuxClientSession struct {
-	wsConn       net.Conn
-	br           *bufio.Reader
-	wsTCPConn    *net.TCPConn
-	cfg          *Config
-	writeMu      sync.Mutex
-	streams      map[uint32]*MuxStream
-	streamsMu    sync.RWMutex
-	nextStreamID uint32
-	closed       chan struct{}
-	closeOnce    sync.Once
-	prng         *maskPRNG
+	wsConn        net.Conn
+	br            *bufio.Reader
+	wsTCPConn     *net.TCPConn
+	cfg           *Config
+	writeMu       sync.Mutex
+	streams       map[uint32]*MuxStream
+	streamsMu     sync.RWMutex
+	nextStreamID  uint32
+	closed        chan struct{}
+	closeOnce     sync.Once
+	prng          *maskPRNG
+	activeStreams atomic.Int64
+}
+
+func (s *MuxClientSession) ActiveStreams() int64 {
+	cnt := s.activeStreams.Load()
+	if cnt < 0 {
+		return 0
+	}
+	return cnt
 }
 
 func newMuxClientSession(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, cfg *Config) *MuxClientSession {
@@ -2681,7 +2720,9 @@ func (s *MuxClientSession) IsAlive() bool {
 func (s *MuxClientSession) Close() {
 	s.closeOnce.Do(func() {
 		close(s.closed)
-		s.wsConn.Close()
+		if s.wsConn != nil {
+			s.wsConn.Close()
+		}
 
 		s.streamsMu.Lock()
 		activeStreams := make([]*MuxStream, 0, len(s.streams))
@@ -2832,6 +2873,36 @@ func NewMuxClientPool(cfg *Config, maxSessions int) *MuxClientPool {
 	}
 }
 
+func (p *MuxClientPool) pickBestSessionLocked() *MuxClientSession {
+	if len(p.sessions) == 0 {
+		return nil
+	}
+	if len(p.sessions) == 1 {
+		return p.sessions[0]
+	}
+
+	var minStreams int64 = -1
+	var candidates []*MuxClientSession
+
+	for _, s := range p.sessions {
+		cnt := s.ActiveStreams()
+		if minStreams == -1 || cnt < minStreams {
+			minStreams = cnt
+			candidates = candidates[:0]
+			candidates = append(candidates, s)
+		} else if cnt == minStreams {
+			candidates = append(candidates, s)
+		}
+	}
+
+	if len(candidates) == 1 {
+		return candidates[0]
+	}
+
+	idx := atomic.AddUint32(&p.roundIdx, 1) % uint32(len(candidates))
+	return candidates[idx]
+}
+
 func (p *MuxClientPool) GetSession() (*MuxClientSession, error) {
 	p.mu.Lock()
 
@@ -2844,10 +2915,9 @@ func (p *MuxClientPool) GetSession() (*MuxClientSession, error) {
 	}
 	p.sessions = valid
 
-	// If at least one session is active, return immediately via round-robin!
+	// If at least one session is active, select the least loaded (least active streams, with round-robin tie-breaking)
 	if len(p.sessions) > 0 {
-		idx := atomic.AddUint32(&p.roundIdx, 1) % uint32(len(p.sessions))
-		sess := p.sessions[idx]
+		sess := p.pickBestSessionLocked()
 
 		// If pool capacity is not yet reached, trigger background dial to scale up
 		if !p.closed && len(p.sessions)+p.dialing < p.maxSess {
@@ -2875,8 +2945,7 @@ func (p *MuxClientPool) GetSession() (*MuxClientSession, error) {
 	if err != nil {
 		// If another goroutine succeeded while we were dialing, use that
 		if len(p.sessions) > 0 {
-			idx := atomic.AddUint32(&p.roundIdx, 1) % uint32(len(p.sessions))
-			s := p.sessions[idx]
+			s := p.pickBestSessionLocked()
 			p.mu.Unlock()
 			return s, nil
 		}
@@ -2967,10 +3036,14 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 
 	streamID := atomic.AddUint32(&session.nextStreamID, 1)
 	stream := newMuxStream(streamID, session)
+	stream.onClose = func() {
+		session.activeStreams.Add(-1)
+	}
 
 	session.streamsMu.Lock()
 	session.streams[streamID] = stream
 	session.streamsMu.Unlock()
+	session.activeStreams.Add(1)
 
 	defer stream.Close()
 

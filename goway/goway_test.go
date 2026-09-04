@@ -1701,3 +1701,145 @@ func TestMuxServerStream_BufPoolUsage(t *testing.T) {
 		t.Fatal("handleNewStream did not terminate after st.Close()")
 	}
 }
+
+func TestMuxClientPool_LeastActiveScheduling(t *testing.T) {
+	cfg := &Config{ConnTimeout: 5}
+	pool := NewMuxClientPool(cfg, 4)
+	defer pool.Close()
+
+	// Create 4 mock sessions
+	s0 := &MuxClientSession{closed: make(chan struct{})}
+	s1 := &MuxClientSession{closed: make(chan struct{})}
+	s2 := &MuxClientSession{closed: make(chan struct{})}
+	s3 := &MuxClientSession{closed: make(chan struct{})}
+
+	// Set active streams:
+	// Session 0: 8 streams
+	// Session 1: 2 streams  <-- candidate
+	// Session 2: 5 streams
+	// Session 3: 2 streams  <-- candidate
+	s0.activeStreams.Store(8)
+	s1.activeStreams.Store(2)
+	s2.activeStreams.Store(5)
+	s3.activeStreams.Store(2)
+
+	pool.sessions = []*MuxClientSession{s0, s1, s2, s3}
+
+	// Verify that GetSession only selects s1 or s3 (the ones with min active streams)
+	counts := make(map[*MuxClientSession]int)
+	for i := 0; i < 20; i++ {
+		sess, err := pool.GetSession()
+		if err != nil {
+			t.Fatalf("GetSession failed: %v", err)
+		}
+		if sess != s1 && sess != s3 {
+			t.Fatalf("Expected only s1 or s3 to be picked, got session with %d streams", sess.ActiveStreams())
+		}
+		counts[sess]++
+	}
+
+	// Verify round-robin tie breaking between s1 and s3
+	if counts[s1] == 0 || counts[s3] == 0 {
+		t.Fatalf("Expected round-robin between s1 and s3, got counts: s1=%d, s3=%d", counts[s1], counts[s3])
+	}
+	if counts[s0] != 0 || counts[s2] != 0 {
+		t.Fatalf("Expected s0 and s2 never to be chosen, got counts: s0=%d, s2=%d", counts[s0], counts[s2])
+	}
+
+	// Now increase s1 active streams to 3. s3 (2 streams) is now strictly the lowest!
+	s1.activeStreams.Store(3)
+	for i := 0; i < 10; i++ {
+		sess, err := pool.GetSession()
+		if err != nil {
+			t.Fatalf("GetSession failed: %v", err)
+		}
+		if sess != s3 {
+			t.Fatalf("Expected strictly s3 to be chosen, got session with %d streams", sess.ActiveStreams())
+		}
+	}
+}
+
+func TestMuxStream_ActiveStreamsLifecycle(t *testing.T) {
+	pipeR, pipeW := net.Pipe()
+	defer pipeR.Close()
+	defer pipeW.Close()
+	go io.Copy(io.Discard, pipeR)
+
+	session := &MuxClientSession{
+		wsConn:  pipeW,
+		streams: make(map[uint32]*MuxStream),
+		closed:  make(chan struct{}),
+		prng:    maskPool.Get().(*maskPRNG),
+		cfg: &Config{
+			ConnTimeout: 5,
+			BufPool: &sync.Pool{
+				New: func() interface{} {
+					b := make([]byte, 32*1024)
+					return &b
+				},
+			},
+		},
+	}
+
+	if session.ActiveStreams() != 0 {
+		t.Fatalf("Initial activeStreams should be 0, got %d", session.ActiveStreams())
+	}
+
+	st := newMuxStream(1, session)
+	st.onClose = func() {
+		session.activeStreams.Add(-1)
+	}
+	session.streamsMu.Lock()
+	session.streams[1] = st
+	session.streamsMu.Unlock()
+	session.activeStreams.Add(1)
+
+	if session.ActiveStreams() != 1 {
+		t.Fatalf("After stream creation, activeStreams should be 1, got %d", session.ActiveStreams())
+	}
+
+	// Close stream
+	st.Close()
+	if session.ActiveStreams() != 0 {
+		t.Fatalf("After st.Close(), activeStreams should be 0, got %d", session.ActiveStreams())
+	}
+
+	// Multiple closes should not decrement again
+	st.Close()
+	st.Reset()
+	if session.ActiveStreams() != 0 {
+		t.Fatalf("Multiple closes should not result in negative activeStreams, got %d", session.ActiveStreams())
+	}
+}
+
+func TestConnPool_ImmediateRefillSignal(t *testing.T) {
+	pool := &ConnPool{
+		conns:    make([]*PooledConn, 0, 5),
+		maxSize:  5,
+		refillCh: make(chan struct{}, 1),
+	}
+
+	c1, _ := net.Pipe()
+	defer c1.Close()
+	pConn1 := &PooledConn{wsConn: c1, br: bufio.NewReader(c1), created: time.Now(), lastUsed: time.Now()}
+	pool.conns = append(pool.conns, pConn1)
+
+	// Get a connection
+	got := pool.Get()
+	if got != pConn1 {
+		t.Fatal("Expected to get connection from pool")
+	}
+
+	// Verify that refillCh received the non-blocking signal immediately
+	select {
+	case <-pool.refillCh:
+		// Success: signal was sent!
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Expected refillCh to receive signal immediately after Get()")
+	}
+
+	// Subsequent Get on empty pool should return nil and not block
+	if empty := pool.Get(); empty != nil {
+		t.Fatal("Expected nil on empty pool")
+	}
+}
