@@ -79,7 +79,7 @@ func TestIsLocalTarget(t *testing.T) {
 	}
 
 	publicAddrs := []string{
-		"8.8.8.8", "1.1.1.1", "96.44.148.122", "example.com", "cloudflare.com", "172.15.0.1", "172.32.0.1",
+		"8.8.8.8", "1.1.1.1", "93.184.216.34", "example.com", "cloudflare.com", "172.15.0.1", "172.32.0.1",
 	}
 	for _, addr := range publicAddrs {
 		if isLocalTarget(addr) {

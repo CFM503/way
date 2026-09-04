@@ -8,7 +8,7 @@ Way Proxy 是一个**轻量级**、**高性能**的 HTTP/SOCKS5 转 WebSocket �
 
 本项目包含两个语言的实现版本，它们具有相同的功能和参数用法：
 - 🐍 **Pyway**: 基于 Python `asyncio` 实现的异步高性能版本 (当前最新: v1.3.2)。
-- 🐹 **Goway**: 基于 Go 语言实现的高并发、低延迟编译型版本 (当前最新: v1.7.6)。
+- 🐹 **Goway**: 基于 Go 语言实现的高并发、低延迟编译型版本 (当前最新: v1.7.7)。
 
 ---
 
@@ -75,15 +75,34 @@ Way Proxy 支持**服务器端**和**客户端**两种模式，通常成对使�
 
 ### 第 1 步：在你的海外服务器上启动 Server 端
 
-Server 端不使用 `-up` 参数，仅监听一个端口提供 WebSocket 代理接入。
+Server 端不使用 `-up` 参数，仅监听一个端口提供 WebSocket 与 QUIC 代理接入。
 
 ```bash
 # 示例：监听 8080 端口，并设置加密密钥为 "my_secret_key"
 # Python 版本
 python pyway/pyway1.3.2.py -p :8080 -k "my_secret_key"
 
-# Go 版本 (推荐用于 Server)
+# Go 版本 (推荐用于 Server，同一端口自动监听 TCP WebSocket 与 UDP QUIC)
 ./goway -p :8080 -k "my_secret_key"
+```
+
+#### 🛡️ 服务器防火墙放行规则 (TCP + UDP)
+
+GOWAY 服务端在同一端口自动同时监听 **TCP (WebSocket)** 与 **UDP (QUIC)**。若要使用 QUIC 弱网加速模式或标准 WebSocket 隧道，必须在服务器终端放行对应端口的 **TCP 和 UDP** 双向流量（请根据实际监听端口替换 `<port>`）：
+
+```bash
+# 示例：以常用端口 8880 为例
+# UFW 防火墙 (Ubuntu / Debian):
+ufw allow 8880/tcp && ufw allow 8880/udp
+
+# iptables 防火墙 (通用 Linux):
+iptables -I INPUT -p tcp --dport 8880 -j ACCEPT
+iptables -I INPUT -p udp --dport 8880 -j ACCEPT
+
+# 推荐：若使用标准 443 端口 (穿透力与防封锁最佳):
+ufw allow 443/tcp && ufw allow 443/udp
+iptables -I INPUT -p tcp --dport 443 -j ACCEPT
+iptables -I INPUT -p udp --dport 443 -j ACCEPT
 ```
 
 ### 第 2 步：在你的本地电脑上启动 Client 端
@@ -91,12 +110,15 @@ python pyway/pyway1.3.2.py -p :8080 -k "my_secret_key"
 Client 端通过 `-up` 参数连接到 Server 端，并在本地暴露 HTTP/SOCKS5 代理。
 
 ```bash
-# 示例：在本地 1080 端口开启 HTTP/SOCKS5 代理，连接到 服务器 WS，带上密钥
+# 示例 1 (WebSocket 模式)：在本地 1080 端口开启代理，通过 WebSocket 连接
 # Python 版本
 python pyway/pyway1.3.2.py -p :1080 -up ws://<你的服务器IP>:8080 -k "my_secret_key"
 
 # Go 版本
 ./goway -p :1080 -up ws://<你的服务器IP>:8080 -k "my_secret_key"
+
+# 示例 2 (QUIC 模式)：在本地 1080 端口开启代理，通过 QUIC (UDP) 抗丢包连接
+./goway -p :1080 -up quic://<你的服务器IP>:8080 -k "my_secret_key"
 ```
 
 ### 第 3 步：配置浏览器或工具
