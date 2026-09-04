@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	Version        = "1.7.5"
+	Version        = "1.7.6"
 	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -1923,7 +1923,7 @@ func readWSFrameInto(r io.Reader, w io.Writer, buf []byte) ([]byte, error) {
 			return nil, io.EOF
 		case 0x9: // Ping
 			if w != nil {
-				if err := writeWSFrame(w, payload, 0xA, true); err != nil {
+				if err := writeWSFrame(w, payload, 0xA, !masked); err != nil {
 					if poolPtr != nil {
 						largeFramePool.Put(poolPtr)
 					}
@@ -2176,25 +2176,32 @@ func main() {
 		} else {
 			if cfg.Mux {
 				cfg.MuxPool = NewMuxClientPool(&cfg, 4)
+			} else {
+				connPool = NewConnPool(&cfg, 10) // Pool of 10 pre-established connections for non-Mux mode
 			}
-			connPool = NewConnPool(&cfg, 10) // Pool of 10 pre-established connections
 		}
 
-		// Startup test: verify upstream IP is reachable (one-time check)
+		// Startup test: verify upstream IP is reachable (asynchronous with fast 3s timeout)
 		if net.ParseIP(cfg.UpstreamHost) != nil {
-			testDialer := &net.Dialer{Timeout: time.Duration(cfg.ConnTimeout) * time.Second}
-			testAddr := net.JoinHostPort(cfg.UpstreamHost, cfg.UpstreamPort)
-			if _, err := testDialer.Dial("tcp", testAddr); err != nil {
-				logWarn("Upstream IP %s is unreachable: %v", testAddr, err)
-				logWarn("All connections will use DNS-resolved Cloudflare edges via -fakehost")
-				if connPool != nil {
-					connPool.mu.Lock()
-					connPool.deadIPs[cfg.UpstreamHost] = true
-					connPool.mu.Unlock()
+			go func() {
+				probeTimeout := 3 * time.Second
+				if cfg.ConnTimeout > 0 && cfg.ConnTimeout < 3 {
+					probeTimeout = time.Duration(cfg.ConnTimeout) * time.Second
 				}
-			} else {
-				logInfo("Upstream IP %s is reachable", testAddr)
-			}
+				testDialer := &net.Dialer{Timeout: probeTimeout}
+				testAddr := net.JoinHostPort(cfg.UpstreamHost, cfg.UpstreamPort)
+				if _, err := testDialer.Dial("tcp", testAddr); err != nil {
+					logWarn("Upstream IP %s is unreachable: %v", testAddr, err)
+					logWarn("All connections will use DNS-resolved Cloudflare edges via -fakehost")
+					if connPool != nil {
+						connPool.mu.Lock()
+						connPool.deadIPs[cfg.UpstreamHost] = true
+						connPool.mu.Unlock()
+					}
+				} else {
+					logInfo("Upstream IP %s is reachable", testAddr)
+				}
+			}()
 		}
 	}
 
@@ -2349,6 +2356,20 @@ func (s *MuxStream) PushData(data []byte) bool {
 		return false
 	case s.readChan <- data:
 		return true
+	default:
+	}
+
+	timer := time.NewTimer(3 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-s.closed:
+		return false
+	case s.readChan <- data:
+		return true
+	case <-timer.C:
+		logWarn("[MUX] Stream %d buffer stalled, resetting stream to protect session", s.id)
+		s.Reset()
+		return false
 	}
 }
 
@@ -2454,7 +2475,29 @@ func newMuxClientSession(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPCo
 		prng:      maskPool.Get().(*maskPRNG),
 	}
 	go s.readLoop()
+	go s.heartbeatLoop()
 	return s
+}
+
+func (s *MuxClientSession) heartbeatLoop() {
+	ticker := time.NewTicker(25 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.closed:
+			return
+		case <-ticker.C:
+			s.writeMu.Lock()
+			select {
+			case <-s.closed:
+				s.writeMu.Unlock()
+				return
+			default:
+				_ = writeWSFrame(s.wsConn, nil, 0x9, true)
+			}
+			s.writeMu.Unlock()
+		}
+	}
 }
 
 func (s *MuxClientSession) IsAlive() bool {
@@ -2585,6 +2628,8 @@ type MuxClientPool struct {
 	mu       sync.Mutex
 	maxSess  int
 	roundIdx uint32
+	dialing  int
+	closed   bool
 }
 
 func NewMuxClientPool(cfg *Config, maxSessions int) *MuxClientPool {
@@ -2597,7 +2642,6 @@ func NewMuxClientPool(cfg *Config, maxSessions int) *MuxClientPool {
 
 func (p *MuxClientPool) GetSession() (*MuxClientSession, error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	// Filter out dead sessions
 	valid := p.sessions[:0]
@@ -2608,22 +2652,69 @@ func (p *MuxClientPool) GetSession() (*MuxClientSession, error) {
 	}
 	p.sessions = valid
 
-	if len(p.sessions) >= p.maxSess {
+	// If at least one session is active, return immediately via round-robin!
+	if len(p.sessions) > 0 {
 		idx := atomic.AddUint32(&p.roundIdx, 1) % uint32(len(p.sessions))
-		return p.sessions[idx], nil
+		sess := p.sessions[idx]
+
+		// If pool capacity is not yet reached, trigger background dial to scale up
+		if !p.closed && len(p.sessions)+p.dialing < p.maxSess {
+			p.dialing++
+			go p.dialBackgroundSession()
+		}
+
+		p.mu.Unlock()
+		return sess, nil
 	}
 
+	if p.closed {
+		p.mu.Unlock()
+		return nil, errors.New("mux client pool closed")
+	}
+
+	// No sessions alive. Dial synchronously, releasing lock during network I/O
+	p.dialing++
+	p.mu.Unlock()
+
 	sess, err := p.dialNewSession()
+
+	p.mu.Lock()
+	p.dialing--
 	if err != nil {
+		// If another goroutine succeeded while we were dialing, use that
 		if len(p.sessions) > 0 {
 			idx := atomic.AddUint32(&p.roundIdx, 1) % uint32(len(p.sessions))
-			return p.sessions[idx], nil
+			s := p.sessions[idx]
+			p.mu.Unlock()
+			return s, nil
 		}
+		p.mu.Unlock()
 		return nil, err
 	}
 
+	if p.closed {
+		p.mu.Unlock()
+		sess.Close()
+		return nil, errors.New("mux client pool closed")
+	}
+
 	p.sessions = append(p.sessions, sess)
+	p.mu.Unlock()
 	return sess, nil
+}
+
+func (p *MuxClientPool) dialBackgroundSession() {
+	sess, err := p.dialNewSession()
+	p.mu.Lock()
+	p.dialing--
+	if err == nil {
+		if !p.closed && len(p.sessions) < p.maxSess {
+			p.sessions = append(p.sessions, sess)
+		} else {
+			sess.Close()
+		}
+	}
+	p.mu.Unlock()
 }
 
 func (p *MuxClientPool) dialNewSession() (*MuxClientSession, error) {
@@ -2668,6 +2759,7 @@ func (p *MuxClientPool) dialNewSession() (*MuxClientSession, error) {
 func (p *MuxClientPool) Close() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.closed = true
 	for _, s := range p.sessions {
 		s.Close()
 	}
