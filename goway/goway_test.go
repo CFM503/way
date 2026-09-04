@@ -18,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	mrand "math/rand"
+
 	"github.com/quic-go/quic-go"
 )
 
@@ -1736,6 +1738,7 @@ func TestMuxClientPool_LeastActiveScheduling(t *testing.T) {
 			t.Fatalf("Expected only s1 or s3 to be picked, got session with %d streams", sess.ActiveStreams())
 		}
 		counts[sess]++
+		sess.decrementActiveStreams() // Release reservation to maintain static candidate counts
 	}
 
 	// Verify round-robin tie breaking between s1 and s3
@@ -1756,6 +1759,7 @@ func TestMuxClientPool_LeastActiveScheduling(t *testing.T) {
 		if sess != s3 {
 			t.Fatalf("Expected strictly s3 to be chosen, got session with %d streams", sess.ActiveStreams())
 		}
+		sess.decrementActiveStreams()
 	}
 }
 
@@ -1787,7 +1791,7 @@ func TestMuxStream_ActiveStreamsLifecycle(t *testing.T) {
 
 	st := newMuxStream(1, session)
 	st.onClose = func() {
-		session.activeStreams.Add(-1)
+		session.decrementActiveStreams()
 	}
 	session.streamsMu.Lock()
 	session.streams[1] = st
@@ -1841,5 +1845,166 @@ func TestConnPool_ImmediateRefillSignal(t *testing.T) {
 	// Subsequent Get on empty pool should return nil and not block
 	if empty := pool.Get(); empty != nil {
 		t.Fatal("Expected nil on empty pool")
+	}
+}
+
+func TestMuxClientPool_ConcurrentReservationLoad(t *testing.T) {
+	for _, numStreams := range []int{100, 500, 1000} {
+		t.Run(fmt.Sprintf("%d_streams", numStreams), func(t *testing.T) {
+			bufPool := &sync.Pool{
+				New: func() interface{} {
+					b := make([]byte, 32*1024)
+					return &b
+				},
+			}
+			cfg := &Config{ConnTimeout: 5, BufPool: bufPool}
+			pool := NewMuxClientPool(cfg, 4)
+			defer pool.Close()
+
+			// Create 4 mock sessions with pipes
+			sessions := make([]*MuxClientSession, 4)
+			for i := 0; i < 4; i++ {
+				pipeR, pipeW := net.Pipe()
+				go io.Copy(io.Discard, pipeR)
+				sessions[i] = &MuxClientSession{
+					wsConn:  pipeW,
+					closed:  make(chan struct{}),
+					streams: make(map[uint32]*MuxStream),
+					prng:    maskPool.Get().(*maskPRNG),
+					cfg:     cfg,
+				}
+			}
+			pool.sessions = sessions
+
+			var wg sync.WaitGroup
+			wg.Add(numStreams)
+
+			for i := 0; i < numStreams; i++ {
+				go func(idx int) {
+					defer wg.Done()
+					sess, err := pool.GetSession()
+					if err != nil {
+						t.Errorf("GetSession failed: %v", err)
+						return
+					}
+
+					if sess.ActiveStreams() < 1 {
+						t.Errorf("ActiveStreams should be >= 1 after reservation")
+					}
+
+					st := newMuxStream(uint32(idx+1), sess)
+					st.onClose = func() {
+						sess.decrementActiveStreams()
+					}
+					sess.streamsMu.Lock()
+					sess.streams[st.id] = st
+					sess.streamsMu.Unlock()
+
+					// Brief sleep
+					time.Sleep(time.Duration(mrand.Intn(2)+1) * time.Millisecond)
+
+					// Close stream (triggers onClose -> decrementActiveStreams)
+					st.Close()
+				}(i)
+			}
+
+			wg.Wait()
+
+			// Check that all sessions returned EXACTLY to 0
+			for i, s := range sessions {
+				active := s.ActiveStreams()
+				if active != 0 {
+					t.Fatalf("Session %d activeStreams did not return to 0, got %d", i, active)
+				}
+			}
+		})
+	}
+}
+
+func TestMuxStream_BufferOwnershipAndCloseRace(t *testing.T) {
+	bufPool := &sync.Pool{
+		New: func() interface{} {
+			b := make([]byte, 32*1024)
+			return &b
+		},
+	}
+	cfg := &Config{
+		ConnTimeout: 5,
+		BufPool:     bufPool,
+	}
+
+	for iter := 0; iter < 50; iter++ {
+		pipeR, pipeW := net.Pipe()
+		go io.Copy(io.Discard, pipeR)
+
+		session := &MuxClientSession{
+			wsConn:  pipeW,
+			streams: make(map[uint32]*MuxStream),
+			closed:  make(chan struct{}),
+			prng:    maskPool.Get().(*maskPRNG),
+			cfg:     cfg,
+		}
+
+		st := newMuxStream(uint32(iter+1), session)
+		session.streamsMu.Lock()
+		session.streams[st.id] = st
+		session.streamsMu.Unlock()
+
+		var wg sync.WaitGroup
+		wg.Add(4)
+
+		// Goroutine 1: PushDataFrame
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 30; i++ {
+				bPtr := bufPool.Get().(*[]byte)
+				buf := *bPtr
+				payload := buf[:512]
+				frame := muxDataFrame{
+					data: payload,
+					bPtr: bPtr,
+					pool: bufPool,
+				}
+				if !st.PushDataFrame(frame) {
+					frame.release()
+					return
+				}
+			}
+		}()
+
+		// Goroutine 2: Read
+		go func() {
+			defer wg.Done()
+			readBuf := make([]byte, 256)
+			for {
+				_, err := st.Read(readBuf)
+				if err != nil {
+					return
+				}
+			}
+		}()
+
+		// Goroutine 3: Close or Reset
+		go func() {
+			defer wg.Done()
+			time.Sleep(time.Duration(mrand.Intn(2)+1) * time.Millisecond)
+			if iter%2 == 0 {
+				st.Close()
+			} else {
+				st.Reset()
+			}
+		}()
+
+		// Goroutine 4: Session Close
+		go func() {
+			defer wg.Done()
+			time.Sleep(time.Duration(mrand.Intn(2)+1) * time.Millisecond)
+			session.Close()
+		}()
+
+		wg.Wait()
+		st.Close()
+		session.Close()
+		pipeR.Close()
 	}
 }

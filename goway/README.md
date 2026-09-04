@@ -1,8 +1,22 @@
-# GOWAY v1.8.0
+# GOWAY v1.8.1
 
 GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具，支持 HTTP 和完整 SOCKS5 (TCP + UDP) 协议，具备浏览器指纹伪装、0-RTT 多路复用 (Mux)、QUIC 弱网抗丢包传输、Cloudflare CDN 边缘接入与 PGO 机器码级性能优化。
 
 ## 版本历史
+
+### v1.8.1 (2026-09-04) - Mux 会话预占时序强化、池化内存所有权竞态消除与并发安全加固
+
+#### 核心优化与 Bug 修复
+
+| 优化项 | 说明 | 效果 |
+|---|---|---|
+| **Mux Session 预占原子前置 (P0)** | `GetSession()` 在池锁内选定会话后立即原子执行 `activeStreams.Add(1)` 预占计数 | **消除建流与注册间的竞态空窗期，高并发场景下各物理会话负载分配绝对均衡，杜绝倾斜** |
+| **activeStreams CAS 极限防负保护 (P0)** | `MuxClientSession` 引入 CAS 循环递减 `decrementActiveStreams()`，下界到达 `<= 0` 时恒定锁定在 0 | **彻底消除计数器异常漂移导致负数的数学可能性，保证调度比较绝对准确** |
+| **Per-Stream `readMu` 内存所有权保护 (P0)** | 为 `MuxStream` 增加独立的 `readMu sync.Mutex` 保护当前数据帧与读取生命周期 | **杜绝 Reader 拷贝中途 Closer 提前归还 `curFrame` 到 `BufPool` 的 use-after-recycle 与数据竞争** |
+| **流关闭后丢弃新帧与未读队列安全回收 (P1)** | 流在关闭状态下若接收到 channel 交付的新帧立即释放归还，`cleanup()` 安全排空剩余全部未读帧 | **保证池化 buffer 全生命周期零泄漏、零重复释放（double free），内存绝对安全** |
+| **SendFrame 会话有效性与指针防御 (P1)** | 会话销毁或连接未初始化边界下对 `wsConn` 与 `BufPool` 增加严密校验 | **增强边界异常情况下的系统鲁棒性，彻底杜绝 nil pointer dereference 异常** |
+
+---
 
 ### v1.8.0 (2026-09-04) - Mux最少活跃流负载调度、ConnPool事件驱动即时补货与生产性能加固
 

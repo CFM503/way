@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	Version        = "1.8.0"
+	Version        = "1.8.1"
 	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -2442,6 +2442,7 @@ type MuxStream struct {
 	queuedBytes int64
 	hasSpace    chan struct{}
 	onClose     func()
+	readMu      sync.Mutex
 }
 
 func newMuxStream(id uint32, session MuxSessionInterface) *MuxStream {
@@ -2554,33 +2555,64 @@ func (s *MuxStream) QueuedBytes() int64 {
 
 func (s *MuxStream) Read(p []byte) (n int, err error) {
 	for {
+		s.readMu.Lock()
 		if s.readPos < len(s.readBuf) {
 			n = copy(p, s.readBuf[s.readPos:])
 			s.readPos += n
-			s.consumedBytes(n)
 			if s.readPos >= len(s.readBuf) {
 				s.curFrame.release()
 				s.readBuf = nil
 				s.readPos = 0
 			}
+			s.readMu.Unlock()
+			s.consumedBytes(n)
 			return n, nil
 		}
 		if s.readClosed.Load() && len(s.readChan) == 0 {
+			s.readMu.Unlock()
 			return 0, io.EOF
 		}
+		s.readMu.Unlock()
+
 		select {
 		case <-s.closed:
+			s.readMu.Lock()
+			s.curFrame.release()
+			s.readBuf = nil
+			s.readPos = 0
+			s.readMu.Unlock()
 			if s.readClosed.Load() {
 				return 0, io.EOF
 			}
 			return 0, errors.New("stream closed")
 		case frame, ok := <-s.readChan:
+			select {
+			case <-s.closed:
+				frame.release()
+				s.readMu.Lock()
+				s.curFrame.release()
+				s.readBuf = nil
+				s.readPos = 0
+				s.readMu.Unlock()
+				if s.readClosed.Load() {
+					return 0, io.EOF
+				}
+				return 0, errors.New("stream closed")
+			default:
+			}
 			if !ok || frame.data == nil {
+				s.readMu.Lock()
+				s.curFrame.release()
+				s.readBuf = nil
+				s.readPos = 0
+				s.readMu.Unlock()
 				return 0, io.EOF
 			}
+			s.readMu.Lock()
 			s.curFrame = frame
 			s.readBuf = frame.data
 			s.readPos = 0
+			s.readMu.Unlock()
 		}
 	}
 }
@@ -2607,12 +2639,16 @@ func (s *MuxStream) Write(p []byte) (n int, err error) {
 }
 
 func (s *MuxStream) cleanup() {
+	s.readMu.Lock()
 	s.curFrame.release()
 	s.readBuf = nil
 	s.readPos = 0
+	s.readMu.Unlock()
+
 	s.bufMu.Lock()
 	s.queuedBytes = 0
 	s.bufMu.Unlock()
+
 	for {
 		select {
 		case f := <-s.readChan:
@@ -2670,6 +2706,19 @@ func (s *MuxClientSession) ActiveStreams() int64 {
 		return 0
 	}
 	return cnt
+}
+
+func (s *MuxClientSession) decrementActiveStreams() {
+	for {
+		cur := s.activeStreams.Load()
+		if cur <= 0 {
+			s.activeStreams.Store(0)
+			return
+		}
+		if s.activeStreams.CompareAndSwap(cur, cur-1) {
+			return
+		}
+	}
 }
 
 func newMuxClientSession(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, cfg *Config) *MuxClientSession {
@@ -2754,6 +2803,10 @@ func (s *MuxClientSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 	case <-s.closed:
 		return errors.New("mux session closed")
 	default:
+	}
+
+	if s.wsConn == nil || s.cfg == nil || s.cfg.BufPool == nil {
+		return nil
 	}
 
 	payloadLen := len(payload)
@@ -2918,6 +2971,7 @@ func (p *MuxClientPool) GetSession() (*MuxClientSession, error) {
 	// If at least one session is active, select the least loaded (least active streams, with round-robin tie-breaking)
 	if len(p.sessions) > 0 {
 		sess := p.pickBestSessionLocked()
+		sess.activeStreams.Add(1)
 
 		// If pool capacity is not yet reached, trigger background dial to scale up
 		if !p.closed && len(p.sessions)+p.dialing < p.maxSess {
@@ -2946,6 +3000,7 @@ func (p *MuxClientPool) GetSession() (*MuxClientSession, error) {
 		// If another goroutine succeeded while we were dialing, use that
 		if len(p.sessions) > 0 {
 			s := p.pickBestSessionLocked()
+			s.activeStreams.Add(1)
 			p.mu.Unlock()
 			return s, nil
 		}
@@ -2960,6 +3015,7 @@ func (p *MuxClientPool) GetSession() (*MuxClientSession, error) {
 	}
 
 	p.sessions = append(p.sessions, sess)
+	sess.activeStreams.Add(1)
 	p.mu.Unlock()
 	return sess, nil
 }
@@ -3037,13 +3093,12 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 	streamID := atomic.AddUint32(&session.nextStreamID, 1)
 	stream := newMuxStream(streamID, session)
 	stream.onClose = func() {
-		session.activeStreams.Add(-1)
+		session.decrementActiveStreams()
 	}
 
 	session.streamsMu.Lock()
 	session.streams[streamID] = stream
 	session.streamsMu.Unlock()
-	session.activeStreams.Add(1)
 
 	defer stream.Close()
 
