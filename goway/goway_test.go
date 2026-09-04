@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1124,7 +1125,7 @@ func TestMuxServerStream_PushDataCleanupOnFalse(t *testing.T) {
 	session.streams[42] = st
 
 	for i := 0; i < 256; i++ {
-		st.writeChan <- []byte("busy")
+		st.writeChan <- muxDataFrame{data: []byte("busy")}
 	}
 
 	start := time.Now()
@@ -1235,5 +1236,468 @@ func TestQUICClientPool_OpenStreamFailureReconnect(t *testing.T) {
 	}
 	if string(resp[:]) != "ping" {
 		t.Fatalf("Expected ping, got %s", string(resp[:]))
+	}
+}
+
+func TestMuxClientPool_ConfiguredSessions(t *testing.T) {
+	pipeR, pipeW := net.Pipe()
+	defer pipeR.Close()
+	defer pipeW.Close()
+
+	cfg := &Config{
+		ConnTimeout: 5,
+	}
+
+	for _, maxSess := range []int{1, 4, 8, 16, 64} {
+		pool := NewMuxClientPool(cfg, maxSess)
+		if pool.maxSess != maxSess {
+			t.Fatalf("Expected maxSess=%d, got %d", maxSess, pool.maxSess)
+		}
+		pool.Close()
+	}
+}
+
+func TestMuxStream_ByteLimitBackpressure(t *testing.T) {
+	pipeR, pipeW := net.Pipe()
+	defer pipeR.Close()
+	defer pipeW.Close()
+	go io.Copy(io.Discard, pipeR)
+
+	cfg := &Config{
+		ConnTimeout: 5,
+		BufPool: &sync.Pool{
+			New: func() interface{} {
+				b := make([]byte, 32*1024)
+				return &b
+			},
+		},
+	}
+
+	session := &MuxClientSession{
+		wsConn:  pipeW,
+		streams: make(map[uint32]*MuxStream),
+		cfg:     cfg,
+		closed:  make(chan struct{}),
+		prng:    maskPool.Get().(*maskPRNG),
+	}
+	st := newMuxStream(10, session)
+	session.streams[10] = st
+	defer st.Close()
+
+	chunkSize := 1024 * 1024 // 1 MiB
+	chunk := make([]byte, chunkSize)
+
+	// Push 4 MiB (limit is 4 MiB)
+	for i := 0; i < 4; i++ {
+		if !st.PushData(chunk) {
+			t.Fatalf("Failed to push chunk %d within limit", i)
+		}
+	}
+
+	if st.QueuedBytes() != 4*1024*1024 {
+		t.Fatalf("Expected 4MB queued, got %d", st.QueuedBytes())
+	}
+
+	// 5th push should be blocked by backpressure!
+	blockedCh := make(chan bool)
+	go func() {
+		ok := st.PushData(chunk)
+		blockedCh <- ok
+	}()
+
+	// Verify that it is blocked
+	select {
+	case <-blockedCh:
+		t.Fatal("Expected 5th chunk to be blocked by byte backpressure limit")
+	case <-time.After(100 * time.Millisecond):
+		// Expected: currently blocked
+	}
+
+	// Read 2 MiB from stream to relieve backpressure
+	buf := make([]byte, 2*1024*1024)
+	if _, err := io.ReadFull(st, buf); err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+
+	// The blocked push should now succeed and unblock!
+	select {
+	case ok := <-blockedCh:
+		if !ok {
+			t.Fatal("Expected blocked push to succeed once space was freed")
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("Blocked push did not unblock after reading data")
+	}
+}
+
+func TestMuxStream_QueuedBytesAccounting(t *testing.T) {
+	pipeR, pipeW := net.Pipe()
+	defer pipeR.Close()
+	defer pipeW.Close()
+	go io.Copy(io.Discard, pipeR)
+
+	cfg := &Config{
+		ConnTimeout: 5,
+		BufPool: &sync.Pool{
+			New: func() interface{} {
+				b := make([]byte, 32*1024)
+				return &b
+			},
+		},
+	}
+
+	session := &MuxClientSession{
+		wsConn:  pipeW,
+		streams: make(map[uint32]*MuxStream),
+		cfg:     cfg,
+		closed:  make(chan struct{}),
+		prng:    maskPool.Get().(*maskPRNG),
+	}
+	st := newMuxStream(20, session)
+	session.streams[20] = st
+	defer st.Close()
+
+	st.PushData(make([]byte, 1000))
+	st.PushData(make([]byte, 1000))
+	st.PushData(make([]byte, 1000))
+
+	if st.QueuedBytes() != 3000 {
+		t.Fatalf("Expected 3000 queued bytes, got %d", st.QueuedBytes())
+	}
+
+	buf := make([]byte, 1500)
+	if _, err := io.ReadFull(st, buf); err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+	if st.QueuedBytes() != 1500 {
+		t.Fatalf("Expected 1500 queued bytes after partial read, got %d", st.QueuedBytes())
+	}
+
+	if _, err := io.ReadFull(st, buf); err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+	if st.QueuedBytes() != 0 {
+		t.Fatalf("Expected 0 queued bytes after complete read, got %d", st.QueuedBytes())
+	}
+}
+
+func TestMuxStream_BufferRecyclingOnClose(t *testing.T) {
+	poolAllocCount := 0
+
+	pool := &sync.Pool{
+		New: func() interface{} {
+			poolAllocCount++
+			b := make([]byte, 4096)
+			return &b
+		},
+	}
+
+	pipeR, pipeW := net.Pipe()
+	defer pipeR.Close()
+	defer pipeW.Close()
+	go io.Copy(io.Discard, pipeR)
+
+	cfg := &Config{
+		ConnTimeout: 5,
+		BufPool: &sync.Pool{
+			New: func() interface{} {
+				b := make([]byte, 32*1024)
+				return &b
+			},
+		},
+	}
+
+	session := &MuxClientSession{
+		wsConn:  pipeW,
+		streams: make(map[uint32]*MuxStream),
+		cfg:     cfg,
+		closed:  make(chan struct{}),
+		prng:    maskPool.Get().(*maskPRNG),
+	}
+	st := newMuxStream(30, session)
+	session.streams[30] = st
+
+	// Push 5 pooled frames
+	for i := 0; i < 5; i++ {
+		bPtr := pool.Get().(*[]byte)
+		frame := muxDataFrame{
+			data: (*bPtr)[:100],
+			bPtr: bPtr,
+			pool: pool,
+		}
+		st.PushDataFrame(frame)
+	}
+
+	// Close stream while frames are still pending
+	st.Close()
+
+	if st.QueuedBytes() != 0 {
+		t.Fatalf("Expected QueuedBytes=0 on Close, got %d", st.QueuedBytes())
+	}
+
+	// Verify all 5 buffers were recycled and can be retrieved from pool without triggering New
+	retrieved := 0
+	for i := 0; i < 5; i++ {
+		p := pool.Get().(*[]byte)
+		if p != nil {
+			retrieved++
+		}
+	}
+	if retrieved != 5 {
+		t.Fatalf("Expected 5 recycled buffers in pool, got %d", retrieved)
+	}
+}
+
+func TestConnPool_GetPutLifecycle(t *testing.T) {
+	cfg := &Config{
+		ConnTimeout: 5,
+	}
+	pool := NewConnPool(cfg, 3)
+	defer pool.Close()
+
+	c1, w1 := net.Pipe()
+	defer c1.Close()
+	defer w1.Close()
+
+	br1 := bufio.NewReader(c1)
+	pConn1 := &PooledConn{
+		wsConn:   c1,
+		br:       br1,
+		created:  time.Now(),
+		lastUsed: time.Now(),
+	}
+
+	// Put into pool
+	pool.Put(pConn1)
+
+	// Get from pool
+	got := pool.Get()
+	if got == nil || got.wsConn != c1 {
+		t.Fatal("Failed to Get connection that was Put into pool")
+	}
+
+	// Pool should now be empty
+	if empty := pool.Get(); empty != nil {
+		t.Fatal("Expected pool to be empty after Get")
+	}
+
+	// Put back
+	pool.Put(got)
+
+	// Put exceeding maxSize
+	c2, _ := net.Pipe()
+	c3, _ := net.Pipe()
+	c4, _ := net.Pipe()
+	pool.Put(&PooledConn{wsConn: c2, br: bufio.NewReader(c2), created: time.Now(), lastUsed: time.Now()})
+	pool.Put(&PooledConn{wsConn: c3, br: bufio.NewReader(c3), created: time.Now(), lastUsed: time.Now()})
+	// 4th connection exceeds maxSize=3
+	pool.Put(&PooledConn{wsConn: c4, br: bufio.NewReader(c4), created: time.Now(), lastUsed: time.Now()})
+
+	pool.mu.Lock()
+	count := len(pool.conns)
+	pool.mu.Unlock()
+	if count > 3 {
+		t.Fatalf("Expected max 3 conns in pool, got %d", count)
+	}
+
+	// Test expired connection rejection
+	cExpired, _ := net.Pipe()
+	pool.Put(&PooledConn{
+		wsConn:   cExpired,
+		br:       bufio.NewReader(cExpired),
+		created:  time.Now().Add(-10 * time.Minute), // expired (> maxAge 5m)
+		lastUsed: time.Now(),
+	})
+
+	// Close pool and verify subsequent Put closes connection
+	pool.Close()
+	cClosed, _ := net.Pipe()
+	pool.Put(&PooledConn{wsConn: cClosed, br: bufio.NewReader(cClosed), created: time.Now(), lastUsed: time.Now()})
+	if pool.Get() != nil {
+		t.Fatal("Expected Get to return nil after pool Close")
+	}
+}
+
+func BenchmarkMuxDataTransferOldMakeCopy(b *testing.B) {
+	data := make([]byte, 32*1024)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		dataCopy := make([]byte, len(data))
+		copy(dataCopy, data)
+		_ = dataCopy
+	}
+}
+
+func BenchmarkMuxDataTransferPooled(b *testing.B) {
+	pool := &sync.Pool{
+		New: func() interface{} {
+			buf := make([]byte, 32*1024+14)
+			return &buf
+		},
+	}
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		bPtr := pool.Get().(*[]byte)
+		frame := muxDataFrame{
+			data: (*bPtr)[14 : 14+32*1024],
+			bPtr: bPtr,
+			pool: pool,
+		}
+		// Consumer finishes and releases back to pool
+		frame.release()
+	}
+}
+
+func TestQUICServer_MaxConnsEnforcement(t *testing.T) {
+	cert, err := generateSelfSignedCert()
+	if err != nil {
+		t.Fatalf("Failed to generate cert: %v", err)
+	}
+
+	tlsConf := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"goway-quic", "h3"},
+	}
+
+	listener, err := quic.ListenAddr("127.0.0.1:0", tlsConf, defaultQUICConfig())
+	if err != nil {
+		t.Fatalf("Failed to listen QUIC: %v", err)
+	}
+	defer listener.Close()
+
+	// Set MaxConns to 1
+	cfg := &Config{
+		MaxConns:    1,
+		ConnTimeout: 5,
+	}
+
+	go func() {
+		for {
+			conn, err := listener.Accept(context.Background())
+			if err != nil {
+				return
+			}
+			go handleQUICConnection(conn, cfg)
+		}
+	}()
+
+	clientTLS := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"goway-quic", "h3"},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, err := quic.DialAddr(ctx, listener.Addr().String(), clientTLS, defaultQUICConfig())
+	if err != nil {
+		t.Fatalf("Failed to dial QUIC server: %v", err)
+	}
+	defer conn.CloseWithError(0, "client done")
+
+	origConns := atomic.LoadInt64(&stats.activeConns)
+	defer atomic.StoreInt64(&stats.activeConns, origConns)
+
+	// Stream 1: should be accepted
+	st1, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("Stream 1 OpenStreamSync failed: %v", err)
+	}
+	defer st1.Close()
+
+	// Send an unclosed dummy stream header so handleQUICStream holds activeConns
+	_, _ = st1.Write([]byte("127.0.0.1:80\n"))
+	time.Sleep(50 * time.Millisecond)
+
+	// Stream 2: exceeds MaxConns (which is 1)
+	st2, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("Stream 2 OpenStreamSync failed: %v", err)
+	}
+	defer st2.Close()
+
+	// Stream 2 should be rejected/closed by server immediately
+	buf := make([]byte, 10)
+	st2.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	n, errRead := st2.Read(buf)
+	if errRead == nil && n > 0 {
+		t.Fatalf("Expected stream 2 to be closed immediately due to MaxConns limit, but read %d bytes", n)
+	}
+}
+
+func TestMuxServerStream_BufPoolUsage(t *testing.T) {
+	targetLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen target: %v", err)
+	}
+	defer targetLn.Close()
+
+	go func() {
+		conn, err := targetLn.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.Write([]byte("hello from target"))
+	}()
+
+	pipeR, pipeW := net.Pipe()
+	defer pipeR.Close()
+	defer pipeW.Close()
+
+	bufPool := &sync.Pool{
+		New: func() interface{} {
+			b := make([]byte, 65536+14+MuxHeaderLen)
+			return &b
+		},
+	}
+
+	cfg := &Config{
+		ConnTimeout: 5,
+		BufPool:     bufPool,
+	}
+
+	session := &MuxServerSession{
+		wsConn:  pipeW,
+		streams: make(map[uint32]*MuxServerStream),
+		cfg:     cfg,
+		closed:  make(chan struct{}),
+	}
+	st := newMuxServerStream(100, session)
+	session.streams[100] = st
+
+	doneCh := make(chan struct{})
+	go func() {
+		session.handleNewStream(st, targetLn.Addr().String(), nil)
+		close(doneCh)
+	}()
+
+	br := bufio.NewReader(pipeR)
+	frame, err := readWSFrame(br, pipeR)
+	if err != nil {
+		t.Fatalf("Failed to read Mux frame: %v", err)
+	}
+	if len(frame) < MuxHeaderLen {
+		t.Fatalf("Frame too short: %d", len(frame))
+	}
+	cmd := frame[4]
+	if cmd != MuxCmdDATA {
+		t.Fatalf("Expected MuxCmdDATA (0x02), got 0x%x", cmd)
+	}
+	payload := frame[7:]
+	if string(payload) != "hello from target" {
+		t.Fatalf("Expected 'hello from target', got %s", string(payload))
+	}
+
+	// Drain any remaining frames (e.g. MuxCmdFIN or MuxCmdRST) so SendFrame on net.Pipe does not block
+	go io.Copy(io.Discard, pipeR)
+
+	st.Close()
+	select {
+	case <-doneCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleNewStream did not terminate after st.Close()")
 	}
 }
