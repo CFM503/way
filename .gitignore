@@ -1,5 +1,6 @@
 # Compiled binaries
 *.exe
+goway_linux
 goway/goway*-linux-*
 goway/goway*-arm*
 goway/goway*-windows-*
