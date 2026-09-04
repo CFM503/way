@@ -1,8 +1,21 @@
-# GOWAY v1.7.4
+# GOWAY v1.7.5
 
 GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具，支持 HTTP 和完整 SOCKS5 (TCP + UDP) 协议，具备浏览器指纹伪装、0-RTT 多路复用 (Mux)、QUIC 弱网抗丢包传输、Cloudflare CDN 边缘接入与 PGO 机器码级性能优化。
 
 ## 版本历史
+
+### v1.7.5 (2026-09-04) - 关键缺陷修复与稳定性加固
+
+#### 核心优化与 Bug 修复
+
+| 优化项 | 说明 | 效果 |
+|---|---|---|
+| **修复 MUX 100% CPU 死循环** | 修复服务端 `handleNewStream` 在 EOF/断连时缺失 `return` 的严重缺陷 | **彻底杜绝单核 100% CPU 盲等空转，确保流资源与内存及时释放** |
+| **TLS 指纹切片安全防护** | 为 `pickProfileTLSConfig()` 增加空切片边界检查与默认 TLS 兜底配置 | **杜绝极端或未初始化情况下 `mrand.Intn(0)` 导致的进程崩溃闪退** |
+| **HTTP CONNECT 端口容错** | 为缺失 `:port` 的标准 HTTP CONNECT 代理请求增加默认 443 端口 fallback | **增强对各类爬虫、命令行工具和第三方客户端的协议兼容性** |
+| **自动化全栈测试套件** | 建立 `goway_test.go`，覆盖加解密、协议握手、分帧及双进程真实联调 | **提供可靠的端到端质量保障与快速回归测试能力** |
+
+---
 
 ### v1.7.4 (2026-09-04) - PGO (Profile-Guided Optimization) 终极编译调优与单文件架构固化
 

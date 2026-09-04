@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	Version        = "1.7.4"
+	Version        = "1.7.5"
 	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -1000,6 +1000,9 @@ func initProfileTLSConfigs(base *tls.Config) {
 }
 
 func pickProfileTLSConfig() *tls.Config {
+	if len(profileTLSConfigs) == 0 {
+		return &tls.Config{InsecureSkipVerify: true}
+	}
 	return profileTLSConfigs[mrand.Intn(len(profileTLSConfigs))]
 }
 
@@ -1945,11 +1948,11 @@ func main() {
 	initWindowsConsole()
 	defer saveLogFile()
 
-	pFlag := flag.String("p", "", "Listen Address (e.g. :8080)")
-	upFlag := flag.String("up", "", "Upstream WebSocket URL")
+	pFlag := flag.String("p", "", "Listen Address (e.g. :8080 or 0.0.0.0:8080)")
+	upFlag := flag.String("up", "", "Upstream WebSocket/QUIC URL (e.g. ws://host:port, wss://host:port, quic://host:port)")
 	kFlag := flag.String("k", "", "Authentication Key")
-	logFlag := flag.String("log", "INFO", "Log Level")
-	fakeHostFlag := flag.String("fakehost", "", "Spoofing Hostname")
+	logFlag := flag.String("log", "INFO", "Log Level (DEBUG, INFO, WARN, ERROR)")
+	fakeHostFlag := flag.String("fakehost", "", "Spoofing Hostname / SNI for Cloudflare CDN")
 	wFlag := flag.Int("W", 64, "App Buffer Size in KB (default 64KB)")
 	noDelayFlag := flag.Bool("no-tcp-nodelay", false, "Disable TCP_NODELAY")
 	keepAliveFlag := flag.Bool("no-tcp-keepalive", false, "Disable TCP KeepAlive")
@@ -3036,6 +3039,7 @@ func (s *MuxServerSession) handleNewStream(st *MuxServerStream, targetStr string
 			} else {
 				s.SendFrame(st.id, MuxCmdRST, nil)
 			}
+			return
 		}
 	}
 }
@@ -3910,6 +3914,9 @@ func handleClient(localConn net.Conn, cfg *Config) {
 				}
 				targetHost = h
 				targetPort = p
+			} else {
+				targetHost = urlPart
+				targetPort = "443"
 			}
 			cfg.HeaderBufPool.Put(restPtr)
 			initialPayload = nil
