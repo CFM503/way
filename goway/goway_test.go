@@ -3,7 +3,9 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -14,6 +16,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/quic-go/quic-go"
 )
 
 func TestRFC6455AcceptKey(t *testing.T) {
@@ -615,3 +619,621 @@ func TestViolentStressSimulation(t *testing.T) {
 		float64(m.TotalAlloc)/1024/1024, float64(m.HeapInuse)/1024/1024, m.NumGC)
 }
 
+func TestMuxClientSession_CloseDeadlock(t *testing.T) {
+	pipeR, pipeW := net.Pipe()
+	defer pipeR.Close()
+	go io.Copy(io.Discard, pipeR)
+
+	cfg := &Config{
+		Crypto:      NewCrypto("test-key"),
+		ConnTimeout: 5,
+		BufPool: &sync.Pool{
+			New: func() interface{} {
+				b := make([]byte, 32*1024)
+				return &b
+			},
+		},
+	}
+
+	session := &MuxClientSession{
+		wsConn:  pipeW,
+		streams: make(map[uint32]*MuxStream),
+		cfg:     cfg,
+		closed:  make(chan struct{}),
+		prng:    maskPool.Get().(*maskPRNG),
+	}
+
+	for id := uint32(1); id <= 10; id++ {
+		st := newMuxStream(id, session)
+		session.streams[id] = st
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			session.Close()
+		}()
+	}
+
+	doneCh := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(doneCh)
+	}()
+
+	select {
+	case <-doneCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Deadlock detected in MuxClientSession.Close()!")
+	}
+
+	session.Close()
+	session.Close()
+}
+
+func TestMuxStream_PushDataTimeout(t *testing.T) {
+	pipeR, pipeW := net.Pipe()
+	defer pipeR.Close()
+	defer pipeW.Close()
+	go io.Copy(io.Discard, pipeR)
+
+	cfg := &Config{
+		ConnTimeout: 5,
+		BufPool: &sync.Pool{
+			New: func() interface{} {
+				b := make([]byte, 32*1024)
+				return &b
+			},
+		},
+	}
+
+	session := &MuxClientSession{
+		wsConn:  pipeW,
+		streams: make(map[uint32]*MuxStream),
+		cfg:     cfg,
+		closed:  make(chan struct{}),
+		prng:    maskPool.Get().(*maskPRNG),
+	}
+	st := newMuxStream(1, session)
+	session.streams[1] = st
+
+	for i := 0; i < 128; i++ {
+		if !st.PushData([]byte("test")) {
+			t.Fatalf("PushData failed early at index %d", i)
+		}
+	}
+
+	start := time.Now()
+	ok := st.PushData([]byte("overflow"))
+	elapsed := time.Since(start)
+
+	if ok {
+		t.Fatal("Expected false from PushData on overflow timeout, got true")
+	}
+	if elapsed < 2*time.Second || elapsed > 4*time.Second {
+		t.Logf("PushData timed out in %v (expected ~3s)", elapsed)
+	}
+}
+
+func TestValidateWSHandshakeResponse_Detailed(t *testing.T) {
+	cases := []struct {
+		name    string
+		resp    string
+		wantErr bool
+		errSub  string
+	}{
+		{
+			name:    "Valid 101 Switching Protocols",
+			resp:    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+			wantErr: false,
+		},
+		{
+			name:    "HTTP 200 OK (Reverse proxy / CDN intercept)",
+			resp:    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+			wantErr: true,
+			errSub:  "200 OK",
+		},
+		{
+			name:    "HTTP 301 Redirect",
+			resp:    "HTTP/1.1 301 Moved Permanently\r\nLocation: https://example.com/\r\n\r\n",
+			wantErr: true,
+			errSub:  "redirected with HTTP 301",
+		},
+		{
+			name:    "HTTP 400 Bad Request",
+			resp:    "HTTP/1.1 400 Bad Request\r\n\r\n",
+			wantErr: true,
+			errSub:  "HTTP 400 Bad Request",
+		},
+		{
+			name:    "HTTP 403 Forbidden",
+			resp:    "HTTP/1.1 403 Forbidden\r\n\r\n",
+			wantErr: true,
+			errSub:  "HTTP 403 Forbidden",
+		},
+		{
+			name:    "HTTP 502 Bad Gateway",
+			resp:    "HTTP/1.1 502 Bad Gateway\r\n\r\n",
+			wantErr: true,
+			errSub:  "HTTP 502 Bad Gateway",
+		},
+		{
+			name:    "Malformed Response",
+			resp:    "GARBAGE_DATA\r\n\r\n",
+			wantErr: true,
+			errSub:  "malformed",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateWSHandshakeResponse([]byte(tc.resp))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("Expected error containing %q, got nil", tc.errSub)
+				}
+				if !strings.Contains(err.Error(), tc.errSub) {
+					t.Fatalf("Expected error containing %q, got %v", tc.errSub, err)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("Expected success, got %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestIsLocalTarget_AllVariants(t *testing.T) {
+	locals := []string{
+		"localhost", "LocalHost", "127.0.0.1", "127.0.0.100", "::1", "[::1]",
+		"0.0.0.0", "::", "10.0.0.1", "10.254.1.1", "172.16.0.1", "172.31.255.254",
+		"192.168.0.1", "192.168.100.200", "169.254.1.1", "fe80::1", "fc00::1", "fd00::1",
+		"::ffff:127.0.0.1", "::ffff:192.168.1.1",
+	}
+	for _, a := range locals {
+		if !isLocalTarget(a) {
+			t.Errorf("isLocalTarget(%q) = false, want true", a)
+		}
+	}
+
+	nonLocals := []string{
+		"1.1.1.1", "8.8.8.8", "172.15.255.255", "172.32.0.1", "203.0.113.1",
+		"google.com", "example.com", "::ffff:8.8.8.8",
+	}
+	for _, a := range nonLocals {
+		if isLocalTarget(a) {
+			t.Errorf("isLocalTarget(%q) = true, want false", a)
+		}
+	}
+}
+
+func TestLargeFramePoolCap(t *testing.T) {
+	largeBuf := make([]byte, 128*1024)
+	putLargeFrame(&largeBuf)
+
+	got := largeFramePool.Get().(*[]byte)
+	if cap(*got) > maxPooledFrameCap {
+		t.Fatalf("largeFramePool retained buffer exceeding cap: %d bytes", cap(*got))
+	}
+}
+
+func TestHTTPProxyTCPFragmentation(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+
+	cfg := &Config{
+		HeaderBufPool: &sync.Pool{
+			New: func() interface{} {
+				b := make([]byte, MaxHeaderSize)
+				return &b
+			},
+		},
+		ConnTimeout: 2,
+	}
+
+	doneCh := make(chan struct{})
+	go func() {
+		defer close(doneCh)
+		var buf [1]byte
+		n, err := serverConn.Read(buf[:])
+		if err != nil || n == 0 {
+			t.Errorf("Failed to read initial byte: %v", err)
+			return
+		}
+		if buf[0] != 'C' {
+			t.Errorf("Unexpected first byte: %c", buf[0])
+			return
+		}
+
+		restPtr := cfg.HeaderBufPool.Get().(*[]byte)
+		restBuf := *restPtr
+		restBuf[0] = buf[0]
+		totalRead := 1
+
+		for {
+			if bytes.Contains(restBuf[:totalRead], []byte("\r\n\r\n")) ||
+				bytes.Contains(restBuf[:totalRead], []byte("\n\n")) {
+				break
+			}
+			if totalRead >= len(restBuf) {
+				t.Errorf("Buffer overflow")
+				return
+			}
+			n, readErr := serverConn.Read(restBuf[totalRead:])
+			if n > 0 {
+				totalRead += n
+			}
+			if readErr != nil {
+				break
+			}
+		}
+
+		header := string(restBuf[:totalRead])
+		if !strings.HasPrefix(header, "CONNECT example.com:443 HTTP/1.1") {
+			t.Errorf("Parsed header mismatch: %q", header)
+		}
+		if !strings.Contains(header, "Host: example.com:443") {
+			t.Errorf("Missing host in parsed header: %q", header)
+		}
+	}()
+
+	go func() {
+		defer clientConn.Close()
+		clientConn.Write([]byte("CO"))
+		time.Sleep(20 * time.Millisecond)
+		clientConn.Write([]byte("NNECT example.com:443 HTTP/1.1\r\n"))
+		time.Sleep(20 * time.Millisecond)
+		clientConn.Write([]byte("Host: example.com:443\r\n\r\n"))
+	}()
+
+	select {
+	case <-doneCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Timeout waiting for fragmented HTTP request read")
+	}
+}
+
+func TestSOCKS5UDPAssociateTruncated(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	cfg := &Config{
+		ConnTimeout: 2,
+	}
+
+	doneCh := make(chan struct{})
+	go func() {
+		defer close(doneCh)
+		handleClient(serverConn, cfg)
+	}()
+
+	clientConn.Write([]byte{0x05, 0x01, 0x00})
+	var hs [2]byte
+	io.ReadFull(clientConn, hs[:])
+
+	// Truncated UDP associate request: atyp=1, but closed immediately without IP or port
+	clientConn.Write([]byte{0x05, 0x03, 0x00, 0x01})
+	clientConn.Close()
+
+	select {
+	case <-doneCh:
+		// Succeeded in safely aborting without hang
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleClient did not abort on truncated UDP ASSOCIATE")
+	}
+}
+
+func TestQUICClientPool_100ConcurrentGetStream(t *testing.T) {
+	cert, err := generateSelfSignedCert()
+	if err != nil {
+		t.Fatalf("Failed to generate cert: %v", err)
+	}
+
+	tlsConf := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"goway-quic", "h3"},
+	}
+
+	listener, err := quic.ListenAddr("127.0.0.1:0", tlsConf, defaultQUICConfig())
+	if err != nil {
+		t.Fatalf("Failed to listen QUIC: %v", err)
+	}
+	defer listener.Close()
+
+	go func() {
+		for {
+			conn, err := listener.Accept(context.Background())
+			if err != nil {
+				return
+			}
+			go func(c quic.Connection) {
+				for {
+					stream, err := c.AcceptStream(context.Background())
+					if err != nil {
+						return
+					}
+					go func(st quic.Stream) {
+						defer st.Close()
+						var b [4]byte
+						if _, err := io.ReadFull(st, b[:]); err == nil {
+							st.Write(b[:])
+						}
+					}(stream)
+				}
+			}(conn)
+		}
+	}()
+
+	cfg := &Config{
+		Upstream:    "quic://" + listener.Addr().String(),
+		ConnTimeout: 5,
+		VerifySSL:   false,
+	}
+
+	pool, err := NewQUICClientPool(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create QUICClientPool: %v", err)
+	}
+	defer pool.Close()
+
+	const concurrency = 100
+	var wg sync.WaitGroup
+	errCh := make(chan error, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			stream, err := pool.GetStream()
+			if err != nil {
+				errCh <- fmt.Errorf("client %d GetStream failed: %v", idx, err)
+				return
+			}
+			defer stream.Close()
+
+			msg := []byte("ping")
+			if _, err := stream.Write(msg); err != nil {
+				errCh <- fmt.Errorf("client %d Write failed: %v", idx, err)
+				return
+			}
+			var resp [4]byte
+			if _, err := io.ReadFull(stream, resp[:]); err != nil {
+				errCh <- fmt.Errorf("client %d ReadFull failed: %v", idx, err)
+				return
+			}
+			if string(resp[:]) != "ping" {
+				errCh <- fmt.Errorf("client %d got bad response: %s", idx, string(resp[:]))
+				return
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Fatal(err)
+	}
+
+	pool.mu.Lock()
+	conn := pool.conn
+	pool.mu.Unlock()
+	if conn == nil {
+		t.Fatal("Expected pool.conn to be non-nil after successful connections")
+	}
+}
+
+func TestQUICClientPool_DialFailure(t *testing.T) {
+	cfg := &Config{
+		Upstream:    "quic://127.0.0.1:59999",
+		ConnTimeout: 1,
+		VerifySSL:   false,
+	}
+
+	pool, err := NewQUICClientPool(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create QUICClientPool: %v", err)
+	}
+	defer pool.Close()
+
+	stream, err := pool.GetStream()
+	if err == nil {
+		stream.Close()
+		t.Fatal("Expected GetStream to fail on unreachable address, got nil error")
+	}
+
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if pool.conn != nil {
+		t.Fatal("Expected pool.conn to remain nil on dial failure")
+	}
+	if pool.dialing != nil {
+		t.Fatal("Expected pool.dialing to be cleared on dial failure")
+	}
+}
+
+func TestQUICClientPool_CloseConcurrent(t *testing.T) {
+	cert, err := generateSelfSignedCert()
+	if err != nil {
+		t.Fatalf("Failed to generate cert: %v", err)
+	}
+
+	tlsConf := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"goway-quic", "h3"},
+	}
+
+	listener, err := quic.ListenAddr("127.0.0.1:0", tlsConf, defaultQUICConfig())
+	if err != nil {
+		t.Fatalf("Failed to listen QUIC: %v", err)
+	}
+	defer listener.Close()
+
+	cfg := &Config{
+		Upstream:    "quic://" + listener.Addr().String(),
+		ConnTimeout: 5,
+		VerifySSL:   false,
+	}
+
+	pool, err := NewQUICClientPool(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create QUICClientPool: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			stream, err := pool.GetStream()
+			if err == nil {
+				stream.Close()
+			}
+		}()
+	}
+
+	time.Sleep(5 * time.Millisecond)
+	pool.Close()
+
+	wg.Wait()
+}
+
+func TestMuxServerStream_PushDataCleanupOnFalse(t *testing.T) {
+	pipeR, pipeW := net.Pipe()
+	defer pipeR.Close()
+	defer pipeW.Close()
+	go io.Copy(io.Discard, pipeR)
+
+	cfg := &Config{
+		ConnTimeout: 5,
+		BufPool: &sync.Pool{
+			New: func() interface{} {
+				b := make([]byte, 32*1024)
+				return &b
+			},
+		},
+	}
+
+	session := &MuxServerSession{
+		wsConn:  pipeW,
+		cfg:     cfg,
+		streams: make(map[uint32]*MuxServerStream),
+		closed:  make(chan struct{}),
+	}
+	st := newMuxServerStream(42, session)
+	session.streams[42] = st
+
+	for i := 0; i < 256; i++ {
+		st.writeChan <- []byte("busy")
+	}
+
+	start := time.Now()
+	ok := st.PushData([]byte("overflow"))
+	if ok {
+		t.Fatal("Expected PushData to return false on stall timeout")
+	}
+	if time.Since(start) < 2*time.Second {
+		t.Fatal("Expected PushData to wait for stall timeout")
+	}
+
+	if !ok {
+		session.streamsMu.Lock()
+		delete(session.streams, 42)
+		session.streamsMu.Unlock()
+	}
+
+	session.streamsMu.RLock()
+	_, exists := session.streams[42]
+	session.streamsMu.RUnlock()
+	if exists {
+		t.Fatal("Expected stream 42 to be removed from session.streams after PushData false")
+	}
+}
+
+func TestQUICClientPool_OpenStreamFailureReconnect(t *testing.T) {
+	cert, err := generateSelfSignedCert()
+	if err != nil {
+		t.Fatalf("Failed to generate cert: %v", err)
+	}
+
+	tlsConf := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"goway-quic", "h3"},
+	}
+
+	listener, err := quic.ListenAddr("127.0.0.1:0", tlsConf, defaultQUICConfig())
+	if err != nil {
+		t.Fatalf("Failed to listen QUIC: %v", err)
+	}
+	defer listener.Close()
+
+	go func() {
+		for {
+			conn, err := listener.Accept(context.Background())
+			if err != nil {
+				return
+			}
+			go func(c quic.Connection) {
+				for {
+					stream, err := c.AcceptStream(context.Background())
+					if err != nil {
+						return
+					}
+					go func(st quic.Stream) {
+						defer st.Close()
+						var b [4]byte
+						if _, err := io.ReadFull(st, b[:]); err == nil {
+							st.Write(b[:])
+						}
+					}(stream)
+				}
+			}(conn)
+		}
+	}()
+
+	cfg := &Config{
+		Upstream:    "quic://" + listener.Addr().String(),
+		ConnTimeout: 5,
+		VerifySSL:   false,
+	}
+
+	pool, err := NewQUICClientPool(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create QUICClientPool: %v", err)
+	}
+	defer pool.Close()
+
+	// 1. First stream succeeds
+	st1, err := pool.GetStream()
+	if err != nil {
+		t.Fatalf("Initial GetStream failed: %v", err)
+	}
+	st1.Close()
+
+	// 2. Abruptly close the underlying connection from under the pool
+	pool.mu.Lock()
+	conn := pool.conn
+	pool.mu.Unlock()
+	if conn == nil {
+		t.Fatal("Expected active connection")
+	}
+	_ = conn.CloseWithError(0x02, "simulated abrupt disconnection")
+
+	// 3. Next GetStream detects failure on broken conn, clears pool reference, and reconnects!
+	st2, err := pool.GetStream()
+	if err != nil {
+		t.Fatalf("Reconnected GetStream failed: %v", err)
+	}
+	defer st2.Close()
+
+	if _, err := st2.Write([]byte("ping")); err != nil {
+		t.Fatalf("Write on reconnected stream failed: %v", err)
+	}
+	var resp [4]byte
+	if _, err := io.ReadFull(st2, resp[:]); err != nil {
+		t.Fatalf("Read on reconnected stream failed: %v", err)
+	}
+	if string(resp[:]) != "ping" {
+		t.Fatalf("Expected ping, got %s", string(resp[:]))
+	}
+}

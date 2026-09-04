@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	Version        = "1.7.7"
+	Version        = "1.7.8"
 	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -51,11 +51,11 @@ var (
 	crlfB   = []byte{'\r', '\n'}
 
 	// Pre-allocated static responses (avoid per-connection alloc)
-	socks5OKResp     = []byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
-	http200Resp      = []byte("HTTP/1.1 200 Connection Established\r\n\r\n")
-	http400Resp      = []byte("HTTP/1.1 400 Bad Request\r\n\r\n")
-	wsUpgradePrefix  = []byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ")
-	wsUpgradeSuffix  = []byte("\r\n\r\n")
+	socks5OKResp    = []byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
+	http200Resp     = []byte("HTTP/1.1 200 Connection Established\r\n\r\n")
+	http400Resp     = []byte("HTTP/1.1 400 Bad Request\r\n\r\n")
+	wsUpgradePrefix = []byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ")
+	wsUpgradeSuffix = []byte("\r\n\r\n")
 )
 
 // --- Fast Mask PRNG ---
@@ -159,6 +159,7 @@ func (s *Statistics) Speeds() (up, down float64) {
 	return math.Float64frombits(atomic.LoadUint64(&s.speedUpBits)),
 		math.Float64frombits(atomic.LoadUint64(&s.speedDownBits))
 }
+
 // --- TUI / GUI-Style CLI Implementation ---
 
 var (
@@ -211,24 +212,12 @@ func tuiLogSlice(n int) []string {
 // spaces is a 200-char padding source; sliced instead of strings.Repeat per call.
 const spaces = "                                                                                                                                                                                                        "
 
-func padRight(s string, n int) string {
-	if n <= 0 {
-		return s
-	}
-	if n > len(spaces) {
-		n = len(spaces)
-	}
-	return s + spaces[:n]
-}
-
 func triggerTuiRefresh() {
 	select {
 	case tuiRefreshCh <- struct{}{}:
 	default:
 	}
 }
-
-
 
 func visibleLength(s string) int {
 	inEscape := false
@@ -536,14 +525,13 @@ func tuiRefreshLoop(cfg *Config, shutdown <-chan struct{}) {
 		}
 	}
 }
+
 // --- Crypto ---
 
 const cryptoChunkSize = 262144 // 256KB pre-expanded key chunk (increased from 64KB)
 
 type Crypto struct {
-	keyBytes    []byte
 	expandedKey []byte
-	keyLen      int
 }
 
 func NewCrypto(key string) *Crypto {
@@ -555,9 +543,7 @@ func NewCrypto(key string) *Crypto {
 	// Pre-expand key to cryptoChunkSize + 8 for single-loop bulk XOR (prevents panic at end boundary)
 	ek := bytes.Repeat(hash[:], (cryptoChunkSize+8)/kl+1)[:cryptoChunkSize+8]
 	return &Crypto{
-		keyBytes:    hash[:],
 		expandedKey: ek,
-		keyLen:      kl,
 	}
 }
 
@@ -602,12 +588,10 @@ type Config struct {
 	Mux            bool
 
 	// Internal derived
-	Crypto        *Crypto
-	UserAgent     string
-	DNS           string
-	Resolver      *RemoteResolver
-	BufPool       *sync.Pool
-	HeaderBufPool *sync.Pool
+	Crypto         *Crypto
+	Resolver       *RemoteResolver
+	BufPool        *sync.Pool
+	HeaderBufPool  *sync.Pool
 	TLSBase        *tls.Config
 	MuxPool        *MuxClientPool
 	QUICPool       *QUICClientPool
@@ -834,16 +818,16 @@ func saveLogFile() {
 // that must match each other. Cloudflare cross-checks these signals.
 
 type BrowserProfile struct {
-	UA           string
-	AcceptLang   string
-	SecChUA      string   // Chrome Client Hints; empty for Firefox/Safari
-	SecChUAMob   string   // "?0" desktop, "?1" mobile
-	SecChUAPlat  string   // e.g. `"Windows"`, `"macOS"`, `"Android"`
-	IsChromium   bool     // drives TLS cipher ordering
-	IsMobile     bool
+	UA          string
+	AcceptLang  string
+	SecChUA     string // Chrome Client Hints; empty for Firefox/Safari
+	SecChUAMob  string // "?0" desktop, "?1" mobile
+	SecChUAPlat string // e.g. `"Windows"`, `"macOS"`, `"Android"`
+	IsChromium  bool   // drives TLS cipher ordering
+	IsMobile    bool
 	// TLS tuning
-	CipherSuites    []uint16
-	CurvePrefs      []tls.CurveID
+	CipherSuites []uint16
+	CurvePrefs   []tls.CurveID
 }
 
 // tlsCiphersChrome136 mirrors Chrome 136 ClientHello cipher suite order.
@@ -903,79 +887,79 @@ var curvePrefsFirefox = []tls.CurveID{
 var browserProfiles = []BrowserProfile{
 	// --- Chrome 136 Windows ---
 	{
-		UA:          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-		AcceptLang:  "en-US,en;q=0.9",
-		SecChUA:     `"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"`,
-		SecChUAMob:  "?0",
-		SecChUAPlat: `"Windows"`,
-		IsChromium:  true,
+		UA:           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+		AcceptLang:   "en-US,en;q=0.9",
+		SecChUA:      `"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"`,
+		SecChUAMob:   "?0",
+		SecChUAPlat:  `"Windows"`,
+		IsChromium:   true,
 		CipherSuites: tlsCiphersChrome136,
 		CurvePrefs:   curvePrefsChrome,
 	},
 	// --- Chrome 136 macOS ---
 	{
-		UA:          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-		AcceptLang:  "en-US,en;q=0.9",
-		SecChUA:     `"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"`,
-		SecChUAMob:  "?0",
-		SecChUAPlat: `"macOS"`,
-		IsChromium:  true,
+		UA:           "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+		AcceptLang:   "en-US,en;q=0.9",
+		SecChUA:      `"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"`,
+		SecChUAMob:   "?0",
+		SecChUAPlat:  `"macOS"`,
+		IsChromium:   true,
 		CipherSuites: tlsCiphersChrome136,
 		CurvePrefs:   curvePrefsChrome,
 	},
 	// --- Chrome 136 Windows (zh-CN user) ---
 	{
-		UA:          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-		AcceptLang:  "zh-CN,zh;q=0.9,en;q=0.8",
-		SecChUA:     `"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"`,
-		SecChUAMob:  "?0",
-		SecChUAPlat: `"Windows"`,
-		IsChromium:  true,
+		UA:           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+		AcceptLang:   "zh-CN,zh;q=0.9,en;q=0.8",
+		SecChUA:      `"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"`,
+		SecChUAMob:   "?0",
+		SecChUAPlat:  `"Windows"`,
+		IsChromium:   true,
 		CipherSuites: tlsCiphersChrome136,
 		CurvePrefs:   curvePrefsChrome,
 	},
 	// --- Edge 136 Windows ---
 	{
-		UA:          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0",
-		AcceptLang:  "en-US,en;q=0.9",
-		SecChUA:     `"Chromium";v="136", "Microsoft Edge";v="136", "Not.A/Brand";v="99"`,
-		SecChUAMob:  "?0",
-		SecChUAPlat: `"Windows"`,
-		IsChromium:  true,
+		UA:           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0",
+		AcceptLang:   "en-US,en;q=0.9",
+		SecChUA:      `"Chromium";v="136", "Microsoft Edge";v="136", "Not.A/Brand";v="99"`,
+		SecChUAMob:   "?0",
+		SecChUAPlat:  `"Windows"`,
+		IsChromium:   true,
 		CipherSuites: tlsCiphersChrome136,
 		CurvePrefs:   curvePrefsChrome,
 	},
 	// --- Firefox 138 Windows ---
 	{
-		UA:          "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:138.0) Gecko/20100101 Firefox/138.0",
-		AcceptLang:  "en-US,en;q=0.5",
-		SecChUA:     "", // Firefox does not send sec-ch-ua
-		SecChUAMob:  "",
-		SecChUAPlat: "",
-		IsChromium:  false,
+		UA:           "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:138.0) Gecko/20100101 Firefox/138.0",
+		AcceptLang:   "en-US,en;q=0.5",
+		SecChUA:      "", // Firefox does not send sec-ch-ua
+		SecChUAMob:   "",
+		SecChUAPlat:  "",
+		IsChromium:   false,
 		CipherSuites: tlsCiphersFirefox138,
 		CurvePrefs:   curvePrefsFirefox,
 	},
 	// --- Firefox 138 macOS ---
 	{
-		UA:          "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.7; rv:138.0) Gecko/20100101 Firefox/138.0",
-		AcceptLang:  "en-US,en;q=0.5",
-		SecChUA:     "",
-		SecChUAMob:  "",
-		SecChUAPlat: "",
-		IsChromium:  false,
+		UA:           "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.7; rv:138.0) Gecko/20100101 Firefox/138.0",
+		AcceptLang:   "en-US,en;q=0.5",
+		SecChUA:      "",
+		SecChUAMob:   "",
+		SecChUAPlat:  "",
+		IsChromium:   false,
 		CipherSuites: tlsCiphersFirefox138,
 		CurvePrefs:   curvePrefsFirefox,
 	},
 	// --- Chrome 136 Android (mobile) ---
 	{
-		UA:          "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36",
-		AcceptLang:  "en-US,en;q=0.9",
-		SecChUA:     `"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"`,
-		SecChUAMob:  "?1",
-		SecChUAPlat: `"Android"`,
-		IsChromium:  true,
-		IsMobile:    true,
+		UA:           "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36",
+		AcceptLang:   "en-US,en;q=0.9",
+		SecChUA:      `"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"`,
+		SecChUAMob:   "?1",
+		SecChUAPlat:  `"Android"`,
+		IsChromium:   true,
+		IsMobile:     true,
 		CipherSuites: tlsCiphersChrome136,
 		CurvePrefs:   curvePrefsChrome,
 	},
@@ -1312,11 +1296,19 @@ func readUntilCRLFCRLF(br *bufio.Reader) ([]byte, error) {
 // largeFramePool pools buffers for WS frames larger than smallFrameSize.
 // Stored as *[]byte so the pool can hold variable-length slices without
 // the type assertion overhead of interface{} wrapping a plain []byte.
+const maxPooledFrameCap = 64 * 1024 // Cap pool retention at 64KB to avoid holding huge buffers
+
 var largeFramePool = sync.Pool{
 	New: func() interface{} {
 		buf := make([]byte, 32*1024) // 32KB default; grown as needed
 		return &buf
 	},
+}
+
+func putLargeFrame(p *[]byte) {
+	if p != nil && cap(*p) <= maxPooledFrameCap {
+		largeFramePool.Put(p)
+	}
 }
 
 // handshakeBufPool pools bytes.Buffer for WebSocket handshake requests.
@@ -1328,194 +1320,59 @@ var handshakeBufPool = sync.Pool{
 	},
 }
 
-// tryClientFallbackDial attempts to resolve the fakehost domain to get
-// alternative Cloudflare edge IPs when the primary upstream IP is unreachable.
-func tryClientFallbackDial(dialer *net.Dialer, wsHost, wsPort, sniHostname string, cfg *Config) net.Conn {
-	if net.ParseIP(wsHost) == nil {
+// validateWSHandshakeResponse parses and verifies the HTTP status line of a WebSocket handshake response.
+// It strictly checks whether the status line contains 101 Switching Protocols and distinguishes
+// specific errors for 200, 301, 302, 400, 403, 502, etc.
+func validateWSHandshakeResponse(respBytes []byte) error {
+	if len(respBytes) == 0 {
+		return errors.New("empty websocket handshake response")
+	}
+	firstLineEnd := bytes.Index(respBytes, crlfB)
+	if firstLineEnd < 0 {
+		firstLineEnd = len(respBytes)
+	}
+	firstLine := string(respBytes[:firstLineEnd])
+	parts := strings.SplitN(firstLine, " ", 3)
+	if len(parts) < 2 || !strings.HasPrefix(parts[0], "HTTP/") {
+		return fmt.Errorf("malformed websocket handshake response: %q", firstLine)
+	}
+	statusCode := parts[1]
+	if statusCode == "101" {
 		return nil
 	}
-	ips, err := net.LookupIP(sniHostname)
-	if err != nil || len(ips) == 0 {
-		return nil
-	}
-	for _, ip := range ips {
-		if ip4 := ip.To4(); ip4 == nil {
-			continue
-		}
-		fallbackAddr := net.JoinHostPort(ip.String(), wsPort)
-		if fallbackAddr == net.JoinHostPort(wsHost, wsPort) {
-			continue
-		}
-		logInfo("[DNS] Trying fallback Cloudflare edge: %s (fakehost: %s)", fallbackAddr, sniHostname)
-		var conn net.Conn
-		if cfg.UpstreamIsWSS {
-			conf := pickProfileTLSConfig().Clone()
-			conf.ServerName = sniHostname
-			conn, err = tls.DialWithDialer(dialer, "tcp", fallbackAddr, conf)
-		} else {
-			conn, err = dialer.Dial("tcp", fallbackAddr)
-		}
-		if err != nil {
-			logDebug("[DNS] Fallback dial %s failed: %v", fallbackAddr, err)
-			continue
-		}
-		return conn
-	}
-	return nil
-}
-
-// --- Connection Pool ---
-// Pre-established WebSocket connections to reduce per-connection setup overhead.
-// Each pooled connection has completed TCP+TLS+WS handshake but has NOT sent
-// the target frame yet. When grabbed from the pool, the target frame is sent
-// and the connection becomes ready for data relay.
-
-type PooledConn struct {
-	wsConn    net.Conn
-	br        *bufio.Reader
-	created   time.Time
-	lastUsed  time.Time
-}
-
-type ConnPool struct {
-	conns       []*PooledConn
-	mu          sync.Mutex
-	cfg         *Config
-	maxSize     int
-	maxAge      time.Duration
-	idleTimeout time.Duration
-	closed      bool
-	deadIPs     map[string]bool // IPs that failed during session (permanent until exit)
-}
-
-func NewConnPool(cfg *Config, maxSize int) *ConnPool {
-	p := &ConnPool{
-		conns:       make([]*PooledConn, 0, maxSize),
-		cfg:         cfg,
-		maxSize:     maxSize,
-		maxAge:      5 * time.Minute,
-		idleTimeout: 30 * time.Second,
-		deadIPs:     make(map[string]bool),
-	}
-	// Start background goroutine to maintain pool
-	go p.maintainLoop()
-	return p
-}
-
-func (p *ConnPool) maintainLoop() {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-	for range ticker.C {
-		p.cleanup()
-		// Fill pool to half capacity
-		for i := 0; i < p.maxSize/2; i++ {
-			p.mu.Lock()
-			if p.closed || len(p.conns) >= p.maxSize/2 {
-				p.mu.Unlock()
-				break
-			}
-			p.mu.Unlock()
-			conn := p.createConn()
-			if conn == nil {
-				break
-			}
-			p.mu.Lock()
-			if p.closed || len(p.conns) >= p.maxSize {
-				p.mu.Unlock()
-				conn.wsConn.Close()
-				break
-			}
-			p.conns = append(p.conns, conn)
-			p.mu.Unlock()
-		}
+	switch statusCode {
+	case "200":
+		return errors.New("handshake failed: server returned 200 OK instead of 101 Switching Protocols (upstream may not support WebSocket)")
+	case "301", "302", "307", "308":
+		return fmt.Errorf("handshake failed: server redirected with HTTP %s", statusCode)
+	case "400":
+		return errors.New("handshake failed: HTTP 400 Bad Request")
+	case "403":
+		return errors.New("handshake failed: HTTP 403 Forbidden (check CDN / firewall rules)")
+	case "404":
+		return errors.New("handshake failed: HTTP 404 Not Found")
+	case "502":
+		return errors.New("handshake failed: HTTP 502 Bad Gateway")
+	case "503":
+		return errors.New("handshake failed: HTTP 503 Service Unavailable")
+	case "504":
+		return errors.New("handshake failed: HTTP 504 Gateway Timeout")
+	default:
+		return fmt.Errorf("handshake failed: unexpected HTTP status %s (%s)", statusCode, firstLine)
 	}
 }
 
-func (p *ConnPool) cleanup() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	now := time.Now()
-	valid := p.conns[:0]
-	for _, c := range p.conns {
-		if now.Sub(c.created) > p.maxAge || now.Sub(c.lastUsed) > p.idleTimeout {
-			c.wsConn.Close()
-		} else {
-			valid = append(valid, c)
-		}
-	}
-	p.conns = valid
-}
-
-func (p *ConnPool) createConn() *PooledConn {
-	cfg := p.cfg
+// performWSHandshake sends a WebSocket handshake request and strictly validates the 101 response.
+func performWSHandshake(wsConn net.Conn, br *bufio.Reader, cfg *Config, wsHost, sniHostname string) error {
 	wsURL := cfg.ParsedUpstream
-	wsHost := cfg.UpstreamHost
-	wsPort := cfg.UpstreamPort
-
-	// DNS resolution
-	dialHost := wsHost
-	if cfg.Resolver != nil {
-		if resolvedIP, resolveErr := cfg.Resolver.Resolve(wsHost); resolveErr == nil {
-			dialHost = resolvedIP
-		} else {
-			logDebug("[POOL] DNS resolve failed for upstream %s: %v", wsHost, resolveErr)
-			return nil
-		}
+	path := "/"
+	if wsURL != nil && wsURL.Path != "" {
+		path = wsURL.Path
 	}
-
-	dialAddr := net.JoinHostPort(dialHost, wsPort)
-	sniHostname := sanitizeHeader(wsHost)
-	if cfg.FakeHost != "" {
-		sniHostname = sanitizeHeader(strings.Split(cfg.FakeHost, ":")[0])
-	}
-
-	dialer := &net.Dialer{Timeout: time.Duration(cfg.ConnTimeout) * time.Second}
-
-	// Skip known-dead IPs (permanent for session)
-	p.mu.Lock()
-	if p.deadIPs[dialHost] {
-		p.mu.Unlock()
-		return p.tryFallbackDial(dialer, wsHost, wsPort, sniHostname)
-	}
-	p.mu.Unlock()
-
-	var wsConn net.Conn
-	var err error
-	if cfg.UpstreamIsWSS {
-		conf := pickProfileTLSConfig().Clone()
-		conf.ServerName = sniHostname
-		wsConn, err = tls.DialWithDialer(dialer, "tcp", dialAddr, conf)
-	} else {
-		wsConn, err = dialer.Dial("tcp", dialAddr)
-	}
-	if err != nil {
-		logDebug("[POOL] Dial %s failed: %v", dialAddr, err)
-		// Mark IP as dead for session
-		p.mu.Lock()
-		p.deadIPs[dialHost] = true
-		p.mu.Unlock()
-		if cfg.FakeHost != "" {
-			fallbackConn := p.tryFallbackDial(dialer, wsHost, wsPort, sniHostname)
-			if fallbackConn != nil {
-				return fallbackConn
-			}
-		}
-		return nil
-	}
-
-	optimizeSocket(wsConn, cfg)
-	br := bufio.NewReaderSize(wsConn, MaxHeaderSize)
-
-	// WebSocket handshake
 	profile := pickBrowserProfile()
-	path := wsURL.Path
-	if path == "" {
-		path = "/"
-	}
 	var wsKey [16]byte
 	if _, err := rand.Read(wsKey[:]); err != nil {
-		wsConn.Close()
-		return nil
+		return err
 	}
 	wsKeyStr := base64.StdEncoding.EncodeToString(wsKey[:])
 
@@ -1592,16 +1449,204 @@ func (p *ConnPool) createConn() *PooledConn {
 
 	if _, err := wsConn.Write(handshakeBuf.Bytes()); err != nil {
 		handshakeBufPool.Put(handshakeBuf)
-		wsConn.Close()
-		return nil
+		return err
 	}
 	handshakeBufPool.Put(handshakeBuf)
 
-	// Read handshake response
 	wsTCPConn := extractTCPConn(wsConn)
 	setTCPReadDeadline(wsTCPConn, cfg.ConnTimeout)
 	respBytes, err := readUntilCRLFCRLF(br)
-	if err != nil || !bytes.Contains(respBytes, []byte("101")) {
+	if err != nil {
+		return err
+	}
+	return validateWSHandshakeResponse(respBytes)
+}
+
+// dialFallback attempts to resolve the fakehost domain to get alternative
+// Cloudflare edge IPs when the primary upstream IP is unreachable.
+func dialFallback(dialer *net.Dialer, wsHost, wsPort, sniHostname string, cfg *Config) net.Conn {
+	if net.ParseIP(wsHost) == nil {
+		return nil
+	}
+	ips, err := net.LookupIP(sniHostname)
+	if err != nil || len(ips) == 0 {
+		return nil
+	}
+	for _, ip := range ips {
+		if ip4 := ip.To4(); ip4 == nil {
+			continue
+		}
+		fallbackAddr := net.JoinHostPort(ip.String(), wsPort)
+		if fallbackAddr == net.JoinHostPort(wsHost, wsPort) {
+			continue
+		}
+		logInfo("[DNS] Trying fallback Cloudflare edge: %s (fakehost: %s)", fallbackAddr, sniHostname)
+		var conn net.Conn
+		if cfg.UpstreamIsWSS {
+			conf := pickProfileTLSConfig().Clone()
+			conf.ServerName = sniHostname
+			conn, err = tls.DialWithDialer(dialer, "tcp", fallbackAddr, conf)
+		} else {
+			conn, err = dialer.Dial("tcp", fallbackAddr)
+		}
+		if err != nil {
+			logDebug("[DNS] Fallback dial %s failed: %v", fallbackAddr, err)
+			continue
+		}
+		return conn
+	}
+	return nil
+}
+
+// --- Connection Pool ---
+// Pre-established WebSocket connections to reduce per-connection setup overhead.
+// Each pooled connection has completed TCP+TLS+WS handshake but has NOT sent
+// the target frame yet. When grabbed from the pool, the target frame is sent
+// and the connection becomes ready for data relay.
+
+type PooledConn struct {
+	wsConn   net.Conn
+	br       *bufio.Reader
+	created  time.Time
+	lastUsed time.Time
+}
+
+type ConnPool struct {
+	conns       []*PooledConn
+	mu          sync.Mutex
+	cfg         *Config
+	maxSize     int
+	maxAge      time.Duration
+	idleTimeout time.Duration
+	closed      bool
+	stopChan    chan struct{}
+	stopOnce    sync.Once
+	deadIPs     map[string]bool // IPs that failed during session (permanent until exit)
+}
+
+func NewConnPool(cfg *Config, maxSize int) *ConnPool {
+	p := &ConnPool{
+		conns:       make([]*PooledConn, 0, maxSize),
+		cfg:         cfg,
+		maxSize:     maxSize,
+		maxAge:      5 * time.Minute,
+		idleTimeout: 30 * time.Second,
+		deadIPs:     make(map[string]bool),
+		stopChan:    make(chan struct{}),
+	}
+	// Start background goroutine to maintain pool
+	go p.maintainLoop()
+	return p
+}
+
+func (p *ConnPool) maintainLoop() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-p.stopChan:
+			return
+		case <-ticker.C:
+			p.cleanup()
+			// Fill pool to half capacity
+			for i := 0; i < p.maxSize/2; i++ {
+				p.mu.Lock()
+				if p.closed || len(p.conns) >= p.maxSize/2 {
+					p.mu.Unlock()
+					break
+				}
+				p.mu.Unlock()
+				conn := p.createConn()
+				if conn == nil {
+					break
+				}
+				p.mu.Lock()
+				if p.closed || len(p.conns) >= p.maxSize {
+					p.mu.Unlock()
+					conn.wsConn.Close()
+					break
+				}
+				p.conns = append(p.conns, conn)
+				p.mu.Unlock()
+			}
+		}
+	}
+}
+
+func (p *ConnPool) cleanup() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	valid := p.conns[:0]
+	for _, c := range p.conns {
+		if now.Sub(c.created) > p.maxAge || now.Sub(c.lastUsed) > p.idleTimeout {
+			c.wsConn.Close()
+		} else {
+			valid = append(valid, c)
+		}
+	}
+	p.conns = valid
+}
+
+func (p *ConnPool) createConn() *PooledConn {
+	cfg := p.cfg
+	wsHost := cfg.UpstreamHost
+	wsPort := cfg.UpstreamPort
+
+	// DNS resolution
+	dialHost := wsHost
+	if cfg.Resolver != nil {
+		if resolvedIP, resolveErr := cfg.Resolver.Resolve(wsHost); resolveErr == nil {
+			dialHost = resolvedIP
+		} else {
+			logDebug("[POOL] DNS resolve failed for upstream %s: %v", wsHost, resolveErr)
+			return nil
+		}
+	}
+
+	dialAddr := net.JoinHostPort(dialHost, wsPort)
+	sniHostname := sanitizeHeader(wsHost)
+	if cfg.FakeHost != "" {
+		sniHostname = sanitizeHeader(strings.Split(cfg.FakeHost, ":")[0])
+	}
+
+	dialer := &net.Dialer{Timeout: time.Duration(cfg.ConnTimeout) * time.Second}
+
+	// Skip known-dead IPs (permanent for session)
+	p.mu.Lock()
+	if p.deadIPs[dialHost] {
+		p.mu.Unlock()
+		return p.tryFallbackDial(dialer, wsHost, wsPort, sniHostname)
+	}
+	p.mu.Unlock()
+
+	var wsConn net.Conn
+	var err error
+	if cfg.UpstreamIsWSS {
+		conf := pickProfileTLSConfig().Clone()
+		conf.ServerName = sniHostname
+		wsConn, err = tls.DialWithDialer(dialer, "tcp", dialAddr, conf)
+	} else {
+		wsConn, err = dialer.Dial("tcp", dialAddr)
+	}
+	if err != nil {
+		logDebug("[POOL] Dial %s failed: %v", dialAddr, err)
+		// Mark IP as dead for session
+		p.mu.Lock()
+		p.deadIPs[dialHost] = true
+		p.mu.Unlock()
+		if cfg.FakeHost != "" {
+			fallbackConn := p.tryFallbackDial(dialer, wsHost, wsPort, sniHostname)
+			if fallbackConn != nil {
+				return fallbackConn
+			}
+		}
+		return nil
+	}
+
+	optimizeSocket(wsConn, cfg)
+	br := bufio.NewReaderSize(wsConn, MaxHeaderSize)
+	if err := performWSHandshake(wsConn, br, cfg, wsHost, sniHostname); err != nil {
 		wsConn.Close()
 		return nil
 	}
@@ -1617,148 +1662,20 @@ func (p *ConnPool) createConn() *PooledConn {
 // tryFallbackDial attempts to resolve the fakehost domain to get alternative
 // Cloudflare edge IPs when the primary upstream IP is unreachable.
 func (p *ConnPool) tryFallbackDial(dialer *net.Dialer, wsHost, wsPort, sniHostname string) *PooledConn {
-	cfg := p.cfg
-	// Only try fallback if wsHost is already an IP (no point retrying a domain)
-	if net.ParseIP(wsHost) == nil {
+	conn := dialFallback(dialer, wsHost, wsPort, sniHostname, p.cfg)
+	if conn == nil {
 		return nil
 	}
-	// Try resolving the sniHostname (fakehost) to get Cloudflare edge IPs
-	ips, err := net.LookupIP(sniHostname)
-	if err != nil || len(ips) == 0 {
-		return nil
-	}
-	for _, ip := range ips {
-		if ip4 := ip.To4(); ip4 == nil {
-			continue
-		}
-		fallbackAddr := net.JoinHostPort(ip.String(), wsPort)
-		if fallbackAddr == net.JoinHostPort(wsHost, wsPort) {
-			continue
-		}
-		logDebug("[POOL] Trying fallback Cloudflare edge: %s", fallbackAddr)
-		var wsConn net.Conn
-		if cfg.UpstreamIsWSS {
-			conf := pickProfileTLSConfig().Clone()
-			conf.ServerName = sniHostname
-			wsConn, err = tls.DialWithDialer(dialer, "tcp", fallbackAddr, conf)
-		} else {
-			wsConn, err = dialer.Dial("tcp", fallbackAddr)
-		}
-		if err != nil {
-			logDebug("[POOL] Fallback dial %s failed: %v", fallbackAddr, err)
-			p.mu.Lock()
-			p.deadIPs[ip.String()] = true
-			p.mu.Unlock()
-			continue
-		}
-		optimizeSocket(wsConn, cfg)
-		br := bufio.NewReaderSize(wsConn, MaxHeaderSize)
-		pConn := p.doHandshake(wsConn, br, cfg, sniHostname)
-		if pConn != nil {
-			return pConn
-		}
-		wsConn.Close()
-	}
-	return nil
+	optimizeSocket(conn, p.cfg)
+	br := bufio.NewReaderSize(conn, MaxHeaderSize)
+	return p.doHandshake(conn, br, p.cfg, sniHostname)
 }
 
 func (p *ConnPool) doHandshake(wsConn net.Conn, br *bufio.Reader, cfg *Config, sniHostname string) *PooledConn {
-	wsURL := cfg.ParsedUpstream
-	profile := pickBrowserProfile()
-	path := wsURL.Path
-	if path == "" {
-		path = "/"
-	}
-	var wsKey [16]byte
-	if _, err := rand.Read(wsKey[:]); err != nil {
+	if err := performWSHandshake(wsConn, br, cfg, cfg.UpstreamHost, sniHostname); err != nil {
+		wsConn.Close()
 		return nil
 	}
-	wsKeyStr := base64.StdEncoding.EncodeToString(wsKey[:])
-
-	hostHeader := sanitizeHeader(cfg.UpstreamHost)
-	if cfg.FakeHost != "" {
-		hostHeader = sanitizeHeader(cfg.FakeHost)
-	}
-
-	protocolScheme := "http"
-	if cfg.UpstreamIsWSS {
-		protocolScheme = "https"
-	}
-
-	secFetchSite := "cross-site"
-	if sniHostname == strings.Split(hostHeader, ":")[0] {
-		secFetchSite = "same-origin"
-	}
-
-	reqLine := "GET " + path + " HTTP/1.1\r\n"
-
-	fixedTop := []string{
-		"Host: " + hostHeader,
-		"Connection: Upgrade",
-		"Upgrade: websocket",
-	}
-
-	shufflable := []string{
-		"Pragma: no-cache",
-		"Cache-Control: no-cache",
-		"User-Agent: " + profile.UA,
-		"Accept-Language: " + profile.AcceptLang,
-		"Accept-Encoding: gzip, deflate, br, zstd",
-		"Origin: " + protocolScheme + "://" + sniHostname,
-	}
-
-	if profile.IsChromium && profile.SecChUA != "" {
-		shufflable = append(shufflable,
-			"sec-ch-ua: "+profile.SecChUA,
-			"sec-ch-ua-mobile: "+profile.SecChUAMob,
-			"sec-ch-ua-platform: "+profile.SecChUAPlat,
-		)
-	}
-
-	fixedBottom := []string{
-		"Sec-WebSocket-Version: 13",
-		"Sec-WebSocket-Key: " + wsKeyStr,
-		"Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits",
-		"Sec-Fetch-Dest: websocket",
-		"Sec-Fetch-Mode: websocket",
-		"Sec-Fetch-Site: " + secFetchSite,
-	}
-
-	for i := len(shufflable) - 1; i > 0; i-- {
-		j := mrand.Intn(i + 1)
-		shufflable[i], shufflable[j] = shufflable[j], shufflable[i]
-	}
-
-	handshakeBuf := handshakeBufPool.Get().(*bytes.Buffer)
-	handshakeBuf.Reset()
-	handshakeBuf.WriteString(reqLine)
-	for _, h := range fixedTop {
-		handshakeBuf.WriteString(h)
-		handshakeBuf.WriteString("\r\n")
-	}
-	for _, h := range shufflable {
-		handshakeBuf.WriteString(h)
-		handshakeBuf.WriteString("\r\n")
-	}
-	for _, h := range fixedBottom {
-		handshakeBuf.WriteString(h)
-		handshakeBuf.WriteString("\r\n")
-	}
-	handshakeBuf.WriteString("\r\n")
-
-	if _, err := wsConn.Write(handshakeBuf.Bytes()); err != nil {
-		handshakeBufPool.Put(handshakeBuf)
-		return nil
-	}
-	handshakeBufPool.Put(handshakeBuf)
-
-	wsTCPConn := extractTCPConn(wsConn)
-	setTCPReadDeadline(wsTCPConn, cfg.ConnTimeout)
-	respBytes, err := readUntilCRLFCRLF(br)
-	if err != nil || !bytes.Contains(respBytes, []byte("101")) {
-		return nil
-	}
-
 	return &PooledConn{
 		wsConn:   wsConn,
 		br:       br,
@@ -1802,6 +1719,9 @@ func (p *ConnPool) Put(conn *PooledConn) {
 }
 
 func (p *ConnPool) Close() {
+	p.stopOnce.Do(func() {
+		close(p.stopChan)
+	})
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.closed = true
@@ -1826,6 +1746,7 @@ func readWSFrameInto(r io.Reader, w io.Writer, buf []byte) ([]byte, error) {
 			return nil, err
 		}
 
+		fin := (head[0] & 0x80) != 0
 		opcode := head[0] & 0x0F
 		masked := (head[1] & 0x80) != 0
 		payloadLen := uint64(head[1] & 0x7F)
@@ -1846,6 +1767,24 @@ func readWSFrameInto(r io.Reader, w io.Writer, buf []byte) ([]byte, error) {
 
 		if payloadLen > uint64(MaxWSFrameSize) {
 			return nil, errors.New("frame too large")
+		}
+
+		// RFC 6455 §5.5: Control frames (Close, Ping, Pong)
+		if opcode >= 0x8 {
+			if !fin {
+				return nil, errors.New("control frame must not be fragmented")
+			}
+			if payloadLen > 125 {
+				return nil, errors.New("control frame payload exceeds 125 bytes")
+			}
+		} else {
+			// RFC 6455 §5.4: Data frames
+			if opcode == 0x0 || !fin {
+				return nil, errors.New("fragmented websocket frames not supported")
+			}
+			if opcode != 0x1 && opcode != 0x2 {
+				return nil, fmt.Errorf("unsupported websocket opcode: 0x%X", opcode)
+			}
 		}
 
 		var maskKey [4]byte
@@ -1884,9 +1823,7 @@ func readWSFrameInto(r io.Reader, w io.Writer, buf []byte) ([]byte, error) {
 		}
 
 		if _, err := io.ReadFull(r, payload); err != nil {
-			if poolPtr != nil {
-				largeFramePool.Put(poolPtr)
-			}
+			putLargeFrame(poolPtr)
 			return nil, err
 		}
 
@@ -1904,7 +1841,7 @@ func readWSFrameInto(r io.Reader, w io.Writer, buf []byte) ([]byte, error) {
 		}
 
 		switch opcode {
-		case 0x0, 0x1, 0x2: // Text, Binary, Continuation
+		case 0x1, 0x2: // Text, Binary
 			if buf != nil {
 				// relay path — payload already lives in caller's buffer
 				return payload, nil
@@ -1912,27 +1849,25 @@ func readWSFrameInto(r io.Reader, w io.Writer, buf []byte) ([]byte, error) {
 			// handshake path — must return heap-owned slice
 			heapPayload := make([]byte, payloadLen)
 			copy(heapPayload, payload)
-			if poolPtr != nil {
-				largeFramePool.Put(poolPtr)
-			}
+			putLargeFrame(poolPtr)
 			return heapPayload, nil
 		case 0x8: // Close
-			if poolPtr != nil {
-				largeFramePool.Put(poolPtr)
-			}
+			putLargeFrame(poolPtr)
 			return nil, io.EOF
 		case 0x9: // Ping
 			if w != nil {
 				if err := writeWSFrame(w, payload, 0xA, !masked); err != nil {
-					if poolPtr != nil {
-						largeFramePool.Put(poolPtr)
-					}
+					putLargeFrame(poolPtr)
 					return nil, err
 				}
 			}
-			if poolPtr != nil {
-				largeFramePool.Put(poolPtr)
-			}
+			putLargeFrame(poolPtr)
+		case 0xA: // Pong
+			putLargeFrame(poolPtr)
+			// Discard pong and continue reading
+		default:
+			putLargeFrame(poolPtr)
+			return nil, fmt.Errorf("unexpected websocket opcode: 0x%X", opcode)
 		}
 	}
 }
@@ -2064,17 +1999,42 @@ func main() {
 	tuiEnabled = *tuiFlag
 	logFilePath = *logFileFlag
 
-	if *pFlag == "" {
+	pInput := strings.TrimSpace(*pFlag)
+	if pInput == "" {
 		fmt.Println("Error: -p is required")
 		flag.Usage()
 		os.Exit(1)
+	}
+
+	if *maxConnFlag <= 0 || *maxConnFlag > 1000000 {
+		fmt.Printf("Error: -max-conn must be between 1 and 1000000, got %d\n", *maxConnFlag)
+		os.Exit(1)
+	}
+	if *sockBufFlag < 0 || *sockBufFlag > 1048576 {
+		fmt.Printf("Error: -socket-buffer must be between 0 and 1048576 KB, got %d\n", *sockBufFlag)
+		os.Exit(1)
+	}
+	if *connTimeoutFlag <= 0 || *connTimeoutFlag > 86400 {
+		fmt.Printf("Error: -connection-timeout must be between 1 and 86400 seconds, got %d\n", *connTimeoutFlag)
+		os.Exit(1)
+	}
+	if *wFlag <= 0 || *wFlag > 16384 {
+		fmt.Printf("Error: -W (buffer size in KB) must be between 1 and 16384, got %d\n", *wFlag)
+		os.Exit(1)
+	}
+	if *fakeHostFlag != "" {
+		fakeHostClean := strings.TrimSpace(*fakeHostFlag)
+		if strings.ContainsAny(fakeHostClean, " \t\r\n/") {
+			fmt.Printf("Error: invalid -fakehost '%s': contains whitespace or invalid characters\n", *fakeHostFlag)
+			os.Exit(1)
+		}
 	}
 
 	cfg := Config{
 		Upstream:       *upFlag,
 		FakeHost:       *fakeHostFlag,
 		Key:            *kFlag,
-		BufferSize:     65536, // 64KB default (optimized for L2 cache and low memory footprints on OpenWrt)
+		BufferSize:     *wFlag * 1024,
 		NoTcpNoDelay:   *noDelayFlag,
 		NoTcpKeepAlive: *keepAliveFlag,
 		SocketBuffer:   *sockBufFlag,
@@ -2088,47 +2048,55 @@ func main() {
 	}
 
 	if *dnsFlag != "" {
-		if net.ParseIP(*dnsFlag) == nil {
+		dnsClean := strings.TrimSpace(*dnsFlag)
+		if net.ParseIP(dnsClean) == nil {
 			fmt.Printf("Error: -dns requires a valid IP address (e.g. 8.8.8.8), got '%s'\n", *dnsFlag)
 			os.Exit(1)
 		}
-		cfg.Resolver = NewRemoteResolver(*dnsFlag)
+		cfg.Resolver = NewRemoteResolver(dnsClean)
 	}
 
-	host := "0.0.0.0"
-	portStr := *pFlag
-	if strings.Contains(*pFlag, ":") {
-		parts := strings.Split(*pFlag, ":")
-		if len(parts) == 2 {
-			if parts[0] != "" {
-				host = parts[0]
-			}
-			portStr = parts[1]
+	var host string
+	var portStr string
+	if strings.Contains(pInput, ":") {
+		h, p, splitErr := net.SplitHostPort(pInput)
+		if splitErr != nil {
+			fmt.Printf("Error: invalid listen address '%s': %v\n", pInput, splitErr)
+			os.Exit(1)
 		}
+		if h == "" {
+			host = "0.0.0.0"
+		} else {
+			host = h
+		}
+		portStr = p
+	} else {
+		host = "0.0.0.0"
+		portStr = pInput
 	}
 	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		fmt.Printf("Error: invalid port '%s'\n", portStr)
+	if err != nil || port < 1 || port > 65535 {
+		fmt.Printf("Error: invalid port '%s' (must be 1-65535)\n", portStr)
 		os.Exit(1)
 	}
 	cfg.ProxyHost = host
 	cfg.ProxyPort = port
-
-	if *wFlag > 0 {
-		cfg.BufferSize = *wFlag * 1024
-	}
 
 	cfg.Crypto = NewCrypto(cfg.Key)
 
 	// Parse upstream URL once at startup — avoids per-connection url.Parse alloc.
 	if cfg.Upstream != "" {
 		parsedUp, upErr := url.Parse(cfg.Upstream)
-		if upErr != nil {
-			fmt.Printf("Error: invalid upstream URL '%s': %v\n", cfg.Upstream, upErr)
+		if upErr != nil || parsedUp.Host == "" {
+			fmt.Printf("Error: invalid upstream URL '%s': valid format ws://host:port, wss://host:port, quic://host:port\n", cfg.Upstream)
+			os.Exit(1)
+		}
+		scheme := strings.ToLower(parsedUp.Scheme)
+		if scheme != "ws" && scheme != "wss" && scheme != "quic" && scheme != "quic+tls" {
+			fmt.Printf("Error: unsupported upstream scheme '%s' in '%s' (supported: ws, wss, quic, quic+tls)\n", parsedUp.Scheme, cfg.Upstream)
 			os.Exit(1)
 		}
 		cfg.ParsedUpstream = parsedUp
-		scheme := strings.ToLower(parsedUp.Scheme)
 		cfg.IsQUICUpstream = (scheme == "quic" || scheme == "quic+tls")
 		cfg.UpstreamIsWSS = (scheme == "wss")
 
@@ -2151,7 +2119,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	listenAddr := fmt.Sprintf("%s:%d", cfg.ProxyHost, cfg.ProxyPort)
+	listenAddr := net.JoinHostPort(cfg.ProxyHost, strconv.Itoa(cfg.ProxyPort))
 
 	if !tuiEnabled {
 		// Print Banner
@@ -2296,13 +2264,19 @@ func main() {
 		if cfg.QUICPool != nil {
 			cfg.QUICPool.Close()
 		}
+		if cfg.MuxPool != nil {
+			cfg.MuxPool.Close()
+		}
+		if connPool != nil {
+			connPool.Close()
+		}
 		pprof.StopCPUProfile()
 		close(shutdown)
 		listener.Close()
 	}()
 
 	if tuiEnabled {
-		fmt.Print("\033[2J\033[?25l") // Clear screen & hide cursor
+		fmt.Print("\033[2J\033[?25l")             // Clear screen & hide cursor
 		defer fmt.Print("\033[?25h\033[2J\033[H") // Restore cursor & clear screen on exit
 		go tuiRefreshLoop(&cfg, shutdown)
 	}
@@ -2386,11 +2360,11 @@ func monitorStats(shutdown <-chan struct{}) {
 // --- Mux (Multiplexing) Subsystem ---
 
 const (
-	MuxCmdSYN  byte = 0x01 // New Stream: [TargetLen uint16][TargetAddr string][InitialData...]
-	MuxCmdDATA byte = 0x02 // Stream Data: [Data...]
-	MuxCmdFIN  byte = 0x03 // Stream Half-Close / EOF
-	MuxCmdRST  byte = 0x04 // Stream Abrupt Reset / Error
-	MuxHeaderLen    = 7    // 4B StreamID + 1B Cmd + 2B PayloadLen
+	MuxCmdSYN    byte = 0x01 // New Stream: [TargetLen uint16][TargetAddr string][InitialData...]
+	MuxCmdDATA   byte = 0x02 // Stream Data: [Data...]
+	MuxCmdFIN    byte = 0x03 // Stream Half-Close / EOF
+	MuxCmdRST    byte = 0x04 // Stream Abrupt Reset / Error
+	MuxHeaderLen      = 7    // 4B StreamID + 1B Cmd + 2B PayloadLen
 )
 
 type MuxSessionInterface interface {
@@ -2582,12 +2556,19 @@ func (s *MuxClientSession) Close() {
 	s.closeOnce.Do(func() {
 		close(s.closed)
 		s.wsConn.Close()
+
 		s.streamsMu.Lock()
+		activeStreams := make([]*MuxStream, 0, len(s.streams))
 		for _, st := range s.streams {
-			st.Reset()
+			activeStreams = append(activeStreams, st)
 		}
 		s.streams = make(map[uint32]*MuxStream)
 		s.streamsMu.Unlock()
+
+		for _, st := range activeStreams {
+			st.Reset()
+		}
+
 		if s.prng != nil {
 			maskPool.Put(s.prng)
 			s.prng = nil
@@ -2608,10 +2589,14 @@ func (s *MuxClientSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 	default:
 	}
 
+	payloadLen := len(payload)
+	if payloadLen > 65535 {
+		return fmt.Errorf("mux frame payload %d exceeds maximum uint16 length (65535)", payloadLen)
+	}
+
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	payloadLen := len(payload)
 	frameLen := MuxHeaderLen + payloadLen
 	bPtr := s.cfg.BufPool.Get().(*[]byte)
 	defer s.cfg.BufPool.Put(bPtr)
@@ -2852,17 +2837,38 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 	defer stream.Close()
 
 	tLen := len(targetAddr)
-	synPayload := make([]byte, 2+tLen+len(initialPayload))
+	if tLen > 65535-2 {
+		logError("[CLIENT-MUX] Target address length %d exceeds max protocol limit", tLen)
+		return false
+	}
+	maxInitialInSYN := 65535 - 2 - tLen
+	var synInitial []byte
+	var remainingInitial []byte
+	if len(initialPayload) > maxInitialInSYN {
+		synInitial = initialPayload[:maxInitialInSYN]
+		remainingInitial = initialPayload[maxInitialInSYN:]
+	} else {
+		synInitial = initialPayload
+	}
+
+	synPayload := make([]byte, 2+tLen+len(synInitial))
 	binary.BigEndian.PutUint16(synPayload[:2], uint16(tLen))
 	copy(synPayload[2:2+tLen], targetAddr)
-	if len(initialPayload) > 0 {
-		copy(synPayload[2+tLen:], initialPayload)
+	if len(synInitial) > 0 {
+		copy(synPayload[2+tLen:], synInitial)
 	}
 
 	if err := session.SendFrame(streamID, MuxCmdSYN, synPayload); err != nil {
 		logDebug("[CLIENT-MUX] Send SYN failed: %v", err)
 		session.RemoveStream(streamID)
 		return false
+	}
+
+	if len(remainingInitial) > 0 {
+		if _, err := stream.Write(remainingInitial); err != nil {
+			logDebug("[CLIENT-MUX] Write remaining initial DATA failed: %v", err)
+			return false
+		}
 	}
 
 	if ver == 0x05 {
@@ -2959,10 +2965,27 @@ func newMuxServerStream(id uint32, session *MuxServerSession) *MuxServerStream {
 	}
 }
 
-func (s *MuxServerStream) PushData(data []byte) {
+func (s *MuxServerStream) PushData(data []byte) bool {
 	select {
 	case <-s.closed:
+		return false
 	case s.writeChan <- data:
+		return true
+	default:
+	}
+
+	timer := time.NewTimer(3 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-s.closed:
+		return false
+	case s.writeChan <- data:
+		return true
+	case <-timer.C:
+		logWarn("[SERVER-MUX] Stream %d buffer stalled, resetting stream to protect session", s.id)
+		s.Close()
+		_ = s.session.SendFrame(s.id, MuxCmdRST, nil)
+		return false
 	}
 }
 
@@ -2979,12 +3002,18 @@ func (s *MuxServerSession) Close() {
 	s.closeOnce.Do(func() {
 		close(s.closed)
 		s.wsConn.Close()
+
 		s.streamsMu.Lock()
+		activeStreams := make([]*MuxServerStream, 0, len(s.streams))
 		for _, st := range s.streams {
-			st.Close()
+			activeStreams = append(activeStreams, st)
 		}
 		s.streams = make(map[uint32]*MuxServerStream)
 		s.streamsMu.Unlock()
+
+		for _, st := range activeStreams {
+			st.Close()
+		}
 	})
 }
 
@@ -2995,10 +3024,14 @@ func (s *MuxServerSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 	default:
 	}
 
+	payloadLen := len(payload)
+	if payloadLen > 65535 {
+		return fmt.Errorf("mux server frame payload %d exceeds maximum uint16 length (65535)", payloadLen)
+	}
+
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	payloadLen := len(payload)
 	frameLen := MuxHeaderLen + payloadLen
 	bPtr := s.cfg.BufPool.Get().(*[]byte)
 	defer s.cfg.BufPool.Put(bPtr)
@@ -3107,7 +3140,11 @@ func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 			if ok && len(payload) > 0 {
 				dataCopy := make([]byte, len(payload))
 				copy(dataCopy, payload)
-				st.PushData(dataCopy)
+				if !st.PushData(dataCopy) {
+					session.streamsMu.Lock()
+					delete(session.streams, streamID)
+					session.streamsMu.Unlock()
+				}
 			}
 
 		case MuxCmdFIN:
@@ -3115,7 +3152,11 @@ func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 			st, ok := session.streams[streamID]
 			session.streamsMu.RUnlock()
 			if ok {
-				st.PushData(nil)
+				if !st.PushData(nil) {
+					session.streamsMu.Lock()
+					delete(session.streams, streamID)
+					session.streamsMu.Unlock()
+				}
 			}
 
 		case MuxCmdRST:
@@ -3158,7 +3199,11 @@ func (s *MuxServerSession) handleNewStream(st *MuxServerStream, targetStr string
 	st.targetConn = targetConn
 
 	if len(initialData) > 0 {
-		targetConn.Write(initialData)
+		if _, err := targetConn.Write(initialData); err != nil {
+			logDebug("[SERVER-MUX] Write initialData to %s failed: %v", targetAddr, err)
+			s.SendFrame(st.id, MuxCmdRST, nil)
+			return
+		}
 		stats.AddBytes(int64(len(initialData)), 0)
 	}
 
@@ -3563,37 +3608,14 @@ func handleServerUDP(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 }
 
 func isLocalTarget(host string) bool {
-	if strings.EqualFold(host, "localhost") ||
-		host == "127.0.0.1" || host == "::1" || host == "[::1]" || host == "0.0.0.0" {
+	if strings.EqualFold(host, "localhost") {
 		return true
 	}
-	// IPv6 local address ranges check (link-local and unique local)
-	if strings.HasPrefix(host, "fe80:") || strings.HasPrefix(host, "fc00:") || strings.HasPrefix(host, "fd00:") ||
-		strings.HasPrefix(host, "[fe80:") || strings.HasPrefix(host, "[fc00:") || strings.HasPrefix(host, "[fd00:") {
-		return true
-	}
-	// Private IPv4 always starts with '1' (10.x, 172.16+, 192.168.x).
-	// Skip ToLower allocation for the common case of public hostnames.
-	if len(host) == 0 || host[0] != '1' {
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	if ip == nil {
 		return false
 	}
-	// Byte-level prefix check (zero allocation, no strings.ToLower)
-	h := host
-	if len(h) >= 8 && h[0] == '1' && h[1] == '9' && h[2] == '2' && h[3] == '.' &&
-		h[4] == '1' && h[5] == '6' && h[6] == '8' && h[7] == '.' {
-		return true
-	}
-	if len(h) >= 3 && h[0] == '1' && h[1] == '0' && h[2] == '.' {
-		return true
-	}
-	if len(h) >= 4 && h[0] == '1' && h[1] == '7' && h[2] == '2' && h[3] == '.' {
-		if dot := strings.IndexByte(h[4:], '.'); dot >= 0 {
-			if b, err := strconv.Atoi(h[4 : 4+dot]); err == nil && b >= 16 && b <= 31 {
-				return true
-			}
-		}
-	}
-	return false
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified()
 }
 
 func dialUpstreamWS(cfg *Config) (net.Conn, *bufio.Reader, *net.TCPConn, error) {
@@ -3604,10 +3626,8 @@ func dialUpstreamWS(cfg *Config) (net.Conn, *bufio.Reader, *net.TCPConn, error) 
 		}
 	}
 
-	wsURL := cfg.ParsedUpstream
 	wsHost := cfg.UpstreamHost
 	wsPort := cfg.UpstreamPort
-	profile := pickBrowserProfile()
 
 	dialHost := wsHost
 	if cfg.Resolver != nil {
@@ -3638,7 +3658,7 @@ func dialUpstreamWS(cfg *Config) (net.Conn, *bufio.Reader, *net.TCPConn, error) 
 	if err != nil {
 		if cfg.FakeHost != "" {
 			wsConn = nil
-			fallbackConn := tryClientFallbackDial(dialer, wsHost, wsPort, sniHostname, cfg)
+			fallbackConn := dialFallback(dialer, wsHost, wsPort, sniHostname, cfg)
 			if fallbackConn != nil {
 				wsConn = fallbackConn
 				err = nil
@@ -3653,105 +3673,9 @@ func dialUpstreamWS(cfg *Config) (net.Conn, *bufio.Reader, *net.TCPConn, error) 
 	wsTCPConn := extractTCPConn(wsConn)
 	br := bufio.NewReaderSize(wsConn, MaxHeaderSize)
 
-	// WebSocket handshake
-	path := wsURL.Path
-	if path == "" {
-		path = "/"
-	}
-	var wsKey [16]byte
-	if _, err := rand.Read(wsKey[:]); err != nil {
+	if err := performWSHandshake(wsConn, br, cfg, wsHost, sniHostname); err != nil {
 		wsConn.Close()
 		return nil, nil, nil, err
-	}
-	wsKeyStr := base64.StdEncoding.EncodeToString(wsKey[:])
-
-	hostHeader := sanitizeHeader(wsHost)
-	if cfg.FakeHost != "" {
-		hostHeader = sanitizeHeader(cfg.FakeHost)
-	}
-
-	protocolScheme := "http"
-	if cfg.UpstreamIsWSS {
-		protocolScheme = "https"
-	}
-
-	secFetchSite := "cross-site"
-	if sniHostname == strings.Split(hostHeader, ":")[0] {
-		secFetchSite = "same-origin"
-	}
-
-	reqLine := "GET " + path + " HTTP/1.1\r\n"
-
-	fixedTop := []string{
-		"Host: " + hostHeader,
-		"Connection: Upgrade",
-		"Upgrade: websocket",
-	}
-
-	shufflable := []string{
-		"Pragma: no-cache",
-		"Cache-Control: no-cache",
-		"User-Agent: " + profile.UA,
-		"Accept-Language: " + profile.AcceptLang,
-		"Accept-Encoding: gzip, deflate, br, zstd",
-		"Origin: " + protocolScheme + "://" + sniHostname,
-	}
-
-	if profile.IsChromium && profile.SecChUA != "" {
-		shufflable = append(shufflable,
-			"sec-ch-ua: "+profile.SecChUA,
-			"sec-ch-ua-mobile: "+profile.SecChUAMob,
-			"sec-ch-ua-platform: "+profile.SecChUAPlat,
-		)
-	}
-
-	fixedBottom := []string{
-		"Sec-WebSocket-Version: 13",
-		"Sec-WebSocket-Key: " + wsKeyStr,
-		"Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits",
-		"Sec-Fetch-Dest: websocket",
-		"Sec-Fetch-Mode: websocket",
-		"Sec-Fetch-Site: " + secFetchSite,
-	}
-
-	for i := len(shufflable) - 1; i > 0; i-- {
-		j := mrand.Intn(i + 1)
-		shufflable[i], shufflable[j] = shufflable[j], shufflable[i]
-	}
-
-	handshakeBuf := handshakeBufPool.Get().(*bytes.Buffer)
-	handshakeBuf.Reset()
-	handshakeBuf.WriteString(reqLine)
-	for _, h := range fixedTop {
-		handshakeBuf.WriteString(h)
-		handshakeBuf.WriteString("\r\n")
-	}
-	for _, h := range shufflable {
-		handshakeBuf.WriteString(h)
-		handshakeBuf.WriteString("\r\n")
-	}
-	for _, h := range fixedBottom {
-		handshakeBuf.WriteString(h)
-		handshakeBuf.WriteString("\r\n")
-	}
-	handshakeBuf.WriteString("\r\n")
-
-	if _, err := wsConn.Write(handshakeBuf.Bytes()); err != nil {
-		handshakeBufPool.Put(handshakeBuf)
-		wsConn.Close()
-		return nil, nil, nil, err
-	}
-	handshakeBufPool.Put(handshakeBuf)
-
-	setTCPReadDeadline(wsTCPConn, cfg.ConnTimeout)
-	respBytes, err := readUntilCRLFCRLF(br)
-	if err != nil {
-		wsConn.Close()
-		return nil, nil, nil, err
-	}
-	if !bytes.Contains(respBytes, []byte("101")) {
-		wsConn.Close()
-		return nil, nil, nil, fmt.Errorf("handshake failed: %s", string(respBytes))
 	}
 
 	return wsConn, br, wsTCPConn, nil
@@ -3957,21 +3881,33 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		atyp := reqHead[3]
 
 		if cmd == 0x03 {
-			// SOCKS5 UDP ASSOCIATE
+			// SOCKS5 UDP ASSOCIATE: strictly check all read errors to avoid processing truncated requests
 			if atyp == 0x01 {
 				var ipBuf [4]byte
-				io.ReadFull(localConn, ipBuf[:])
+				if _, err := io.ReadFull(localConn, ipBuf[:]); err != nil {
+					return
+				}
 			} else if atyp == 0x03 {
 				var lenBuf [1]byte
-				io.ReadFull(localConn, lenBuf[:])
+				if _, err := io.ReadFull(localConn, lenBuf[:]); err != nil {
+					return
+				}
 				domainBuf := make([]byte, int(lenBuf[0]))
-				io.ReadFull(localConn, domainBuf)
+				if _, err := io.ReadFull(localConn, domainBuf); err != nil {
+					return
+				}
 			} else if atyp == 0x04 {
 				var ipBuf [16]byte
-				io.ReadFull(localConn, ipBuf[:])
+				if _, err := io.ReadFull(localConn, ipBuf[:]); err != nil {
+					return
+				}
+			} else {
+				return
 			}
 			var portBuf [2]byte
-			io.ReadFull(localConn, portBuf[:])
+			if _, err := io.ReadFull(localConn, portBuf[:]); err != nil {
+				return
+			}
 
 			handleClientUDP(localConn, cfg)
 			return
@@ -4015,21 +3951,44 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		portVal := binary.BigEndian.Uint16(portBuf[:])
 		targetPort = strconv.Itoa(int(portVal))
 	} else {
-		// HTTP Proxy
+		// HTTP Proxy: read full request header handling TCP fragmentation
 		restPtr := cfg.HeaderBufPool.Get().(*[]byte)
 		restBuf := *restPtr
-		n, readErr := localConn.Read(restBuf)
-		if readErr != nil && n == 0 {
-			cfg.HeaderBufPool.Put(restPtr)
-			return
+		restBuf[0] = buf[0]
+		totalRead := 1
+
+		for {
+			if bytes.Contains(restBuf[:totalRead], []byte("\r\n\r\n")) ||
+				bytes.Contains(restBuf[:totalRead], []byte("\n\n")) {
+				break
+			}
+			if totalRead >= len(restBuf) {
+				cfg.HeaderBufPool.Put(restPtr)
+				return
+			}
+			n, readErr := localConn.Read(restBuf[totalRead:])
+			if n > 0 {
+				totalRead += n
+			}
+			if readErr != nil {
+				if totalRead <= 1 {
+					cfg.HeaderBufPool.Put(restPtr)
+					return
+				}
+				break
+			}
 		}
-		// Parse first line byte-level (avoids string concat + Fields allocs)
-		firstLineEnd := bytes.Index(restBuf[:n], crlfB)
+
+		headerBytes := restBuf[:totalRead]
+		firstLineEnd := bytes.Index(headerBytes, crlfB)
 		if firstLineEnd < 0 {
-			cfg.HeaderBufPool.Put(restPtr)
-			return
+			firstLineEnd = bytes.IndexByte(headerBytes, '\n')
+			if firstLineEnd < 0 {
+				cfg.HeaderBufPool.Put(restPtr)
+				return
+			}
 		}
-		firstLine := restBuf[:firstLineEnd]
+		firstLine := headerBytes[:firstLineEnd]
 		sp1 := bytes.IndexByte(firstLine, ' ')
 		if sp1 < 0 {
 			cfg.HeaderBufPool.Put(restPtr)
@@ -4043,29 +4002,30 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		} else {
 			urlBytes = rest
 		}
-		// Reconstruct full method name with allocation-free fast-path matching
+
 		var method string
-		firstPart := firstLine[:sp1]
-		if buf[0] == 'G' && bytes.Equal(firstPart, []byte("ET")) {
+		methodBytes := firstLine[:sp1]
+		if bytes.Equal(methodBytes, []byte("GET")) {
 			method = "GET"
-		} else if buf[0] == 'C' && bytes.Equal(firstPart, []byte("ONNECT")) {
+		} else if bytes.Equal(methodBytes, []byte("CONNECT")) {
 			method = "CONNECT"
-		} else if buf[0] == 'P' && bytes.Equal(firstPart, []byte("OST")) {
+		} else if bytes.Equal(methodBytes, []byte("POST")) {
 			method = "POST"
-		} else if buf[0] == 'P' && bytes.Equal(firstPart, []byte("UT")) {
+		} else if bytes.Equal(methodBytes, []byte("PUT")) {
 			method = "PUT"
-		} else if buf[0] == 'D' && bytes.Equal(firstPart, []byte("ELETE")) {
+		} else if bytes.Equal(methodBytes, []byte("DELETE")) {
 			method = "DELETE"
-		} else if buf[0] == 'H' && bytes.Equal(firstPart, []byte("EAD")) {
+		} else if bytes.Equal(methodBytes, []byte("HEAD")) {
 			method = "HEAD"
-		} else if buf[0] == 'O' && bytes.Equal(firstPart, []byte("PTIONS")) {
+		} else if bytes.Equal(methodBytes, []byte("OPTIONS")) {
 			method = "OPTIONS"
-		} else if buf[0] == 'P' && bytes.Equal(firstPart, []byte("ATCH")) {
+		} else if bytes.Equal(methodBytes, []byte("PATCH")) {
 			method = "PATCH"
 		} else {
-			method = string(buf[0]) + string(firstPart)
+			method = string(methodBytes)
 		}
 		urlPart := string(urlBytes)
+
 		if method == "CONNECT" {
 			if strings.Contains(urlPart, ":") {
 				h, p, splitErr := net.SplitHostPort(urlPart)
@@ -4082,11 +4042,11 @@ func handleClient(localConn net.Conn, cfg *Config) {
 			cfg.HeaderBufPool.Put(restPtr)
 			initialPayload = nil
 		} else {
-			fullData := make([]byte, 1+n)
-			copy(fullData, buf[:])
-			copy(fullData[1:], restBuf[:n])
+			fullData := make([]byte, totalRead)
+			copy(fullData, headerBytes)
 			cfg.HeaderBufPool.Put(restPtr)
 			initialPayload = fullData
+
 			u, err := url.Parse(urlPart)
 			if err == nil && u.Host != "" {
 				if strings.Contains(u.Host, ":") {
@@ -4102,7 +4062,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 				}
 			} else {
 				// Search Host header at byte level
-				searchData := fullData[firstLineEnd+3:]
+				searchData := fullData[firstLineEnd+1:]
 				for len(searchData) > 0 {
 					lineEnd := bytes.Index(searchData, crlfB)
 					var line []byte
@@ -4697,6 +4657,8 @@ type QUICClientPool struct {
 	mu       sync.Mutex
 	dialAddr string
 	tlsConf  *tls.Config
+	dialing  chan struct{}
+	closed   bool
 }
 
 func NewQUICClientPool(cfg *Config) (*QUICClientPool, error) {
@@ -4730,20 +4692,93 @@ func NewQUICClientPool(cfg *Config) (*QUICClientPool, error) {
 }
 
 func (p *QUICClientPool) GetStream() (quic.Stream, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(p.cfg.ConnTimeout)*time.Second)
 	defer cancel()
 
-	if p.conn != nil {
-		stream, err := p.conn.OpenStreamSync(ctx)
-		if err == nil {
-			return stream, nil
+	for {
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return nil, errors.New("quic client pool closed")
 		}
-		p.conn = nil
-	}
 
+		// 1. If an active connection exists, attempt to open a stream outside the lock.
+		if p.conn != nil {
+			conn := p.conn
+			p.mu.Unlock()
+
+			stream, err := conn.OpenStreamSync(ctx)
+			if err == nil {
+				return stream, nil
+			}
+
+			// OpenStreamSync failed on existing connection: close to avoid leak and clear pool reference
+			_ = conn.CloseWithError(0x01, "stream open failed")
+			p.mu.Lock()
+			if p.conn == conn {
+				p.conn = nil
+			}
+			p.mu.Unlock()
+			continue
+		}
+
+		// 2. If another goroutine is currently dialing, wait on its barrier outside the lock
+		if p.dialing != nil {
+			waitCh := p.dialing
+			p.mu.Unlock()
+
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-waitCh:
+				// Dialer finished; loop back to check newly established connection
+				continue
+			}
+		}
+
+		// 3. We are the elected dialer: set up dialing barrier and release mutex
+		dialingCh := make(chan struct{})
+		p.dialing = dialingCh
+		p.mu.Unlock()
+
+		// Perform DNS resolution, DialAddr and OpenStreamSync completely OUTSIDE p.mu
+		return p.dialAndOpenStream(ctx, dialingCh)
+	}
+}
+
+func (p *QUICClientPool) dialAndOpenStream(ctx context.Context, dialingCh chan struct{}) (quic.Stream, error) {
+	var newConn quic.Connection
+	var stream quic.Stream
+	var dialErr error
+
+	defer func() {
+		p.mu.Lock()
+		if dialErr != nil || stream == nil {
+			if newConn != nil {
+				_ = newConn.CloseWithError(0x01, "stream open failed")
+			}
+			if p.conn == newConn {
+				p.conn = nil
+			}
+		} else if !p.closed {
+			p.conn = newConn
+		} else {
+			// Pool was closed while dialing
+			if newConn != nil {
+				_ = newConn.CloseWithError(0, "client closed")
+			}
+			if stream != nil {
+				_ = stream.Close()
+				stream = nil
+			}
+			dialErr = errors.New("quic client pool closed")
+		}
+		p.dialing = nil
+		close(dialingCh)
+		p.mu.Unlock()
+	}()
+
+	// 1. DNS Resolve outside lock
 	dialHost, dialPort, _ := net.SplitHostPort(p.dialAddr)
 	if p.cfg.Resolver != nil {
 		if resolvedIP, rErr := p.cfg.Resolver.Resolve(dialHost); rErr == nil {
@@ -4752,18 +4787,25 @@ func (p *QUICClientPool) GetStream() (quic.Stream, error) {
 	}
 	actualAddr := net.JoinHostPort(dialHost, dialPort)
 
-	conn, err := quic.DialAddr(ctx, actualAddr, p.tlsConf, defaultQUICConfig())
-	if err != nil {
-		return nil, err
+	// 2. DialAddr outside lock
+	newConn, dialErr = quic.DialAddr(ctx, actualAddr, p.tlsConf, defaultQUICConfig())
+	if dialErr != nil {
+		return nil, dialErr
 	}
-	p.conn = conn
 
-	return conn.OpenStreamSync(ctx)
+	// 3. OpenStreamSync on the newly established connection outside lock
+	stream, dialErr = newConn.OpenStreamSync(ctx)
+	if dialErr != nil {
+		return nil, dialErr
+	}
+
+	return stream, nil
 }
 
 func (p *QUICClientPool) Close() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.closed = true
 	if p.conn != nil {
 		p.conn.CloseWithError(0, "client closed")
 		p.conn = nil
@@ -4969,4 +5011,3 @@ func handleClientUDPQUIC(localConn net.Conn, boundAddr *net.UDPAddr, udpListener
 	stream.Close()
 	localConn.Close()
 }
-

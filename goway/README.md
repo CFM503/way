@@ -1,8 +1,26 @@
-# GOWAY v1.7.7
+# GOWAY v1.7.8
 
 GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具，支持 HTTP 和完整 SOCKS5 (TCP + UDP) 协议，具备浏览器指纹伪装、0-RTT 多路复用 (Mux)、QUIC 弱网抗丢包传输、Cloudflare CDN 边缘接入与 PGO 机器码级性能优化。
 
 ## 版本历史
+
+### v1.7.8 (2026-09-04) - Mux死锁治理、QUIC连接池优化、TCP分包与协议鲁棒性加固
+
+#### 核心优化与 Bug 修复
+
+| 优化项 | 说明 | 效果 |
+|---|---|---|
+| **Mux 会话销毁死锁修复 (P0)** | 修复 `MuxClientSession.Close()` 与 `MuxServerSession.Close()` 在持有互斥锁时级联调用 `st.Reset()` 导致的自死锁 | **确保高并发连接断开、重连与进程退出时 100% 幂等无死锁** |
+| **QUIC 连接池锁粒度与防泄漏 (P0)** | DNS 解析、`quic.DialAddr` 与 `OpenStreamSync` 移至锁外，引入 Single-flight 屏障防止建连风暴，建流失败立即安全回收连接 | **消除高并发下长时间互斥锁阻塞假死，彻底杜绝孤儿 QUIC 连接泄漏** |
+| **HTTP TCP 分包粘包治理 (P0)** | 客户端代理 HTTP CONNECT 请求头读取引入循环缓冲区，完整检测 `\r\n\r\n` / `\n\n` 并限制 `MaxHeaderSize` | **彻底解决 TCP 分包切片时解析截断导致的 Bad Request 错误，兼具慢速 DoS 防护** |
+| **SOCKS5 UDP ASSOCIATE 边界保护 (P0)** | 对 SOCKS5 UDP 协商响应读取中全部 `io.ReadFull` 增加严格的错误与截断校验 | **防止网络异常或报文残缺时进入未定义解析状态，增强协议健壮性** |
+| **Mux 慢流背压与自动回收 (P1)** | `MuxServerStream.PushData` 遇到拥塞超时或断开时，自动从 Session 映射中摘除并发送 RST | **杜绝因单一慢流或僵死流积压阻塞整个多路复用隧道的读循环** |
+| **WebSocket RFC 6455 规范合规 (P1)** | 严格校验控制帧大小 (≤125 字节)、非法 Opcode 拦截，支持标准 Pong 帧回应与 64KB 缓冲池容量封顶 | **全面提升隧道传输标准合规度，防止内存缓冲池无界增长** |
+| **isLocalTarget 安全精准判定 (P2)** | 使用 `net.ParseIP` 标准库解析取代字符串前缀匹配，严格识别 IPv4/IPv6 私网与回环段 | **杜绝地址混淆绕过，精准拦截非法本地回环与内网探测请求** |
+| **冗余死代码与结构精简** | 移除未使用的回退拨号函数、字符串填充函数，精简配置结构体冗余字段 | **优化编译体积与内存结构，降低心智负担** |
+| **全覆盖暴力压测与测试套件** | 新增覆盖 100+ 并发 QUIC 流、150+ 并发 Mux 流、100MB 视频流吞吐及快速断连的自动化测试套件 | **在真实跨国 WAN 复杂弱网环境下 100% 稳定运行无丢包** |
+
+---
 
 ### v1.7.7 (2026-09-04) - QUIC 协议端到端全面验证、UDP 防火墙指南与公网部署加固
 
@@ -270,8 +288,8 @@ var handshakeBufPool = sync.Pool{
 ### Test 0: 基线测试 (v1.4.7 默认配置)
 
 **配置**:
-- 服务器: `-p 0.0.0.0:2052 -k a6835181 -log INFO -W 512 --socket-buffer 4096`
-- 客户端: `-p :1080 -up ws://192.3.152.210:2052 -k a6835181`
+- 服务器: `-p 0.0.0.0:2052 -k my_secret_key -log INFO -W 512 --socket-buffer 4096`
+- 客户端: `-p :1080 -up ws://198.51.100.1:2052 -k my_secret_key`
 
 **结果** (YouTube 主页，SOCKS5 代理):
 | 运行 | 总时间 | TTFB | 速度 | 大小 |
@@ -388,7 +406,7 @@ var handshakeBufPool = sync.Pool{
 
 ### Test 7: 加密模式 + 优化缓冲区
 
-**配置**: `-k a6835181`（启用加密），1MB 缓冲区，8MB socket 缓冲区
+**配置**: `-k my_secret_key`（启用加密），1MB 缓冲区，8MB socket 缓冲区
 
 **结果**:
 | 运行 | 总时间 | TTFB | 速度 | 大小 |
