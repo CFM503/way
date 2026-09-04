@@ -111,22 +111,29 @@ python pyway/pyway1.3.2.py -p :1080 -up ws://<你的服务器IP>:8080 -k "my_sec
 
 | 参数 (Go / Python) | 必需 | 默认值 | 描述 / 隐式生效状态 |
 | :--- | :---: | :---: | :--- |
-| `-p` | ✅ | - | 监听的地址和端口 (如 `:8080` 或 `127.0.0.1:1080`)。 |
-| `-up` | ❌ | - | 上游的 WebSocket URL。如果指定了该参数，程序将作为 **客户端** 运行，否则作为 **服务器端** 运行。 |
-| `-k` | ✅* | - | 流量混淆/认证密钥。（*服务端模式必须，除非使用 `--allow-open`） |
-| `-fakehost` | ❌ | - | 伪造的 WS握手 `Host` 头以配合 CDN 或 Nginx 反代过白名单。 |
-| `--block-local` / `-block-local` | ❌ | `true` | **默认启用**。客户端防回环/防死循环特性：主动拦截发往 `localhost` 及局域网的请求。在 Python 中可传入 `--no-block-local` 关闭。 |
-| `-log` | ❌ | `INFO` | 日志打印级别: `DEBUG`, `INFO`, `WARN`, `ERROR`。 |
-| `-W` | ❌ | `256` | **默认 256 KB**。应用层单次读取的缓冲区大小 (单位: KB)。 |
-| `--socket-buffer` / `-socket-buffer` | ❌ | `0` (系统默认) | 覆盖 OS 的 TCP Socket 缓冲区 (单位: KB)，若为 0 则使用系统自动调节。 |
-| `--max-conn` / `-max-conn` | ❌ | `1000` | 安全限制: 单实例最大并发连接数（DoS 防护）。 |
-| `--connection-timeout` / `-connection-timeout` | ❌ | `300` | 连接空闲超时时间（秒），超过该秒数未活动的连接结构会被主动回收。 |
-| `--verify-ssl` / `-verify-ssl` | ❌ | `false` | 在客户端模式下启动时，是否对 `wss://` 连接进行严格的证书验证。 |
-| `--no-tcp-nodelay` / `--no-tcp-nodelay` | ❌ | `false` | 禁用 TCP_NODELAY 算法 (不推荐)。 |
-| `--no-tcp-keepalive` / `--no-tcp-keepalive` | ❌ | `false` | 禁用 TCP KeepAlive (不推荐)。 |
+| `-p` | ✅ | - | 监听的地址和端口 (如 `:8080` 或 `0.0.0.0:8080`、`127.0.0.1:1080`)。 |
+| `-up` | ❌ | - | 上游的 WebSocket/QUIC URL (如 `ws://host:port`、`wss://host:port`、`quic://host:port`)。若指定则作为 **客户端** 运行，省略则作为 **服务端** 运行。 |
+| `-k` | ✅* | - | 流量混淆与身份认证密钥。（*服务端模式必须，除非使用 `--allow-open`） |
+| `-fakehost` | ❌ | - | 伪造的 WS握手 `Host` 头 / SNI，配合 Cloudflare CDN Anycast 或 Nginx 反代伪装。 |
+| `-mux` / `--mux` | ❌ | `true` | **默认启用**。0-RTT 多路复用隧道传输，单 TCP 连接并发多虚拟 Stream，消除建连握手等待。 |
+| `-no-mux` / `--no-mux` | ❌ | `false` | 关闭 0-RTT 多路复用（降级为 1:1 单流连接池模式）。 |
+| `-W` | ❌ | `64` | **默认 64 KB**。应用层单次传输缓冲区大小 (单位: KB)。观看 4K 视频推荐设为 `512` 或 `1024`。 |
+| `--socket-buffer` / `-socket-buffer` | ❌ | `0` (系统自动调谐) | 覆盖 OS 的 TCP Socket 缓冲区 (单位: KB)，若为 0 则使用操作系统内核原生 Autotuning。 |
+| `--no-tcp-nodelay` / `-no-tcp-nodelay` | ❌ | `false` | 禁用 TCP_NODELAY 算法 (不推荐)。 |
+| `--no-tcp-keepalive` / `-no-tcp-keepalive` | ❌ | `false` | 禁用 TCP KeepAlive 心跳探测 (不推荐)。 |
+| `-dns` | ❌ | - | 远程防污染安全 DNS 服务器 IP (如 `8.8.8.8`、`1.1.1.1`)，用于解析目标域名。 |
+| `--block-local` / `-block-local` | ❌ | `true` | **默认启用**。客户端防回环/防死循环特性：主动拦截发往 `localhost` 及局域网的请求。 |
+| `--no-block-local` / `-no-block-local` | ❌ | `false` | 允许客户端转发发往 `localhost` 及局域网内部的请求。 |
+| `--verify-ssl` / `-verify-ssl` | ❌ | `false` | 客户端连接 `wss://` 上游时，是否开启严格 SSL 证书链验证。 |
 | `--allow-open` / `--allow-open` | ❌ | `false` | 允许服务端模式在无密钥的情况下运行（不推荐，存在开放代理风险）。 |
+| `--max-conn` / `-max-conn` | ❌ | `1000` | 安全限制: 单实例最大并发连接数（DoS 防护）。 |
+| `--connection-timeout` / `-connection-timeout` | ❌ | `60` | 连接空闲超时时间（秒），超过该秒数未活动的连接结构会被主动回收。 |
+| `-log` | ❌ | `INFO` | 日志打印级别: `DEBUG`, `INFO`, `WARN`, `ERROR`。 |
+| `-log-file` | ❌ | - | 进程退出时保存最近 10 条警告/错误日志到指定文件 (如 `goway.log`)。 |
 | `--tui` / `-tui` | ❌ | `false` | 是否开启 GUI-Style 仪表盘面板进行仪表可视化展示。 |
 | `--version` / `-version` | ❌ | - | 打印版本号并退出。 |
+| `-cpuprofile` | ❌ | - | 将 CPU 性能采样输出到文件 (用于编译器 PGO 引导优化)。 |
+| `-cpuprofile-duration` | ❌ | `0` | 在 N 秒后自动停止 CPU 性能采样并保存文件。 |
 
 ---
 
