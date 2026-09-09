@@ -1,14 +1,30 @@
-name: GoWay v1.9.2 Actions Smoke Test
+name: GoWay v1.9.3 Validated Mux Benchmark
 
 on:
+  workflow_dispatch:
   push:
     paths:
+      - 'goway/goway.go'
       - '.github/workflows/goway-smoke-v1.9.2.yml'
-  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'goway/goway.go'
+      - '.github/workflows/goway-smoke-v1.9.2.yml'
 
 jobs:
-  smoke:
+  throughput:
+    name: '${{ matrix.name }}'
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: no-mux-auth
+            client_args: '-no-mux'
+          - name: mux-1-auth
+            client_args: '-mux -mux-sessions 1'
+          - name: mux-4-auth
+            client_args: '-mux -mux-sessions 4'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -17,12 +33,38 @@ jobs:
         with:
           go-version: '1.25.x'
           cache-dependency-path: goway/go.mod
-      - name: Build GoWay
+      - name: Build and benchmark
         shell: pwsh
         working-directory: goway
         run: |
           $ErrorActionPreference = 'Stop'
           go version
-          go build -trimpath -ldflags='-s -w' -o goway-smoke.exe goway.go
-          if (-not (Test-Path .\goway-smoke.exe)) { throw 'GoWay build output missing' }
-          Write-Host 'GoWay v1.9.2 smoke build passed'
+          go build -trimpath -ldflags='-s -w' -o goway-bench.exe goway.go
+          $root = Join-Path $env:RUNNER_TEMP 'goway-bench-http'
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          $file = Join-Path $root 'payload.bin'
+          $size = 512MB
+          $fs = [System.IO.File]::Create($file)
+          try { $fs.SetLength($size) } finally { $fs.Dispose() }
+          $http = Start-Process python -ArgumentList @('-m','http.server','18000','--bind','127.0.0.1','--directory',$root) -PassThru
+          $server = $null; $client = $null
+          try {
+            Start-Sleep -Seconds 2
+            if ($http.HasExited) { throw 'HTTP server exited' }
+            $server = Start-Process .\goway-bench.exe -ArgumentList @('-p','127.0.0.1:18880','-k','benchmark','-W','1024','-no-block-local') -PassThru
+            $clientArgs = @('-p','127.0.0.1:19080','-up','ws://127.0.0.1:18880','-k','benchmark','-W','1024','-no-block-local') + '${{ matrix.client_args }}'.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries)
+            $client = Start-Process .\goway-bench.exe -ArgumentList $clientArgs -PassThru
+            Start-Sleep -Seconds 4
+            if ($server.HasExited) { throw 'GoWay server exited' }
+            if ($client.HasExited) { throw 'GoWay client exited' }
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            & curl.exe --fail --silent --show-error --socks5-hostname 127.0.0.1:19080 --output NUL http://127.0.0.1:18000/payload.bin
+            $exitCode = $LASTEXITCODE
+            $sw.Stop()
+            $sec = [Math]::Max($sw.Elapsed.TotalSeconds,0.000001)
+            $mbps = ([double]$size / $sec) * 8 / 1MB
+            if ($exitCode -ne 0) { throw "curl failed: $exitCode" }
+            Write-Host (([PSCustomObject]@{Variant='${{ matrix.name }}';Seconds=[Math]::Round($sec,3);Mbps=[Math]::Round($mbps,1)} | ConvertTo-Json -Compress))
+          } finally {
+            foreach ($id in @($client.Id,$server.Id,$http.Id)) { if ($id) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue } }
+          }
