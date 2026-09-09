@@ -1,4 +1,4 @@
-name: GoWay v1.8.9 Mux Isolation Benchmark
+name: GoWay v1.9.0 Mux Owned-Buffer Benchmark
 
 on:
   workflow_dispatch:
@@ -19,133 +19,130 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: no-mux-noauth
+          - name: no-mux-auth
             client_args: '-no-mux'
-            server_auth: '--allow-open'
-            client_auth: ''
             patch: 'none'
-          - name: mux-1-noauth
+          - name: mux-1-auth-baseline
             client_args: '-mux -mux-sessions 1'
-            server_auth: '--allow-open'
-            client_auth: ''
             patch: 'none'
-          - name: mux-1-auth
+          - name: mux-1-auth-owned
             client_args: '-mux -mux-sessions 1'
-            server_auth: '-k benchmark'
-            client_auth: '-k benchmark'
-            patch: 'none'
-          - name: mux-1-auth-60k
-            client_args: '-mux -mux-sessions 1'
-            server_auth: '-k benchmark'
-            client_auth: '-k benchmark'
-            patch: '60k'
+            patch: 'owned'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.25.x'
           cache-dependency-path: goway/go.mod
-
       - name: Build and benchmark
         shell: pwsh
         working-directory: goway
         run: |
           $ErrorActionPreference = 'Stop'
+          if ('${{ matrix.patch }}' -eq 'owned') {
+            $path = Join-Path (Get-Location) 'goway.go'
+            $s = Get-Content -Raw $path
+            $needle = @'
+func (s *MuxClientSession) readLoop() {
+'@
+            $method = @'
+func (s *MuxClientSession) SendDataFrameOwned(streamID uint32, payload []byte, frameBuf []byte) error {
+  select { case <-s.closed: return errors.New("mux session closed"); default: }
+  if len(payload) > 65535-MuxHeaderLen || len(frameBuf) < 14+MuxHeaderLen+len(payload) { return errors.New("mux owned frame exceeds buffer") }
+  s.writeMu.Lock()
+  defer s.writeMu.Unlock()
+  frameStart := 14
+  binary.BigEndian.PutUint32(frameBuf[frameStart:frameStart+4], streamID)
+  frameBuf[frameStart+4] = MuxCmdDATA
+  binary.BigEndian.PutUint16(frameBuf[frameStart+5:frameStart+7], uint16(len(payload)))
+  frameLen := MuxHeaderLen + len(payload)
+  if s.cfg.Crypto != nil { s.cfg.Crypto.TransformInPlace(frameBuf[frameStart:frameStart+frameLen]) }
+  return writeWSFramePreallocatedFast(s.wsConn, frameBuf, frameStart, frameLen, 0x2, s.prng)
+}
 
-          if ('${{ matrix.patch }}' -eq '60k') {
-            $sourcePath = Join-Path (Get-Location) 'goway.go'
-            $source = Get-Content -Raw -Path $sourcePath
-            $old = 'const maxChunk = 32 * 1024'
-            $new = 'const maxChunk = 60 * 1024'
-            if (-not $source.Contains($old)) { throw 'Expected Mux chunk constant not found' }
-            $source = $source.Replace($old, $new)
-            Set-Content -Path $sourcePath -Value $source -NoNewline
-            Write-Host 'Applied benchmark-only candidate: Mux maxChunk 32KB -> 60KB'
+func (s *MuxClientSession) readLoop() {
+'@
+            if (-not $s.Contains($needle)) { throw 'MuxClientSession readLoop anchor not found' }
+            $s = $s.Replace($needle,$method)
+            $needle = 'nr, errRead := localConn.Read(buf)'
+            $replacement = 'nr, errRead := localConn.Read(buf[21:])'
+            if (-not $s.Contains($needle)) { throw 'client relay read anchor not found' }
+            $s = $s.Replace($needle,$replacement)
+            $needle = 'if _, errWrite := stream.Write(buf[:nr]); errWrite != nil {'
+            $replacement = 'if errWrite := session.SendDataFrameOwned(streamID, buf[21:21+nr], buf); errWrite != nil {'
+            if (-not $s.Contains($needle)) { throw 'client relay write anchor not found' }
+            $s = $s.Replace($needle,$replacement)
+
+            $needle = 'func (s *MuxServerSession) SendFrame(streamID uint32, cmd byte, payload []byte) error {'
+            $method = @'
+func (s *MuxServerSession) SendDataFrameOwned(streamID uint32, payload []byte, frameBuf []byte) error {
+  select { case <-s.closed: return errors.New("mux server session closed"); default: }
+  if len(payload) > 65535-MuxHeaderLen || len(frameBuf) < 14+MuxHeaderLen+len(payload) { return errors.New("mux server owned frame exceeds buffer") }
+  s.writeMu.Lock()
+  defer s.writeMu.Unlock()
+  frameStart := 14
+  binary.BigEndian.PutUint32(frameBuf[frameStart:frameStart+4], streamID)
+  frameBuf[frameStart+4] = MuxCmdDATA
+  binary.BigEndian.PutUint16(frameBuf[frameStart+5:frameStart+7], uint16(len(payload)))
+  frameLen := MuxHeaderLen + len(payload)
+  if s.cfg.Crypto != nil { s.cfg.Crypto.TransformInPlace(frameBuf[frameStart:frameStart+frameLen]) }
+  return writeWSFramePreallocated(s.wsConn, frameBuf, frameStart, frameLen, 0x2, false)
+}
+
+func (s *MuxServerSession) SendFrame(streamID uint32, cmd byte, payload []byte) error {
+'@
+            if (-not $s.Contains($needle)) { throw 'server SendFrame anchor not found' }
+            $s = $s.Replace($needle,$method)
+            $needle = 'nr, errRead := targetConn.Read(readBuf)'
+            $replacement = 'nr, errRead := targetConn.Read(readBuf[21:])'
+            if (-not $s.Contains($needle)) { throw 'server relay read anchor not found' }
+            $s = $s.Replace($needle,$replacement)
+            $needle = 'if errWrite := s.SendFrame(st.id, MuxCmdDATA, readBuf[:nr]); errWrite != nil {'
+            $replacement = 'if errWrite := s.SendDataFrameOwned(st.id, readBuf[21:21+nr], readBuf); errWrite != nil {'
+            if (-not $s.Contains($needle)) { throw 'server relay write anchor not found' }
+            $s = $s.Replace($needle,$replacement)
+            Set-Content -Path $path -Value $s -NoNewline
+            Write-Host 'Applied benchmark-only owned-buffer Mux DATA path'
           }
-
-          go version
           go build -trimpath -ldflags='-s -w' -o goway-bench.exe goway.go
-
           $root = Join-Path $env:RUNNER_TEMP 'goway-bench-http'
           New-Item -ItemType Directory -Force -Path $root | Out-Null
           $file = Join-Path $root 'payload.bin'
           $size = 512MB
-          $fs = [System.IO.File]::Create($file)
-          try { $fs.SetLength($size) } finally { $fs.Dispose() }
-
-          $httpLog = Join-Path $env:RUNNER_TEMP 'goway-http.log'
-          $httpErr = Join-Path $env:RUNNER_TEMP 'goway-http.err.log'
-          $serverLog = Join-Path $env:RUNNER_TEMP 'goway-server.log'
-          $serverErr = Join-Path $env:RUNNER_TEMP 'goway-server.err.log'
-          $clientLog = Join-Path $env:RUNNER_TEMP 'goway-client.log'
-          $clientErr = Join-Path $env:RUNNER_TEMP 'goway-client.err.log'
-
+          $fs = [System.IO.File]::Create($file); try { $fs.SetLength($size) } finally { $fs.Dispose() }
+          $httpLog = Join-Path $env:RUNNER_TEMP 'goway-http.log'; $httpErr = Join-Path $env:RUNNER_TEMP 'goway-http.err.log'
+          $serverLog = Join-Path $env:RUNNER_TEMP 'goway-server.log'; $serverErr = Join-Path $env:RUNNER_TEMP 'goway-server.err.log'
+          $clientLog = Join-Path $env:RUNNER_TEMP 'goway-client.log'; $clientErr = Join-Path $env:RUNNER_TEMP 'goway-client.err.log'
           $http = Start-Process python -ArgumentList @('-m','http.server','18000','--bind','127.0.0.1','--directory',$root) -RedirectStandardOutput $httpLog -RedirectStandardError $httpErr -PassThru
-          $server = $null
-          $client = $null
+          $server = $null; $client = $null
           try {
             Start-Sleep -Seconds 2
-            if ($http.HasExited) { throw 'HTTP server exited before benchmark' }
-            & curl.exe --fail --silent --show-error --output NUL http://127.0.0.1:18000/payload.bin
-            if ($LASTEXITCODE -ne 0) { throw "HTTP target preflight failed: $LASTEXITCODE" }
-
-            $serverArgs = @('-p','127.0.0.1:18880') + '${{ matrix.server_auth }}'.Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries) + @('-W','1024','-no-block-local')
+            if ($http.HasExited) { throw 'HTTP server exited' }
+            $serverArgs = @('-p','127.0.0.1:18880','-k','benchmark','-W','1024','-no-block-local')
             $server = Start-Process .\goway-bench.exe -ArgumentList $serverArgs -RedirectStandardOutput $serverLog -RedirectStandardError $serverErr -PassThru
-
-            $clientArgs = @('-p','127.0.0.1:19080','-up','ws://127.0.0.1:18880') + '${{ matrix.client_auth }}'.Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries) + @('-W','1024','-no-block-local')
-            $clientArgs += '${{ matrix.client_args }}'.Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)
+            $clientArgs = @('-p','127.0.0.1:19080','-up','ws://127.0.0.1:18880','-k','benchmark','-W','1024','-no-block-local') + '${{ matrix.client_args }}'.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries)
             $client = Start-Process .\goway-bench.exe -ArgumentList $clientArgs -RedirectStandardOutput $clientLog -RedirectStandardError $clientErr -PassThru
-
             Start-Sleep -Seconds 4
-            if ($server.HasExited) { Get-Content $serverLog -ErrorAction SilentlyContinue; Get-Content $serverErr -ErrorAction SilentlyContinue; throw 'GoWay server exited before benchmark' }
-            if ($client.HasExited) { Get-Content $clientLog -ErrorAction SilentlyContinue; Get-Content $clientErr -ErrorAction SilentlyContinue; throw 'GoWay client exited before benchmark' }
-
-            $beforeServer = Get-Process -Id $server.Id -ErrorAction Stop
-            $beforeClient = Get-Process -Id $client.Id -ErrorAction Stop
-            $serverCpu0 = $beforeServer.TotalProcessorTime.TotalSeconds
-            $clientCpu0 = $beforeClient.TotalProcessorTime.TotalSeconds
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            if ($server.HasExited) { Get-Content $serverLog -ErrorAction SilentlyContinue; Get-Content $serverErr -ErrorAction SilentlyContinue; throw 'GoWay server exited' }
+            if ($client.HasExited) { Get-Content $clientLog -ErrorAction SilentlyContinue; Get-Content $clientErr -ErrorAction SilentlyContinue; throw 'GoWay client exited' }
+            $beforeServer = Get-Process -Id $server.Id; $beforeClient = Get-Process -Id $client.Id
+            $cpu0 = $beforeServer.TotalProcessorTime.TotalSeconds + $beforeClient.TotalProcessorTime.TotalSeconds
+            $sw = [Diagnostics.Stopwatch]::StartNew()
             & curl.exe --fail --silent --show-error --socks5-hostname 127.0.0.1:19080 --output NUL http://127.0.0.1:18000/payload.bin
-            $exitCode = $LASTEXITCODE
-            $sw.Stop()
-
-            $afterServer = Get-Process -Id $server.Id -ErrorAction Stop
-            $afterClient = Get-Process -Id $client.Id -ErrorAction Stop
-            $serverCpu = [Math]::Max(0, $afterServer.TotalProcessorTime.TotalSeconds - $serverCpu0)
-            $clientCpu = [Math]::Max(0, $afterClient.TotalProcessorTime.TotalSeconds - $clientCpu0)
-            $seconds = [Math]::Max($sw.Elapsed.TotalSeconds, 0.000001)
-            $bytes = [double]$size
-            $mbps = ($bytes / $seconds) * 8 / 1MB
-            $cpuPct = (($serverCpu + $clientCpu) / $seconds) / [Environment]::ProcessorCount * 100
-
-            if ($exitCode -ne 0) { throw "curl failed with exit code $exitCode" }
-            Write-Host (([PSCustomObject]@{
-              Test='goway-socks5'
-              Seconds=[Math]::Round($seconds,3)
-              Mbps=[Math]::Round($mbps,1)
-              GoWayCPUPercent=[Math]::Round($cpuPct,1)
-              Variant='${{ matrix.name }}'
-              Patch='${{ matrix.patch }}'
-              ServerAuth='${{ matrix.server_auth }}'
-              ClientAuth='${{ matrix.client_auth }}'
-            } | ConvertTo-Json -Compress))
-          }
-          finally {
-            Write-Host '=== GoWay server log ==='
-            Get-Content $serverLog -ErrorAction SilentlyContinue | Select-Object -Last 120
-            Write-Host '=== GoWay server errors ==='
-            Get-Content $serverErr -ErrorAction SilentlyContinue | Select-Object -Last 120
-            Write-Host '=== GoWay client log ==='
-            Get-Content $clientLog -ErrorAction SilentlyContinue | Select-Object -Last 120
-            Write-Host '=== GoWay client errors ==='
-            Get-Content $clientErr -ErrorAction SilentlyContinue | Select-Object -Last 120
-            Write-Host '=== System ==='
-            Get-CimInstance Win32_ComputerSystem | Select-Object NumberOfLogicalProcessors,TotalPhysicalMemory | Format-List
-            Get-CimInstance Win32_Processor | Select-Object Name,MaxClockSpeed | Format-List
-            foreach ($processId in @($client.Id,$server.Id,$http.Id)) {
-              if ($processId) { Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue }
-            }
+            $code = $LASTEXITCODE; $sw.Stop()
+            $afterServer = Get-Process -Id $server.Id; $afterClient = Get-Process -Id $client.Id
+            $cpu = ($afterServer.TotalProcessorTime.TotalSeconds + $afterClient.TotalProcessorTime.TotalSeconds) - $cpu0
+            $sec = [Math]::Max($sw.Elapsed.TotalSeconds,0.000001)
+            $mbps = ([double]$size / $sec) * 8 / 1MB
+            $cpuPct = ($cpu / $sec) / [Environment]::ProcessorCount * 100
+            if ($code -ne 0) { throw "curl failed: $code" }
+            Write-Host (([PSCustomObject]@{Variant='${{ matrix.name }}'; Seconds=[Math]::Round($sec,3); Mbps=[Math]::Round($mbps,1); GoWayCPUPercent=[Math]::Round($cpuPct,1); Patch='${{ matrix.patch }}'} | ConvertTo-Json -Compress))
+          } finally {
+            Get-Content $serverLog -ErrorAction SilentlyContinue | Select-Object -Last 80
+            Get-Content $serverErr -ErrorAction SilentlyContinue | Select-Object -Last 80
+            Get-Content $clientLog -ErrorAction SilentlyContinue | Select-Object -Last 80
+            Get-Content $clientErr -ErrorAction SilentlyContinue | Select-Object -Last 80
+            foreach ($processId in @($client.Id,$server.Id,$http.Id)) { if ($processId) { Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue } }
           }
