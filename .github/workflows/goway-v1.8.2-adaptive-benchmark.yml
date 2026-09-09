@@ -1,37 +1,30 @@
-name: GoWay v1.8.2 Adaptive Mux Benchmark
+name: GoWay v1.8.2 Adaptive Benchmark
 
 on:
   push:
     paths:
-      - '.github/workflows/trigger-v1.8.2'
-  workflow_dispatch:
-
-permissions:
-  contents: write
+      - .github/workflows/trigger-v1.8.2
 
 jobs:
-  patch-build-benchmark:
+  benchmark:
     runs-on: windows-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
           go-version: '1.25.x'
-          cache-dependency-path: goway/go.mod
-      - name: Apply v1.8.2 adaptive-session patch
+      - name: Build and benchmark
         shell: pwsh
-        working-directory: goway
         run: |
           $ErrorActionPreference = 'Stop'
-          $path = Join-Path (Get-Location) 'goway.go'
-          $text = Get-Content $path -Raw
-          if ($text -notmatch 'Version\s*=\s*"1\.8\.1"') { throw 'Expected v1.8.1 source baseline not found' }
-          $text = $text.Replace('Version        = "1.8.1"','Version        = "1.8.2"')
-          $oldBlock = @'
+          cd goway
+          $base = '0ba97216b31006a8b10e9dfb9c2ed2fe034d2899'
+          git show "${base}:goway/goway.go" | Set-Content baseline.go -NoNewline -Encoding utf8
+          $adaptive = Get-Content baseline.go -Raw
+          $adaptive = $adaptive.Replace('Version        = "1.8.1"','Version        = "1.8.2"')
+          $old = @'
 \t// If at least one session is active, select the least loaded (least active streams, with round-robin tie-breaking)
 \tif len(p.sessions) > 0 {
 \t\tsess := p.pickBestSessionLocked()
@@ -47,11 +40,10 @@ jobs:
 \t\treturn sess, nil
 \t}
 '@
-          $newBlock = @'
-\t// If at least one session is active, select the least loaded (least active streams, with round-robin tie-breaking)
+          $new = @'
+\t// Keep a single-stream workload on one physical Mux session. Scale out only
+\t// when currently available sessions are already occupied by active streams.
 \tif len(p.sessions) > 0 {
-\t\t// Keep a single-stream workload on one physical Mux session. Scale out only
-\t\t// when the currently available sessions are already occupied by active streams.
 \t\tactiveBefore := int64(0)
 \t\tfor _, s := range p.sessions {
 \t\t\tactiveBefore += s.ActiveStreams()
@@ -66,65 +58,33 @@ jobs:
 \t\treturn sess, nil
 \t}
 '@
-          if (-not $text.Contains($oldBlock)) { throw 'Expected GetSession block not found; refusing to patch' }
-          $text = $text.Replace($oldBlock, $newBlock)
-          Set-Content -Path $path -Value $text -NoNewline -Encoding utf8
-          gofmt -w goway.go
-          if (-not (Select-String -Path goway.go -Pattern 'Version\s*=\s*"1\.8\.2"' -Quiet)) { throw 'Version patch verification failed' }
-          git diff -- goway.go
+          if (-not $adaptive.Contains($old)) { throw 'adaptive patch target not found' }
+          $adaptive = $adaptive.Replace($old,$new)
+          Set-Content adaptive.go $adaptive -NoNewline -Encoding utf8
+          gofmt -w baseline.go adaptive.go
+          go build -trimpath -ldflags='-s -w' -o baseline.exe baseline.go
+          go build -trimpath -ldflags='-s -w' -o adaptive.exe adaptive.go
 
-      - name: Commit v1.8.2 patch
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add goway/goway.go
-          git commit -m 'perf(v1.8.2): defer extra Mux sessions until additional streams arrive'
-          git push origin HEAD:perf-v1.8.2-single-stream
-
-      - name: Benchmark baseline vs v1.8.2
-        shell: pwsh
-        working-directory: goway
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $base = '0ba97216b31006a8b10e9dfb9c2ed2fe034d2899'
-          git show "${base}:goway/goway.go" | Set-Content baseline-goway.go -NoNewline -Encoding utf8
-          go build -trimpath -ldflags='-s -w' -o baseline.exe baseline-goway.go
-          go build -trimpath -ldflags='-s -w' -o adaptive.exe goway.go
-          $root = Join-Path $env:RUNNER_TEMP 'goway-adaptive-http'
-          New-Item -ItemType Directory -Force -Path $root | Out-Null
-          $file = Join-Path $root 'payload.bin'
-          $size = 512MB
-          $fs = [System.IO.File]::Create($file)
-          try { $fs.SetLength($size) } finally { $fs.Dispose() }
+          $root = Join-Path $env:RUNNER_TEMP 'goway-http'
+          New-Item -ItemType Directory -Force $root | Out-Null
+          $file = Join-Path $root payload.bin
+          $fs = [IO.File]::Create($file); try {$fs.SetLength(512MB)} finally {$fs.Dispose()}
           $http = Start-Process python -ArgumentList @('-m','http.server','18000','--bind','127.0.0.1','--directory',$root) -PassThru
           try {
-            Start-Sleep -Seconds 2
-            if ($http.HasExited) { throw 'HTTP server exited' }
-            foreach ($case in @(@('v1.8.1-baseline','baseline.exe'),@('v1.8.2-adaptive','adaptive.exe'))) {
+            Start-Sleep 2
+            foreach($case in @(@('baseline','baseline.exe'),@('adaptive','adaptive.exe'))){
               $label=$case[0]; $exe=$case[1]
               $server=Start-Process ".\$exe" -ArgumentList @('-p','127.0.0.1:18880','-k','benchmark','-W','1024','-no-block-local','-log','ERROR') -PassThru
               $client=Start-Process ".\$exe" -ArgumentList @('-p','127.0.0.1:19080','-up','ws://127.0.0.1:18880','-k','benchmark','-W','1024','-no-block-local','-mux','-mux-sessions','4','-log','ERROR') -PassThru
               try {
-                Start-Sleep -Seconds 3
-                if ($server.HasExited -or $client.HasExited) { throw "$label process exited before benchmark" }
+                Start-Sleep 3
+                if($server.HasExited -or $client.HasExited){throw "$label process exited"}
                 $sw=[Diagnostics.Stopwatch]::StartNew()
                 & curl.exe --fail --silent --show-error --socks5-hostname 127.0.0.1:19080 --output NUL http://127.0.0.1:18000/payload.bin
-                $code=$LASTEXITCODE; $sw.Stop()
-                if ($code -ne 0) { throw "$label curl failed: $code" }
-                $seconds=[Math]::Max($sw.Elapsed.TotalSeconds,0.000001)
-                $mbps=($size/$seconds)*8/1MB
-                Write-Host ("RESULT {0} {1} Mbps" -f $label,[Math]::Round($mbps,1))
-              } finally {
-                foreach($p in @($client,$server)){if($p -and -not $p.HasExited){Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue}}
-              }
+                $code=$LASTEXITCODE; $sw.Stop(); if($code -ne 0){throw "$label curl failed $code"}
+                $mbps=(512MB/$sw.Elapsed.TotalSeconds)*8/1MB
+                Write-Host ("RESULT {0}: {1:N1} Mbps" -f $label,$mbps)
+              } finally {foreach($p in @($client,$server)){if($p -and -not $p.HasExited){Stop-Process $p.Id -Force -ErrorAction SilentlyContinue}}}
             }
-          } finally { if(-not $http.HasExited){Stop-Process -Id $http.Id -Force -ErrorAction SilentlyContinue} }
-
-      - name: Test and verify
-        shell: pwsh
-        working-directory: goway
-        run: |
-          $ErrorActionPreference = 'Stop'
+          } finally {if(-not $http.HasExited){Stop-Process $http.Id -Force -ErrorAction SilentlyContinue}}
           go test ./...
