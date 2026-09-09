@@ -1,8 +1,12 @@
-name: GoWay v1.8.4 Performance Benchmark
+name: GoWay v1.8.5 Performance Benchmark
 
 on:
   workflow_dispatch:
   push:
+    paths:
+      - 'goway/goway.go'
+      - '.github/workflows/goway-performance-v1.8.2.yml'
+  pull_request:
     paths:
       - 'goway/goway.go'
       - '.github/workflows/goway-performance-v1.8.2.yml'
@@ -59,7 +63,7 @@ jobs:
           try {
             Start-Sleep -Seconds 2
             if ($http.HasExited) { Get-Content $httpLog -ErrorAction SilentlyContinue; Get-Content $httpErr -ErrorAction SilentlyContinue; throw 'HTTP server exited before benchmark' }
-            curl.exe --fail --silent --show-error --output NUL http://127.0.0.1:18000/payload.bin
+            & curl.exe --fail --silent --show-error --output NUL http://127.0.0.1:18000/payload.bin
             if ($LASTEXITCODE -ne 0) { throw "HTTP target preflight failed: $LASTEXITCODE" }
 
             $server = Start-Process .\goway-bench.exe -ArgumentList @('-p','127.0.0.1:18880','-k','benchmark','-W','1024','-no-block-local') -RedirectStandardOutput $serverLog -RedirectStandardError $serverErr -PassThru
