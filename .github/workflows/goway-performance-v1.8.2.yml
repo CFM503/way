@@ -1,4 +1,4 @@
-name: GoWay v1.9.0 Mux Owned-Buffer Benchmark
+name: GoWay v1.9.1 Mux Owned-Buffer Benchmark
 
 on:
   workflow_dispatch:
@@ -50,7 +50,7 @@ func (s *MuxClientSession) readLoop() {
             $method = @'
 func (s *MuxClientSession) SendDataFrameOwned(streamID uint32, payload []byte, frameBuf []byte) error {
   select { case <-s.closed: return errors.New("mux session closed"); default: }
-  if len(payload) > 65535-MuxHeaderLen || len(frameBuf) < 14+MuxHeaderLen+len(payload) { return errors.New("mux owned frame exceeds buffer") }
+  if len(frameBuf) < 14+MuxHeaderLen+len(payload) { return errors.New("mux owned frame buffer too small") }
   s.writeMu.Lock()
   defer s.writeMu.Unlock()
   frameStart := 14
@@ -71,7 +71,20 @@ func (s *MuxClientSession) readLoop() {
             if (-not $s.Contains($needle)) { throw 'client relay read anchor not found' }
             $s = $s.Replace($needle,$replacement)
             $needle = 'if _, errWrite := stream.Write(buf[:nr]); errWrite != nil {'
-            $replacement = 'if errWrite := session.SendDataFrameOwned(streamID, buf[21:21+nr], buf); errWrite != nil {'
+            $replacement = @'
+if nr > 65535-MuxHeaderLen {
+  for off := 0; off < nr; {
+    chunk := nr - off
+    if chunk > 65535-MuxHeaderLen { chunk = 65535-MuxHeaderLen }
+    if errWrite := session.SendDataFrameOwned(streamID, buf[21+off:21+off+chunk], buf[off:]); errWrite != nil {
+      return
+    }
+    off += chunk
+  }
+} else if errWrite := session.SendDataFrameOwned(streamID, buf[21:21+nr], buf); errWrite != nil {
+  return
+}
+'@
             if (-not $s.Contains($needle)) { throw 'client relay write anchor not found' }
             $s = $s.Replace($needle,$replacement)
 
@@ -79,7 +92,7 @@ func (s *MuxClientSession) readLoop() {
             $method = @'
 func (s *MuxServerSession) SendDataFrameOwned(streamID uint32, payload []byte, frameBuf []byte) error {
   select { case <-s.closed: return errors.New("mux server session closed"); default: }
-  if len(payload) > 65535-MuxHeaderLen || len(frameBuf) < 14+MuxHeaderLen+len(payload) { return errors.New("mux server owned frame exceeds buffer") }
+  if len(frameBuf) < 14+MuxHeaderLen+len(payload) { return errors.New("mux server owned frame buffer too small") }
   s.writeMu.Lock()
   defer s.writeMu.Unlock()
   frameStart := 14
@@ -100,11 +113,24 @@ func (s *MuxServerSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
             if (-not $s.Contains($needle)) { throw 'server relay read anchor not found' }
             $s = $s.Replace($needle,$replacement)
             $needle = 'if errWrite := s.SendFrame(st.id, MuxCmdDATA, readBuf[:nr]); errWrite != nil {'
-            $replacement = 'if errWrite := s.SendDataFrameOwned(st.id, readBuf[21:21+nr], readBuf); errWrite != nil {'
+            $replacement = @'
+if nr > 65535-MuxHeaderLen {
+  for off := 0; off < nr; {
+    chunk := nr - off
+    if chunk > 65535-MuxHeaderLen { chunk = 65535-MuxHeaderLen }
+    if errWrite := s.SendDataFrameOwned(st.id, readBuf[21+off:21+off+chunk], readBuf[off:]); errWrite != nil {
+      return
+    }
+    off += chunk
+  }
+} else if errWrite := s.SendDataFrameOwned(st.id, readBuf[21:21+nr], readBuf); errWrite != nil {
+  return
+}
+'@
             if (-not $s.Contains($needle)) { throw 'server relay write anchor not found' }
             $s = $s.Replace($needle,$replacement)
             Set-Content -Path $path -Value $s -NoNewline
-            Write-Host 'Applied benchmark-only owned-buffer Mux DATA path'
+            Write-Host 'Applied benchmark-only v1.9.1 owned-buffer Mux DATA path'
           }
           go build -trimpath -ldflags='-s -w' -o goway-bench.exe goway.go
           $root = Join-Path $env:RUNNER_TEMP 'goway-bench-http'
