@@ -1,4 +1,4 @@
-name: GoWay v1.8.5 Performance Benchmark
+name: GoWay v1.8.6 Performance Benchmark
 
 on:
   workflow_dispatch:
@@ -21,12 +21,22 @@ jobs:
         include:
           - name: mux-1
             args: '-mux -mux-sessions 1'
+            patch: 'none'
           - name: mux-4
             args: '-mux -mux-sessions 4'
+            patch: 'none'
           - name: mux-8
             args: '-mux -mux-sessions 8'
+            patch: 'none'
           - name: no-mux
             args: '-no-mux'
+            patch: 'none'
+          - name: mux-1-60k
+            args: '-mux -mux-sessions 1'
+            patch: '60k'
+          - name: mux-4-60k
+            args: '-mux -mux-sessions 4'
+            patch: '60k'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -40,6 +50,16 @@ jobs:
         working-directory: goway
         run: |
           $ErrorActionPreference = 'Stop'
+          if ('${{ matrix.patch }}' -eq '60k') {
+            $sourcePath = Join-Path (Get-Location) 'goway.go'
+            $source = Get-Content -Raw -Path $sourcePath
+            $old = 'const maxChunk = 32 * 1024'
+            $new = 'const maxChunk = 60 * 1024'
+            if (-not $source.Contains($old)) { throw "Expected Mux chunk constant not found" }
+            $source = $source.Replace($old, $new)
+            Set-Content -Path $sourcePath -Value $source -NoNewline
+            Write-Host 'Applied benchmark-only candidate: Mux maxChunk 32KB -> 60KB'
+          }
           go version
           go build -trimpath -ldflags='-s -w' -o goway-bench.exe goway.go
 
@@ -93,7 +113,7 @@ jobs:
               $mbps = ($bytes / $seconds) * 8 / 1MB
               $cpuPct = (($serverCpu + $clientCpu) / $seconds) / [Environment]::ProcessorCount * 100
               if ($exitCode -ne 0) { throw "$name curl failed with exit code $exitCode" }
-              [PSCustomObject]@{ Test=$name; Seconds=[Math]::Round($seconds,3); Mbps=[Math]::Round($mbps,1); GoWayCPUPercent=[Math]::Round($cpuPct,1) } | ConvertTo-Json -Compress
+              [PSCustomObject]@{ Test=$name; Seconds=[Math]::Round($seconds,3); Mbps=[Math]::Round($mbps,1); GoWayCPUPercent=[Math]::Round($cpuPct,1); Patch='${{ matrix.patch }}' } | ConvertTo-Json -Compress
             }
 
             Invoke-Transfer 'direct' @('--fail','--silent','--show-error','--output','NUL','http://127.0.0.1:18000/payload.bin')
