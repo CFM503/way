@@ -1,9 +1,6 @@
 name: GoWay v1.8.2 Adaptive Mux Benchmark
 
 on:
-  push:
-    branches:
-      - perf-v1.8.2-single-stream
   workflow_dispatch:
 
 permissions:
@@ -37,7 +34,6 @@ jobs:
 \tVersion        = "1.8.2"
 '@
           $text = $text.Replace($old, $new)
-
           $oldBlock = @'
 \t// If at least one session is active, select the least loaded (least active streams, with round-robin tie-breaking)
 \tif len(p.sessions) > 0 {
@@ -59,21 +55,17 @@ jobs:
 \tif len(p.sessions) > 0 {
 \t\t// Scale physical sessions only when the number of existing active streams
 \t\t// already fills the current session count. This keeps a single-stream workload
-\t\t// on one physical Mux session, while allowing additional sessions to appear
-\t\t// as additional concurrent streams arrive.
+\t\t// on one physical Mux session, while allowing additional concurrent streams to arrive.
 \t\tactiveBefore := int64(0)
 \t\tfor _, s := range p.sessions {
 \t\t\tactiveBefore += s.ActiveStreams()
 \t\t}
-
 \t\tsess := p.pickBestSessionLocked()
 \t\tsess.activeStreams.Add(1)
-
 \t\tif !p.closed && activeBefore >= int64(len(p.sessions)) && len(p.sessions)+p.dialing < p.maxSess {
 \t\t\tp.dialing++
 \t\t\tgo p.dialBackgroundSession()
 \t\t}
-
 \t\tp.mu.Unlock()
 \t\treturn sess, nil
 \t}
@@ -104,52 +96,35 @@ jobs:
           git show "$base`:goway/goway.go" | Set-Content baseline-goway.go -NoNewline -Encoding utf8
           go build -trimpath -ldflags='-s -w' -o baseline.exe baseline-goway.go
           go build -trimpath -ldflags='-s -w' -o adaptive.exe goway.go
-
           $root = Join-Path $env:RUNNER_TEMP 'goway-adaptive-http'
           New-Item -ItemType Directory -Force -Path $root | Out-Null
           $file = Join-Path $root 'payload.bin'
           $size = 512MB
           $fs = [System.IO.File]::Create($file)
           try { $fs.SetLength($size) } finally { $fs.Dispose() }
-
-          function Run-Case([string]$label, [string]$exe) {
-            $serverLog = Join-Path $env:RUNNER_TEMP "$label-server.log"
-            $serverErr = Join-Path $env:RUNNER_TEMP "$label-server.err.log"
-            $clientLog = Join-Path $env:RUNNER_TEMP "$label-client.log"
-            $clientErr = Join-Path $env:RUNNER_TEMP "$label-client.err.log"
-            $server = $null; $client = $null
-            try {
-              $server = Start-Process ".\$exe" -ArgumentList @('-p','127.0.0.1:18880','-k','benchmark','-W','1024','-no-block-local','-log','ERROR') -RedirectStandardOutput $serverLog -RedirectStandardError $serverErr -PassThru
-              $client = Start-Process ".\$exe" -ArgumentList @('-p','127.0.0.1:19080','-up','ws://127.0.0.1:18880','-k','benchmark','-W','1024','-no-block-local','-mux','-mux-sessions','4','-log','ERROR') -RedirectStandardOutput $clientLog -RedirectStandardError $clientErr -PassThru
-              Start-Sleep -Seconds 3
-              if ($server.HasExited -or $client.HasExited) { throw "$label GoWay process exited before benchmark" }
-              $sw = [Diagnostics.Stopwatch]::StartNew()
-              & curl.exe --fail --silent --show-error --socks5-hostname 127.0.0.1:19080 --output NUL http://127.0.0.1:18000/payload.bin
-              $code = $LASTEXITCODE
-              $sw.Stop()
-              if ($code -ne 0) { throw "$label curl failed: $code" }
-              $seconds = [Math]::Max($sw.Elapsed.TotalSeconds,0.000001)
-              $mbps = ($size / $seconds) * 8 / 1MB
-              [PSCustomObject]@{ Test=$label; Seconds=[Math]::Round($seconds,3); Mbps=[Math]::Round($mbps,1) } | ConvertTo-Json -Compress
-            }
-            finally {
-              foreach ($p in @($client,$server)) { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } }
-              Write-Host "=== $label client ==="
-              Get-Content $clientLog -ErrorAction SilentlyContinue | Select-Object -Last 50
-              Get-Content $clientErr -ErrorAction SilentlyContinue | Select-Object -Last 50
-            }
-          }
-
           $http = Start-Process python -ArgumentList @('-m','http.server','18000','--bind','127.0.0.1','--directory',$root) -PassThru
           try {
             Start-Sleep -Seconds 2
             if ($http.HasExited) { throw 'HTTP server exited' }
-            Run-Case 'v1.8.1-baseline' 'baseline.exe'
-            Run-Case 'v1.8.2-adaptive' 'adaptive.exe'
-          }
-          finally {
-            if (-not $http.HasExited) { Stop-Process -Id $http.Id -Force -ErrorAction SilentlyContinue }
-          }
+            foreach ($case in @(@('v1.8.1-baseline','baseline.exe'),@('v1.8.2-adaptive','adaptive.exe'))) {
+              $label=$case[0]; $exe=$case[1]
+              $server=Start-Process ".\$exe" -ArgumentList @('-p','127.0.0.1:18880','-k','benchmark','-W','1024','-no-block-local','-log','ERROR') -PassThru
+              $client=Start-Process ".\$exe" -ArgumentList @('-p','127.0.0.1:19080','-up','ws://127.0.0.1:18880','-k','benchmark','-W','1024','-no-block-local','-mux','-mux-sessions','4','-log','ERROR') -PassThru
+              try {
+                Start-Sleep -Seconds 3
+                if ($server.HasExited -or $client.HasExited) { throw "$label process exited before benchmark" }
+                $sw=[Diagnostics.Stopwatch]::StartNew()
+                & curl.exe --fail --silent --show-error --socks5-hostname 127.0.0.1:19080 --output NUL http://127.0.0.1:18000/payload.bin
+                $code=$LASTEXITCODE; $sw.Stop()
+                if ($code -ne 0) { throw "$label curl failed: $code" }
+                $seconds=[Math]::Max($sw.Elapsed.TotalSeconds,0.000001)
+                $mbps=($size/$seconds)*8/1MB
+                Write-Host ("RESULT {0} {1} Mbps" -f $label,[Math]::Round($mbps,1))
+              } finally {
+                foreach($p in @($client,$server)){if($p -and -not $p.HasExited){Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue}}
+              }
+            }
+          } finally { if(-not $http.HasExited){Stop-Process -Id $http.Id -Force -ErrorAction SilentlyContinue} }
 
       - name: Test and verify
         shell: pwsh
@@ -157,4 +132,3 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           go test ./...
-          git status --short
