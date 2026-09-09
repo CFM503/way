@@ -1,4 +1,4 @@
-name: GoWay v1.8.3 Performance Benchmark
+name: GoWay v1.8.4 Performance Benchmark
 
 on:
   workflow_dispatch:
@@ -38,53 +38,78 @@ jobs:
           $ErrorActionPreference = 'Stop'
           go version
           go build -trimpath -ldflags='-s -w' -o goway-bench.exe goway.go
+
           $root = Join-Path $env:RUNNER_TEMP 'goway-bench-http'
           New-Item -ItemType Directory -Force -Path $root | Out-Null
           $file = Join-Path $root 'payload.bin'
           $size = 512MB
-          $fs = [System.IO.File]::Create($file); try { $fs.SetLength($size) } finally { $fs.Dispose() }
+          $fs = [System.IO.File]::Create($file)
+          try { $fs.SetLength($size) } finally { $fs.Dispose() }
+
           $httpLog = Join-Path $env:RUNNER_TEMP 'goway-http.log'
           $httpErr = Join-Path $env:RUNNER_TEMP 'goway-http.err.log'
           $serverLog = Join-Path $env:RUNNER_TEMP 'goway-server.log'
           $serverErr = Join-Path $env:RUNNER_TEMP 'goway-server.err.log'
           $clientLog = Join-Path $env:RUNNER_TEMP 'goway-client.log'
           $clientErr = Join-Path $env:RUNNER_TEMP 'goway-client.err.log'
+
           $http = Start-Process python -ArgumentList @('-m','http.server','18000','--bind','127.0.0.1','--directory',$root) -RedirectStandardOutput $httpLog -RedirectStandardError $httpErr -PassThru
+          $server = $null
+          $client = $null
           try {
-            Start-Sleep 2
+            Start-Sleep -Seconds 2
+            if ($http.HasExited) { Get-Content $httpLog -ErrorAction SilentlyContinue; Get-Content $httpErr -ErrorAction SilentlyContinue; throw 'HTTP server exited before benchmark' }
             curl.exe --fail --silent --show-error --output NUL http://127.0.0.1:18000/payload.bin
+            if ($LASTEXITCODE -ne 0) { throw "HTTP target preflight failed: $LASTEXITCODE" }
+
             $server = Start-Process .\goway-bench.exe -ArgumentList @('-p','127.0.0.1:18880','-k','benchmark','-W','1024','-no-block-local') -RedirectStandardOutput $serverLog -RedirectStandardError $serverErr -PassThru
             $clientArgs = @('-p','127.0.0.1:19080','-up','ws://127.0.0.1:18880','-k','benchmark','-W','1024','-no-block-local')
             $clientArgs += '${{ matrix.args }}'.Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)
             $client = Start-Process .\goway-bench.exe -ArgumentList $clientArgs -RedirectStandardOutput $clientLog -RedirectStandardError $clientErr -PassThru
-            try {
-              Start-Sleep 4
-              if ($server.HasExited) { throw 'GoWay server exited before benchmark' }
-              if ($client.HasExited) { throw 'GoWay client exited before benchmark' }
-              function Invoke-Transfer([string]$name, [string[]]$curlArgs) {
-                $beforeServer = Get-Process -Id $server.Id -ErrorAction Stop
-                $beforeClient = Get-Process -Id $client.Id -ErrorAction Stop
-                $cpu0 = $beforeServer.TotalProcessorTime.TotalSeconds + $beforeClient.TotalProcessorTime.TotalSeconds
-                $sw = [Diagnostics.Stopwatch]::StartNew()
-                $p = Start-Process curl.exe -ArgumentList $curlArgs -NoNewWindow -PassThru -Wait
-                $sw.Stop()
-                $afterServer = Get-Process -Id $server.Id -ErrorAction Stop
-                $afterClient = Get-Process -Id $client.Id -ErrorAction Stop
-                $cpu = ($afterServer.TotalProcessorTime.TotalSeconds + $afterClient.TotalProcessorTime.TotalSeconds) - $cpu0
-                $seconds = [Math]::Max($sw.Elapsed.TotalSeconds,0.000001)
-                $mbps = ($size / $seconds) * 8 / 1MB
-                $cpuPct = ($cpu / $seconds) / [Environment]::ProcessorCount * 100
-                if ($p.ExitCode -ne 0) { throw "$name curl failed: $($p.ExitCode)" }
-                [PSCustomObject]@{Test=$name;Seconds=[Math]::Round($seconds,3);Mbps=[Math]::Round($mbps,1);GoWayCPUPercent=[Math]::Round($cpuPct,1)} | ConvertTo-Json -Compress
-              }
-              Invoke-Transfer 'direct' @('--fail','--silent','--show-error','--output','NUL','http://127.0.0.1:18000/payload.bin')
-              Invoke-Transfer 'goway-socks5' @('--fail','--silent','--show-error','--socks5-hostname','127.0.0.1:19080','--output','NUL','http://127.0.0.1:18000/payload.bin')
-            } finally {
-              if ($client) { Stop-Process -Id $client.Id -Force -ErrorAction SilentlyContinue }
-              if ($server) { Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue }
+
+            Start-Sleep -Seconds 4
+            if ($server.HasExited) { Get-Content $serverLog -ErrorAction SilentlyContinue; Get-Content $serverErr -ErrorAction SilentlyContinue; throw 'GoWay server exited before benchmark' }
+            if ($client.HasExited) { Get-Content $clientLog -ErrorAction SilentlyContinue; Get-Content $clientErr -ErrorAction SilentlyContinue; throw 'GoWay client exited before benchmark' }
+
+            function Invoke-Transfer([string]$name, [string[]]$curlArgs) {
+              $beforeServer = Get-Process -Id $server.Id -ErrorAction Stop
+              $beforeClient = Get-Process -Id $client.Id -ErrorAction Stop
+              $serverCpu0 = $beforeServer.TotalProcessorTime.TotalSeconds
+              $clientCpu0 = $beforeClient.TotalProcessorTime.TotalSeconds
+              $sw = [System.Diagnostics.Stopwatch]::StartNew()
+              & curl.exe @curlArgs
+              $exitCode = $LASTEXITCODE
+              $sw.Stop()
+              $afterServer = Get-Process -Id $server.Id -ErrorAction Stop
+              $afterClient = Get-Process -Id $client.Id -ErrorAction Stop
+              $serverCpu = [Math]::Max(0, $afterServer.TotalProcessorTime.TotalSeconds - $serverCpu0)
+              $clientCpu = [Math]::Max(0, $afterClient.TotalProcessorTime.TotalSeconds - $clientCpu0)
+              $seconds = [Math]::Max($sw.Elapsed.TotalSeconds, 0.000001)
+              $bytes = [double]$size
+              $mbps = ($bytes / $seconds) * 8 / 1MB
+              $cpuPct = (($serverCpu + $clientCpu) / $seconds) / [Environment]::ProcessorCount * 100
+              if ($exitCode -ne 0) { throw "$name curl failed with exit code $exitCode" }
+              [PSCustomObject]@{ Test=$name; Seconds=[Math]::Round($seconds,3); Mbps=[Math]::Round($mbps,1); GoWayCPUPercent=[Math]::Round($cpuPct,1) } | ConvertTo-Json -Compress
             }
-          } finally {
-            if ($http) { Stop-Process -Id $http.Id -Force -ErrorAction SilentlyContinue }
-            Get-Content $serverLog,$serverErr,$clientLog,$clientErr,$httpErr -ErrorAction SilentlyContinue | Select-Object -Last 200
-            Get-CimInstance Win32_Processor | Select-Object Name,NumberOfLogicalProcessors,MaxClockSpeed | Format-List
+
+            Invoke-Transfer 'direct' @('--fail','--silent','--show-error','--output','NUL','http://127.0.0.1:18000/payload.bin')
+            Invoke-Transfer 'goway-socks5' @('--fail','--silent','--show-error','--socks5-hostname','127.0.0.1:19080','--output','NUL','http://127.0.0.1:18000/payload.bin')
+          }
+          finally {
+            Write-Host '=== GoWay server log ==='
+            Get-Content $serverLog -ErrorAction SilentlyContinue | Select-Object -Last 120
+            Write-Host '=== GoWay server errors ==='
+            Get-Content $serverErr -ErrorAction SilentlyContinue | Select-Object -Last 120
+            Write-Host '=== GoWay client log ==='
+            Get-Content $clientLog -ErrorAction SilentlyContinue | Select-Object -Last 120
+            Write-Host '=== GoWay client errors ==='
+            Get-Content $clientErr -ErrorAction SilentlyContinue | Select-Object -Last 120
+            Write-Host '=== HTTP errors ==='
+            Get-Content $httpErr -ErrorAction SilentlyContinue | Select-Object -Last 120
+            Write-Host '=== System ==='
+            Get-CimInstance Win32_ComputerSystem | Select-Object NumberOfLogicalProcessors,TotalPhysicalMemory | Format-List
+            Get-CimInstance Win32_Processor | Select-Object Name,MaxClockSpeed | Format-List
+            foreach ($processId in @($client.Id,$server.Id,$http.Id)) {
+              if ($processId) { Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue }
+            }
           }
