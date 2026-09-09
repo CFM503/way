@@ -1,6 +1,9 @@
 name: GoWay v1.8.2 Adaptive Mux Benchmark
 
 on:
+  push:
+    paths:
+      - '.github/workflows/trigger-v1.8.2'
   workflow_dispatch:
 
 permissions:
@@ -27,13 +30,7 @@ jobs:
           $path = Join-Path (Get-Location) 'goway.go'
           $text = Get-Content $path -Raw
           if ($text -notmatch 'Version\s*=\s*"1\.8\.1"') { throw 'Expected v1.8.1 source baseline not found' }
-          $old = @'
-\tVersion        = "1.8.1"
-'@
-          $new = @'
-\tVersion        = "1.8.2"
-'@
-          $text = $text.Replace($old, $new)
+          $text = $text.Replace('Version        = "1.8.1"','Version        = "1.8.2"')
           $oldBlock = @'
 \t// If at least one session is active, select the least loaded (least active streams, with round-robin tie-breaking)
 \tif len(p.sessions) > 0 {
@@ -53,9 +50,8 @@ jobs:
           $newBlock = @'
 \t// If at least one session is active, select the least loaded (least active streams, with round-robin tie-breaking)
 \tif len(p.sessions) > 0 {
-\t\t// Scale physical sessions only when the number of existing active streams
-\t\t// already fills the current session count. This keeps a single-stream workload
-\t\t// on one physical Mux session, while allowing additional concurrent streams to arrive.
+\t\t// Keep a single-stream workload on one physical Mux session. Scale out only
+\t\t// when the currently available sessions are already occupied by active streams.
 \t\tactiveBefore := int64(0)
 \t\tfor _, s := range p.sessions {
 \t\t\tactiveBefore += s.ActiveStreams()
@@ -93,7 +89,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $base = '0ba97216b31006a8b10e9dfb9c2ed2fe034d2899'
-          git show "$base`:goway/goway.go" | Set-Content baseline-goway.go -NoNewline -Encoding utf8
+          git show "${base}:goway/goway.go" | Set-Content baseline-goway.go -NoNewline -Encoding utf8
           go build -trimpath -ldflags='-s -w' -o baseline.exe baseline-goway.go
           go build -trimpath -ldflags='-s -w' -o adaptive.exe goway.go
           $root = Join-Path $env:RUNNER_TEMP 'goway-adaptive-http'
