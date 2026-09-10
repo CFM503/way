@@ -1,0 +1,330 @@
+name: Apply GoWay MUX refactor
+
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.event.head_commit.message != 'chore: add one-time mux refactor workflow'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch MUX backpressure and half-close handling
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('goway/goway.go')
+          s = p.read_text(encoding='utf-8')
+
+          old = '''func (s *MuxStream) PushDataFrame(frame muxDataFrame) bool {
+\tdataLen := int64(len(frame.data))
+\ts.bufMu.Lock()
+\tselect {
+\tcase <-s.closed:
+\t\ts.bufMu.Unlock()
+\t\treturn false
+\tdefault:
+\t}
+\tif s.queuedBytes+dataLen > muxClientStreamBufferLimit {
+\t\ts.bufMu.Unlock()
+\t\tlogWarn("[MUX] Stream %d receive buffer limit reached, resetting stream", s.id)
+\t\ts.Reset()
+\t\treturn false
+\t}
+\tselect {
+\tcase s.readChan <- frame:
+\t\ts.queuedBytes += dataLen
+\t\ts.bufMu.Unlock()
+\t\treturn true
+\tdefault:
+\t\ts.bufMu.Unlock()
+\t\tlogWarn("[MUX] Stream %d receive queue full, resetting stream", s.id)
+\t\ts.Reset()
+\t\treturn false
+\t}
+}
+'''
+          new = '''func (s *MuxStream) enqueueDataFrame(frame muxDataFrame) bool {
+\tdataLen := int64(len(frame.data))
+\ts.bufMu.Lock()
+\tdefer s.bufMu.Unlock()
+\tselect {
+\tcase <-s.closed:
+\t\treturn false
+\tdefault:
+\t}
+\tif s.queuedBytes+dataLen > muxClientStreamBufferLimit {
+\t\treturn false
+\t}
+\tselect {
+\tcase s.readChan <- frame:
+\t\ts.queuedBytes += dataLen
+\t\treturn true
+\tdefault:
+\t\treturn false
+\t}
+}
+
+func (s *MuxStream) PushDataFrame(frame muxDataFrame) bool {
+\tdataLen := int64(len(frame.data))
+\tdeadline := time.NewTimer(3 * time.Second)
+\tdefer deadline.Stop()
+\tfor {
+\t\ts.bufMu.Lock()
+\t\tselect {
+\t\tcase <-s.closed:
+\t\t\ts.bufMu.Unlock()
+\t\t\treturn false
+\t\tdefault:
+\t\t}
+\t\tif s.queuedBytes+dataLen <= muxClientStreamBufferLimit {
+\t\t\tselect {
+\t\t\tcase s.readChan <- frame:
+\t\t\t\ts.queuedBytes += dataLen
+\t\t\t\ts.bufMu.Unlock()
+\t\t\t\treturn true
+\t\t\tdefault:
+\t\t\t}
+\t\t}
+\t\ts.bufMu.Unlock()
+\t\tselect {
+\t\tcase <-s.closed:
+\t\t\treturn false
+\t\tcase <-s.hasSpace:
+\t\tcase <-deadline.C:
+\t\t\tlogWarn("[MUX] Stream %d receive backpressure timeout, resetting stream", s.id)
+\t\t\ts.Reset()
+\t\t\treturn false
+\t\t}
+\t}
+}
+'''
+          if s.count(old) != 1:
+              raise SystemExit('client PushDataFrame marker not found exactly once')
+          s = s.replace(old, new, 1)
+
+          old = '''func (s *MuxStream) PushEOF() {
+\ts.readClosed.Store(true)
+\tselect {
+\tcase <-s.closed:
+\tdefault:
+\t\tselect {
+\t\tcase s.readChan <- muxDataFrame{data: nil}:
+\t\tdefault:
+\t\t}
+\t}
+}
+'''
+          new = '''func (s *MuxStream) PushEOF() {
+\tif s.readClosed.Swap(true) {
+\t\treturn
+\t}
+\tselect {
+\tcase <-s.closed:
+\t\treturn
+\tdefault:
+\t}
+\tselect {
+\tcase s.readChan <- muxDataFrame{data: nil}:
+\tdefault:
+\t\tselect {
+\t\tcase <-s.closed:
+\t\tcase s.hasSpace <- struct{}{}:
+\t\tdefault:
+\t\t}
+\t}
+}
+'''
+          if s.count(old) != 1:
+              raise SystemExit('PushEOF marker not found exactly once')
+          s = s.replace(old, new, 1)
+
+          old = '''func (s *MuxServerStream) PushDataFrame(frame muxDataFrame) bool {
+\tdataLen := int64(len(frame.data))
+\ts.bufMu.Lock()
+\tselect {
+\tcase <-s.closed:
+\t\ts.bufMu.Unlock()
+\t\treturn false
+\tdefault:
+\t}
+\tif s.queuedBytes+dataLen > muxServerStreamBufferLimit {
+\t\ts.bufMu.Unlock()
+\t\tlogWarn("[SERVER-MUX] Stream %d receive buffer limit reached, resetting stream", s.id)
+\t\ts.Close()
+\t\t_ = s.session.SendFrame(s.id, MuxCmdRST, nil)
+\t\treturn false
+\t}
+\tselect {
+\tcase s.writeChan <- frame:
+\t\ts.queuedBytes += dataLen
+\t\ts.bufMu.Unlock()
+\t\treturn true
+\tdefault:
+\t\ts.bufMu.Unlock()
+\t\tlogWarn("[SERVER-MUX] Stream %d receive queue full, resetting stream", s.id)
+\t\ts.Close()
+\t\t_ = s.session.SendFrame(s.id, MuxCmdRST, nil)
+\t\treturn false
+\t}
+}
+'''
+          new = '''func (s *MuxServerStream) enqueueDataFrame(frame muxDataFrame) bool {
+\tdataLen := int64(len(frame.data))
+\ts.bufMu.Lock()
+\tdefer s.bufMu.Unlock()
+\tselect {
+\tcase <-s.closed:
+\t\treturn false
+\tdefault:
+\t}
+\tif s.queuedBytes+dataLen > muxServerStreamBufferLimit {
+\t\treturn false
+\t}
+\tselect {
+\tcase s.writeChan <- frame:
+\t\ts.queuedBytes += dataLen
+\t\treturn true
+\tdefault:
+\t\treturn false
+\t}
+}
+
+func (s *MuxServerStream) PushDataFrame(frame muxDataFrame) bool {
+\tdataLen := int64(len(frame.data))
+\tdeadline := time.NewTimer(3 * time.Second)
+\tdefer deadline.Stop()
+\tfor {
+\t\ts.bufMu.Lock()
+\t\tselect {
+\t\tcase <-s.closed:
+\t\t\ts.bufMu.Unlock()
+\t\t\treturn false
+\t\tdefault:
+\t\t}
+\t\tif s.queuedBytes+dataLen <= muxServerStreamBufferLimit {
+\t\t\tselect {
+\t\t\tcase s.writeChan <- frame:
+\t\t\t\ts.queuedBytes += dataLen
+\t\t\t\ts.bufMu.Unlock()
+\t\t\t\treturn true
+\t\t\tdefault:
+\t\t\t}
+\t\t}
+\t\ts.bufMu.Unlock()
+\t\tselect {
+\t\tcase <-s.closed:
+\t\t\treturn false
+\t\tcase <-s.hasSpace:
+\t\tcase <-deadline.C:
+\t\t\tlogWarn("[SERVER-MUX] Stream %d receive backpressure timeout, resetting stream", s.id)
+\t\t\ts.Close()
+\t\t\t_ = s.session.SendFrame(s.id, MuxCmdRST, nil)
+\t\t\treturn false
+\t\t}
+\t}
+}
+'''
+          if s.count(old) != 1:
+              raise SystemExit('server PushDataFrame marker not found exactly once')
+          s = s.replace(old, new, 1)
+
+          old = '''\t\tcase MuxCmdDATA:
+\t\t\tif len(payload) > 0 {
+\t\t\t\tframe := muxDataFrame{
+\t\t\t\t\tdata: payload,
+\t\t\t\t\tbPtr: bPtr,
+\t\t\t\t\tpool: s.cfg.BufPool,
+\t\t\t\t}
+\t\t\t\tbPtr = s.cfg.BufPool.Get().(*[]byte)
+\t\t\t\tbuf = *bPtr
+\t\t\t\tif !st.PushDataFrame(frame) {
+\t\t\t\t\tframe.release()
+\t\t\t\t}
+\t\t\t\tstats.AddBytes(0, int64(len(payload)))
+\t\t\t}
+\t\tcase MuxCmdFIN:
+\t\t\tst.PushEOF()
+'''
+          new = '''\t\tcase MuxCmdDATA:
+\t\t\tif len(payload) > 0 {
+\t\t\t\tframe := muxDataFrame{
+\t\t\t\t\tdata: payload,
+\t\t\t\t\tbPtr: bPtr,
+\t\t\t\t\tpool: s.cfg.BufPool,
+\t\t\t\t}
+\t\t\t\tbPtr = s.cfg.BufPool.Get().(*[]byte)
+\t\t\t\tbuf = *bPtr
+\t\t\t\tif !st.enqueueDataFrame(frame) {
+\t\t\t\t\tframe.release()
+\t\t\t\t\tst.Reset()
+\t\t\t\t}
+\t\t\t\tstats.AddBytes(0, int64(len(payload)))
+\t\t\t}
+\t\tcase MuxCmdFIN:
+\t\t\tst.PushEOF()
+'''
+          if s.count(old) != 1:
+              raise SystemExit('client readLoop DATA marker not found exactly once')
+          s = s.replace(old, new, 1)
+
+          old = '''\t\tcase MuxCmdDATA:
+\t\t\tif len(payload) > 0 {
+\t\t\t\tframe := muxDataFrame{
+\t\t\t\t\tdata: payload,
+\t\t\t\t\tbPtr: bPtr,
+\t\t\t\t\tpool: s.cfg.BufPool,
+\t\t\t\t}
+\t\t\t\tbPtr = s.cfg.BufPool.Get().(*[]byte)
+\t\t\t\tbuf = *bPtr
+\t\t\t\tif !st.PushDataFrame(frame) {
+\t\t\t\t\tframe.release()
+\t\t\t\t}
+\t\t\t\tstats.AddBytes(0, int64(len(payload)))
+\t\t\t}
+'''
+          new = '''\t\tcase MuxCmdDATA:
+\t\t\tif len(payload) > 0 {
+\t\t\t\tframe := muxDataFrame{
+\t\t\t\t\tdata: payload,
+\t\t\t\t\tbPtr: bPtr,
+\t\t\t\t\tpool: s.cfg.BufPool,
+\t\t\t\t}
+\t\t\t\tbPtr = s.cfg.BufPool.Get().(*[]byte)
+\t\t\t\tbuf = *bPtr
+\t\t\t\tif !st.enqueueDataFrame(frame) {
+\t\t\t\t\tframe.release()
+\t\t\t\t\tst.Close()
+\t\t\t\t\t_ = st.session.SendFrame(st.id, MuxCmdRST, nil)
+\t\t\t\t}
+\t\t\t\tstats.AddBytes(0, int64(len(payload)))
+\t\t\t}
+'''
+          if s.count(old) != 1:
+              raise SystemExit('server readLoop DATA marker not found exactly once')
+          s = s.replace(old, new, 1)
+
+          p.write_text(s, encoding='utf-8')
+
+      - name: Format and test
+        run: |
+          set -euo pipefail
+          gofmt -w goway/goway.go
+          cd goway
+          go test ./... -run 'TestMuxStream|TestMuxServerStream|TestMux' -count=1
+          go test ./... -run '^$'
+          go vet ./...
+
+      - name: Commit source and remove workflow
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add goway/goway.go
+          git rm -f .github/workflows/apply-goway-mux.yml
+          git commit -m "perf: isolate mux stream backpressure and preserve half-close [skip ci]"
+          git push
