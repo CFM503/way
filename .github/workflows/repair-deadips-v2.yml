@@ -1,0 +1,73 @@
+name: Repair GoWay deadIPs v2
+
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache-dependency-path: goway/go.mod
+      - name: Repair deadIPs and compile
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('goway/goway.go')
+          s = p.read_text(encoding='utf-8')
+
+          s = s.replace(
+              '\tdeadIPs     map[string]bool // IPs that failed during session (permanent until exit)',
+              '\tdeadIPs     map[string]time.Time // temporarily suppress failed IPs', 1)
+          s = s.replace('\tdeadIPs:     make(map[string]bool),',
+                        '\tdeadIPs:     make(map[string]time.Time),', 1)
+          s = s.replace('p.deadIPs[dialHost] = true',
+                        'p.deadIPs[dialHost] = time.Now().Add(5 * time.Minute)')
+          s = s.replace('connPool.deadIPs[cfg.UpstreamHost] = true',
+                        'connPool.deadIPs[cfg.UpstreamHost] = time.Now().Add(5 * time.Minute)')
+
+          old = '''\t// Skip known-dead IPs (permanent for session)
+\tp.mu.Lock()
+\tif p.deadIPs[dialHost] {
+\t\tp.mu.Unlock()
+\t\treturn p.tryFallbackDial(dialer, wsHost, wsPort, sniHostname)
+\t}
+\tp.mu.Unlock()'''
+          new = '''\t// Skip recently failed IPs, but allow retry after cooldown.
+\tp.mu.Lock()
+\tif until, ok := p.deadIPs[dialHost]; ok {
+\t\tif time.Now().Before(until) {
+\t\t\tp.mu.Unlock()
+\t\t\treturn p.tryFallbackDial(dialer, wsHost, wsPort, sniHostname)
+\t\t}
+\t\tdelete(p.deadIPs, dialHost)
+\t}
+\tp.mu.Unlock()'''
+          if old in s:
+              s = s.replace(old, new, 1)
+
+          p.write_text(s, encoding='utf-8')
+      - name: Compile test
+        working-directory: goway
+        run: |
+          gofmt -w goway.go
+          go test ./... -run '^$'
+          go vet ./...
+      - name: Commit and remove workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add goway/goway.go .github/workflows/repair-deadips-v2.yml
+          git commit -m 'fix: use expiring deadIPs cooldown [skip ci]'
+          git push
