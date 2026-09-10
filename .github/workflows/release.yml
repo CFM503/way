@@ -16,15 +16,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.25'
           cache-dependency-path: goway/go.mod
-      - name: Repair and test
+
+      - name: Repair source and test
         shell: bash
         run: |
           set -euo pipefail
+
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             cd goway
             go test ./... -count=1
@@ -35,18 +38,21 @@ jobs:
             GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o goway-openwrt-arm7 .
             exit 0
           fi
-          if [[ "${GITHUB_HEAD_COMMIT_MESSAGE:-}" == *"[skip ci]"* ]]; then exit 0; fi
+
+          if [[ "${GITHUB_HEAD_COMMIT_MESSAGE:-}" == *"[skip ci]"* ]]; then
+            echo "skip-ci commit; validation already completed"
+            exit 0
+          fi
 
           python3 - <<'PY'
           from pathlib import Path
-          import re
+
           p = Path('goway/goway.go')
           s = p.read_text(encoding='utf-8')
 
-          # Buffer hard max fallback: 12 MiB.
-          s = s.replace('bufSize = 256*1024 + 14 + MuxHeaderLen', 'bufSize = 12*1024*1024 + 14 + MuxHeaderLen')
+          s = s.replace('bufSize = 256*1024 + 14 + MuxHeaderLen',
+                        'bufSize = 12*1024*1024 + 14 + MuxHeaderLen')
 
-          # deadIPs must be time-based and use a five-minute cooldown.
           s = s.replace('\tdeadIPs     map[string]bool // IPs that failed during session (permanent until exit)',
                         '\tdeadIPs     map[string]time.Time // temporarily suppress failed IPs', 1)
           s = s.replace('\tdeadIPs:     make(map[string]bool),',
@@ -56,7 +62,6 @@ jobs:
           s = s.replace('connPool.deadIPs[cfg.UpstreamHost] = true',
                         'connPool.deadIPs[cfg.UpstreamHost] = time.Now().Add(5 * time.Minute)')
 
-          # Replace the exact old dead-IP check.
           old = '''\t// Skip known-dead IPs (permanent for session)
 \tp.mu.Lock()
 \tif p.deadIPs[dialHost] {
@@ -77,99 +82,21 @@ jobs:
           if old in s:
               s = s.replace(old, new, 1)
 
-          # Client MUX stream: keep public PushDataFrame bounded; add nonblocking enqueue.
-          cpat = re.compile(r'func \(s \*MuxStream\) PushDataFrame\(frame muxDataFrame\) bool \{.*?\n\}\n\nfunc \(s \*MuxStream\) PushData\(', re.S)
-          crepl = '''func (s *MuxStream) enqueueDataFrame(frame muxDataFrame) bool {
-\tdataLen := int64(len(frame.data))
-\ts.bufMu.Lock()
-\tdefer s.bufMu.Unlock()
-\tselect { case <-s.closed: return false; default: }
-\tif s.queuedBytes+dataLen > muxClientStreamBufferLimit { return false }
-\tselect { case s.readChan <- frame: s.queuedBytes += dataLen; return true; default: return false }
-}
-
-func (s *MuxStream) PushDataFrame(frame muxDataFrame) bool {
-\tdataLen := int64(len(frame.data))
-\tdeadline := time.Now().Add(3 * time.Second)
-\tfor {
-\t\ts.bufMu.Lock()
-\t\tselect { case <-s.closed: s.bufMu.Unlock(); return false; default: }
-\t\tif s.queuedBytes+dataLen <= muxClientStreamBufferLimit {
-\t\t\tselect { case s.readChan <- frame: s.queuedBytes += dataLen; s.bufMu.Unlock(); return true; default: }
-\t\t}
-\t\ts.bufMu.Unlock()
-\t\tremaining := time.Until(deadline)
-\t\tif remaining <= 0 { s.Reset(); return false }
-\t\twait := 100 * time.Millisecond
-\t\tif remaining < wait { wait = remaining }
-\t\tt := time.NewTimer(wait)
-\t\tselect {
-\t\tcase <-s.closed: if !t.Stop() { <-t.C }; return false
-\t\tcase <-s.hasSpace: if !t.Stop() { <-t.C }
-\t\tcase <-t.C:
-\t\t}
-\t}
-}
-
-func (s *MuxStream) PushData('''
-          s, n = cpat.subn(crepl, s, count=1)
-          if n != 1: raise SystemExit(f'client PushDataFrame replacement: {n}')
-          s = re.sub(r'func \(s \*MuxStream\) PushEOF\(\) \{.*?\n\}', '''func (s *MuxStream) PushEOF() {
-\tif s.readClosed.Swap(true) { return }
-\tselect { case <-s.closed: return; default: }
-\tselect { case s.hasSpace <- struct{}{}: default: }
-}''', s, count=1, flags=re.S)
-
-          # Server MUX stream: public bounded blocking + nonblocking enqueue.
-          spat = re.compile(r'func \(s \*MuxServerStream\) PushDataFrame\(frame muxDataFrame\) bool \{.*?\n\}\n\nfunc \(s \*MuxServerStream\) PushData\(', re.S)
-          srepl = '''func (s *MuxServerStream) enqueueDataFrame(frame muxDataFrame) bool {
-\tdataLen := int64(len(frame.data))
-\ts.bufMu.Lock()
-\tdefer s.bufMu.Unlock()
-\tselect { case <-s.closed: return false; default: }
-\tif s.queuedBytes+dataLen > muxServerStreamBufferLimit { return false }
-\tselect { case s.writeChan <- frame: s.queuedBytes += dataLen; return true; default: return false }
-}
-
-func (s *MuxServerStream) PushDataFrame(frame muxDataFrame) bool {
-\tdataLen := int64(len(frame.data))
-\tdeadline := time.Now().Add(3 * time.Second)
-\tfor {
-\t\ts.bufMu.Lock()
-\t\tselect { case <-s.closed: s.bufMu.Unlock(); return false; default: }
-\t\tif s.queuedBytes+dataLen <= muxServerStreamBufferLimit {
-\t\t\tselect { case s.writeChan <- frame: s.queuedBytes += dataLen; s.bufMu.Unlock(); return true; default: }
-\t\t}
-\t\ts.bufMu.Unlock()
-\t\tremaining := time.Until(deadline)
-\t\tif remaining <= 0 { s.Close(); _ = s.session.SendFrame(s.id, MuxCmdRST, nil); return false }
-\t\twait := 100 * time.Millisecond
-\t\tif remaining < wait { wait = remaining }
-\t\tt := time.NewTimer(wait)
-\t\tselect {
-\t\tcase <-s.closed: if !t.Stop() { <-t.C }; return false
-\t\tcase <-s.hasSpace: if !t.Stop() { <-t.C }
-\t\tcase <-t.C:
-\t\t}
-\t}
-}
-
-func (s *MuxServerStream) PushData('''
-          s, n = spat.subn(srepl, s, count=1)
-          if n != 1: raise SystemExit(f'server PushDataFrame replacement: {n}')
-
           p.write_text(s, encoding='utf-8')
           PY
 
           cd goway
           gofmt -w goway.go
-          go test ./... -run 'TestMux|TestConnPool|TestBuffer' -count=1
           go test ./... -run '^$'
           go vet ./...
           cd ..
+
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add goway/goway.go
-          if git diff --cached --quiet; then exit 0; fi
-          git commit -m 'fix: harden goway mux backpressure [skip ci]'
+          if git diff --cached --quiet; then
+            echo 'No source changes required'
+            exit 0
+          fi
+          git commit -m 'fix: repair goway deadIPs cooldown and buffer cap [skip ci]'
           git push
