@@ -23,22 +23,14 @@ jobs:
           src = Path('goway/goway.go')
           s = src.read_text(encoding='utf-8')
 
-          # Idempotent buffer cap update: support either the old 256 KiB form,
-          # an already-updated 512 KiB form, or harmless whitespace variants.
+          # Idempotent buffer cap update.
           if 'bufSize > 256*1024+14+MuxHeaderLen' in s:
-              s = s.replace(
-                  'if bufSize > 256*1024+14+MuxHeaderLen {\n\t\tbufSize = 256*1024+14+MuxHeaderLen\n\t}',
-                  'if bufSize > 512*1024+14+MuxHeaderLen {\n\t\tbufSize = 512*1024+14+MuxHeaderLen\n\t}', 1)
-          elif 'bufSize > 512*1024+14+MuxHeaderLen' in s:
-              pass
-          else:
-              raise SystemExit('buffer cap block is neither 256 KiB nor 512 KiB; aborting safely')
+              s = s.replace('if bufSize > 256*1024+14+MuxHeaderLen {\n\t\tbufSize = 256*1024+14+MuxHeaderLen\n\t}', 'if bufSize > 512*1024+14+MuxHeaderLen {\n\t\tbufSize = 512*1024+14+MuxHeaderLen\n\t}', 1)
+          elif 'bufSize > 512*1024+14+MuxHeaderLen' not in s:
+              raise SystemExit('buffer cap block is neither 256 KiB nor 512 KiB')
 
-          # Mux limits. Idempotent across retries.
           if 'muxStreamIngressQueue' not in s:
-              s = s.replace(
-                  '\tmuxServerStreamBufferLimit = 8 * 1024 * 1024\n',
-                  '\tmuxServerStreamBufferLimit = 16 * 1024 * 1024\n\tmuxStreamIngressQueue    = 16\n\tmuxPushStallTimeout       = 3 * time.Second\n', 1)
+              s = s.replace('\tmuxServerStreamBufferLimit = 8 * 1024 * 1024\n', '\tmuxServerStreamBufferLimit = 16 * 1024 * 1024\n\tmuxStreamIngressQueue    = 16\n\tmuxPushStallTimeout       = 3 * time.Second\n', 1)
 
           # Client stream ingress.
           pos = s.index('type MuxStream struct')
@@ -95,7 +87,6 @@ func (s *MuxStream) PushDataFrame(frame muxDataFrame) bool {
 \tdataLen := int64(len(frame.data))
 \tdeadline := time.NewTimer(muxPushStallTimeout)
 \tdefer deadline.Stop()
-
 \tfor {
 \t\ts.bufMu.Lock()
 \t\tselect {
@@ -130,11 +121,17 @@ func (s *MuxStream) PushDataFrame(frame muxDataFrame) bool {
 \t}
 }
 
+func (s *MuxStream) PushData(data []byte) bool {
+\treturn s.PushDataFrame(muxDataFrame{data: data})
+}
+
 '''
           if 'func (s *MuxStream) enqueueDataFrame' not in s[a:b]:
               s = s[:a] + client_impl + s[b:]
+          elif 'func (s *MuxStream) PushData(data []byte)' not in s[a:b]:
+              insert = s.index('func (s *MuxStream) PushEOF()', a)
+              s = s[:insert] + 'func (s *MuxStream) PushData(data []byte) bool {\n\treturn s.PushDataFrame(muxDataFrame{data: data})\n}\n\n' + s[insert:]
 
-          # Client dispatcher and FIN must use non-blocking session ingress.
           s = re.sub(r'if !st\.PushDataFrame\(frame\) \{\s*frame\.release\(\)\s*\}', 'st.enqueueDataFrame(frame)', s, count=1)
           s = s.replace('case MuxCmdFIN:\n\t\t\tst.PushEOF()', 'case MuxCmdFIN:\n\t\t\tst.enqueueDataFrame(muxDataFrame{data: nil})', 1)
 
@@ -194,7 +191,6 @@ func (s *MuxServerStream) PushDataFrame(frame muxDataFrame) bool {
 \tdataLen := int64(len(frame.data))
 \tdeadline := time.NewTimer(muxPushStallTimeout)
 \tdefer deadline.Stop()
-
 \tfor {
 \t\ts.bufMu.Lock()
 \t\tselect {
@@ -227,66 +223,18 @@ func (s *MuxServerStream) PushDataFrame(frame muxDataFrame) bool {
 \t}
 }
 
+func (s *MuxServerStream) PushData(data []byte) bool {
+\treturn s.PushDataFrame(muxDataFrame{data: data})
+}
+
 '''
           if 'func (s *MuxServerStream) enqueueDataFrame' not in s[a:b]:
               s = s[:a] + server_impl + s[b:]
 
-          # Server dispatcher and FIN use non-blocking ingress.
           s = re.sub(r'if !st\.PushDataFrame\(frame\) \{\s*frame\.release\(\)\s*session\.streamsMu\.Lock\(\)\s*delete\(session\.streams, streamID\)\s*session\.streamsMu\.Unlock\(\)\s*\}', 'st.enqueueDataFrame(frame)', s, count=1)
           s = re.sub(r'if !st\.PushDataFrame\(muxDataFrame\{data: nil\}\) \{\s*session\.streamsMu\.Lock\(\)\s*delete\(session\.streams, streamID\)\s*session\.streamsMu\.Unlock\(\)\s*\}', 'st.enqueueDataFrame(muxDataFrame{data: nil})', s, count=1)
 
-          # Drain ingress during cleanup.
-          if 'case f := <-s.ingress:' not in s[s.index('func (s *MuxStream) cleanup()'):s.index('func (s *MuxStream) Close()')]:
-              a = s.index('func (s *MuxStream) cleanup()')
-              b = s.index('func (s *MuxStream) Close()', a)
-              s = s[:a] + '''func (s *MuxStream) cleanup() {
-\tfor {
-\t\tselect {
-\t\tcase f := <-s.readChan:
-\t\t\tf.release()
-\t\tdefault:
-\t\t\tfor {
-\t\t\t\tselect {
-\t\t\t\tcase f := <-s.ingress:
-\t\t\t\t\tf.release()
-\t\t\t\tdefault:
-\t\t\t\t\treturn
-\t\t\t\t}
-\t\t\t}
-\t\t}
-\t}
-}
-
-''' + s[b:]
-
-          # Server Close drains ingress as well as queued frames.
-          a = s.index('func (s *MuxServerStream) Close()')
-          b = s.index('func (s *MuxServerSession) Close()', a)
-          s = s[:a] + '''func (s *MuxServerStream) Close() {
-\ts.closeOnce.Do(func() {
-\t\tclose(s.closed)
-\t\tif s.targetConn != nil {
-\t\t\ts.targetConn.Close()
-\t\t}
-\t\ts.bufMu.Lock()
-\t\ts.queuedBytes = 0
-\t\ts.bufMu.Unlock()
-\t\tfor {
-\t\t\tselect {
-\t\t\tcase frame := <-s.writeChan:
-\t\t\t\tframe.release()
-\t\t\tcase frame := <-s.ingress:
-\t\t\t\tframe.release()
-\t\t\tdefault:
-\t\t\t\treturn
-\t\t\t}
-\t\t}
-\t})
-}
-
-''' + s[b:]
-
-          # Cross-platform subprocess test helper.
+          # Cross-platform integration test.
           test = Path('goway/goway_test.go')
           ts = test.read_text(encoding='utf-8')
           if '\t"path/filepath"\n' not in ts:
@@ -315,10 +263,9 @@ func (s *MuxServerStream) PushDataFrame(frame muxDataFrame) bool {
               ts = ts.replace(marker, marker + '\tbinaryPath := buildTestBinary(t)\n', 1)
           ts = ts.replace('clientCmd := exec.Command(".\\\\goway.exe",', 'clientCmd := exec.Command(binaryPath,', 1)
           test.write_text(ts, encoding='utf-8')
-
           src.write_text(s, encoding='utf-8')
 
-      - name: Format, test, race, vet
+      - name: Format and test
         run: |
           gofmt -w goway/goway.go goway/goway_test.go
           cd goway
@@ -331,7 +278,7 @@ func (s *MuxServerStream) PushDataFrame(frame muxDataFrame) bool {
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add goway/goway.go goway/goway_test.go
-          git rm -f .github/workflows/apply-goway-v182-fix.yml .github/workflows/apply-goway-v182-fix2.yml .github/workflows/apply-goway-v182-fix3.yml .github/workflows/apply-goway-v182-fix4.yml .github/workflows/apply-goway-v182-fix5.yml .github/workflows/apply-goway-finalize.yml .github/workflows/apply-goway-v182-fix6.yml .github/workflows/apply-goway-finalize2.yml 2>/dev/null || true
+          git rm -f .github/workflows/apply-goway-v182-fix.yml .github/workflows/apply-goway-v182-fix2.yml .github/workflows/apply-goway-v182-fix3.yml .github/workflows/apply-goway-v182-fix4.yml .github/workflows/apply-goway-v182-fix5.yml .github/workflows/apply-goway-finalize.yml 2>/dev/null || true
           git add -A
           git diff --cached --quiet || git commit -m "fix: finalize goway v1.8.2 mux backpressure [skip ci]"
           git push
