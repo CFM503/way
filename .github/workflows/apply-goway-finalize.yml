@@ -27,15 +27,12 @@ jobs:
           src = Path('goway/goway.go')
           s = src.read_text(encoding='utf-8')
 
-          # Application relay buffer: 12 MiB absolute cap (4096 KiB x 3).
+          # Application relay buffer: 12 MiB absolute cap = 4096 KiB x 3.
           s = s.replace('if bufSize > 256*1024+14+MuxHeaderLen {', 'if bufSize > 12*1024*1024+14+MuxHeaderLen {', 1)
           s = s.replace('bufSize = 256*1024+14+MuxHeaderLen', 'bufSize = 12*1024*1024+14+MuxHeaderLen', 1)
-
-          # CLI hard limit must match the internal cap.
           s = s.replace('*wFlag > 16384', '*wFlag > 12288', 1)
           s = s.replace('must be between 1 and 16384', 'must be between 1 and 12288', 1)
 
-          # Mux constants.
           if 'muxStreamIngressQueue' not in s:
               s = s.replace(
                   'muxServerStreamBufferLimit = 8 * 1024 * 1024',
@@ -43,252 +40,259 @@ jobs:
                   1,
               )
 
-          # Client stream: replace only complete function ranges, never partial braces.
-          s = s.replace('\treadMu      sync.Mutex\n}', '\treadMu      sync.Mutex\n\tingress     chan muxDataFrame\n}', 1)
-          client_block = r'''func newMuxStream(id uint32, session MuxSessionInterface) *MuxStream {
-\tst := &MuxStream{
-\t\tid:       id,
-\t\tsession:  session,
-\t\treadChan: make(chan muxDataFrame, 128),
-\t\tclosed:   make(chan struct{}),
-\t\thasSpace: make(chan struct{}, 1),
-\t\tingress:  make(chan muxDataFrame, muxStreamIngressQueue),
-\t}
-\tgo st.deliveryLoop()
-\treturn st
+          # Client stream structure.
+          client_struct_start = s.index('type MuxStream struct')
+          client_struct_end = s.index('\n}', client_struct_start)
+          client_struct = s[client_struct_start:client_struct_end]
+          if 'ingress     chan muxDataFrame' not in client_struct:
+              client_struct = client_struct.replace('\treadMu      sync.Mutex', '\treadMu      sync.Mutex\n\tingress     chan muxDataFrame')
+              s = s[:client_struct_start] + client_struct + s[client_struct_end:]
+
+          client_block = """func newMuxStream(id uint32, session MuxSessionInterface) *MuxStream {
+    st := &MuxStream{
+        id:       id,
+        session:  session,
+        readChan: make(chan muxDataFrame, 128),
+        closed:   make(chan struct{}),
+        hasSpace: make(chan struct{}, 1),
+        ingress:  make(chan muxDataFrame, muxStreamIngressQueue),
+    }
+    go st.deliveryLoop()
+    return st
 }
 
 func (s *MuxStream) enqueueDataFrame(frame muxDataFrame) bool {
-\tselect {
-\tcase <-s.closed:
-\t\tframe.release()
-\t\treturn false
-\tcase s.ingress <- frame:
-\t\treturn true
-\tdefault:
-\t\tlogWarn("[MUX] Stream %d ingress queue full, resetting stream", s.id)
-\t\tframe.release()
-\t\ts.Reset()
-\t\treturn false
-\t}
+    select {
+    case <-s.closed:
+        frame.release()
+        return false
+    case s.ingress <- frame:
+        return true
+    default:
+        logWarn("[MUX] Stream %d ingress queue full, resetting stream", s.id)
+        frame.release()
+        s.Reset()
+        return false
+    }
 }
 
 func (s *MuxStream) deliveryLoop() {
-\tfor {
-\t\tselect {
-\t\tcase <-s.closed:
-\t\t\treturn
-\t\tcase frame := <-s.ingress:
-\t\t\tif !s.PushDataFrame(frame) {
-\t\t\t\tframe.release()
-\t\t\t}
-\t\t}
-\t}
+    for {
+        select {
+        case <-s.closed:
+            return
+        case frame := <-s.ingress:
+            if !s.PushDataFrame(frame) {
+                frame.release()
+            }
+        }
+    }
 }
 
 func (s *MuxStream) PushDataFrame(frame muxDataFrame) bool {
-\tdataLen := int64(len(frame.data))
-\tdeadline := time.NewTimer(muxPushStallTimeout)
-\tdefer deadline.Stop()
-\n\tfor {
-\t\ts.bufMu.Lock()
-\t\tselect {
-\t\tcase <-s.closed:
-\t\t\ts.bufMu.Unlock()
-\t\t\treturn false
-\t\tdefault:
-\t\t}
-\t\tif frame.data == nil {
-\t\t\ts.readClosed.Store(true)
-\t\t}
-\t\tif s.queuedBytes+dataLen <= muxClientStreamBufferLimit {
-\t\t\tselect {
-\t\t\tcase s.readChan <- frame:
-\t\t\t\ts.queuedBytes += dataLen
-\t\t\t\ts.bufMu.Unlock()
-\t\t\t\treturn true
-\t\t\tdefault:
-\t\t\t}
-\t\t}
-\t\ts.bufMu.Unlock()
-\t\tselect {
-\t\tcase <-s.closed:
-\t\t\treturn false
-\t\tcase <-s.hasSpace:
-\t\t\tcontinue
-\t\tcase <-deadline.C:
-\t\t\tlogWarn("[MUX] Stream %d receive backpressure timeout, resetting stream", s.id)
-\t\t\ts.Reset()
-\t\t\treturn false
-\t\t}
-\t}
+    dataLen := int64(len(frame.data))
+    deadline := time.NewTimer(muxPushStallTimeout)
+    defer deadline.Stop()
+
+    for {
+        s.bufMu.Lock()
+        select {
+        case <-s.closed:
+            s.bufMu.Unlock()
+            return false
+        default:
+        }
+        if frame.data == nil {
+            s.readClosed.Store(true)
+        }
+        if s.queuedBytes+dataLen <= muxClientStreamBufferLimit {
+            select {
+            case s.readChan <- frame:
+                s.queuedBytes += dataLen
+                s.bufMu.Unlock()
+                return true
+            default:
+            }
+        }
+        s.bufMu.Unlock()
+        select {
+        case <-s.closed:
+            return false
+        case <-s.hasSpace:
+            continue
+        case <-deadline.C:
+            logWarn("[MUX] Stream %d receive backpressure timeout, resetting stream", s.id)
+            s.Reset()
+            return false
+        }
+    }
 }
 
 func (s *MuxStream) PushData(data []byte) bool {
-\treturn s.PushDataFrame(muxDataFrame{data: data})
+    return s.PushDataFrame(muxDataFrame{data: data})
 }
 
-'''
+"""
           s = replace_range(s, 'func newMuxStream(', 'func (s *MuxStream) PushEOF()', client_block)
 
-          # Client read loop must only enqueue into per-stream ingress.
+          # Client readLoop routes frames to ingress so one slow stream cannot stall the session.
           s = s.replace('if !st.PushDataFrame(frame) {\n\t\t\t\t\tframe.release()\n\t\t\t\t}', 'st.enqueueDataFrame(frame)', 1)
           s = s.replace('case MuxCmdFIN:\n\t\t\tst.PushEOF()', 'case MuxCmdFIN:\n\t\t\tst.enqueueDataFrame(muxDataFrame{data: nil})', 1)
 
-          # Client cleanup also releases pending ingress frames.
           cleanup_start = s.index('func (s *MuxStream) cleanup()')
           cleanup_end = s.index('func (s *MuxStream) Close()', cleanup_start)
-          cleanup_block = r'''func (s *MuxStream) cleanup() {
-\ts.readMu.Lock()
-\ts.curFrame.release()
-\ts.readBuf = nil
-\ts.readPos = 0
-\ts.readMu.Unlock()
-\n\ts.bufMu.Lock()
-\ts.queuedBytes = 0
-\ts.bufMu.Unlock()
-\n\tfor {
-\t\tselect {
-\t\tcase f := <-s.readChan:
-\t\t\tf.release()
-\t\tcase f := <-s.ingress:
-\t\t\tf.release()
-\t\tdefault:
-\t\t\treturn
-\t\t}
-\t}
+          cleanup_block = """func (s *MuxStream) cleanup() {
+    s.readMu.Lock()
+    s.curFrame.release()
+    s.readBuf = nil
+    s.readPos = 0
+    s.readMu.Unlock()
+
+    s.bufMu.Lock()
+    s.queuedBytes = 0
+    s.bufMu.Unlock()
+
+    for {
+        select {
+        case f := <-s.readChan:
+            f.release()
+        case f := <-s.ingress:
+            f.release()
+        default:
+            return
+        }
+    }
 }
 
-'''
+"""
           s = s[:cleanup_start] + cleanup_block + s[cleanup_end:]
 
-          # Server stream.
-          marker = '\tqueuedBytes int64\n\thasSpace    chan struct{}\n}'
+          # Server stream structure.
           server_struct_start = s.index('type MuxServerStream struct')
           server_struct_end = s.index('func newMuxServerStream(', server_struct_start)
-          if '\tingress     chan muxDataFrame' not in s[server_struct_start:server_struct_end]:
-              s = s.replace(marker, '\tqueuedBytes int64\n\thasSpace    chan struct{}\n\tingress     chan muxDataFrame\n}', 1)
+          server_struct = s[server_struct_start:server_struct_end]
+          if 'ingress     chan muxDataFrame' not in server_struct:
+              server_struct = server_struct.replace('\thasSpace    chan struct{}', '\thasSpace    chan struct{}\n\tingress     chan muxDataFrame')
+              s = s[:server_struct_start] + server_struct + s[server_struct_end:]
 
-          server_block = r'''func newMuxServerStream(id uint32, session *MuxServerSession) *MuxServerStream {
-\tst := &MuxServerStream{
-\t\tid:        id,
-\t\tsession:   session,
-\t\twriteChan: make(chan muxDataFrame, 256),
-\t\tclosed:    make(chan struct{}),
-\t\thasSpace:  make(chan struct{}, 1),
-\t\tingress:   make(chan muxDataFrame, muxStreamIngressQueue),
-\t}
-\tgo st.deliveryLoop()
-\treturn st
+          server_block = """func newMuxServerStream(id uint32, session *MuxServerSession) *MuxServerStream {
+    st := &MuxServerStream{
+        id:        id,
+        session:   session,
+        writeChan: make(chan muxDataFrame, 256),
+        closed:    make(chan struct{}),
+        hasSpace:  make(chan struct{}, 1),
+        ingress:   make(chan muxDataFrame, muxStreamIngressQueue),
+    }
+    go st.deliveryLoop()
+    return st
 }
 
 func (s *MuxServerStream) enqueueDataFrame(frame muxDataFrame) bool {
-\tselect {
-\tcase <-s.closed:
-\t\tframe.release()
-\t\treturn false
-\tcase s.ingress <- frame:
-\t\treturn true
-\tdefault:
-\t\tlogWarn("[SERVER-MUX] Stream %d ingress queue full, resetting stream", s.id)
-\t\tframe.release()
-\t\ts.Close()
-\t\t_ = s.session.SendFrame(s.id, MuxCmdRST, nil)
-\t\treturn false
-\t}
+    select {
+    case <-s.closed:
+        frame.release()
+        return false
+    case s.ingress <- frame:
+        return true
+    default:
+        logWarn("[SERVER-MUX] Stream %d ingress queue full, resetting stream", s.id)
+        frame.release()
+        s.Close()
+        _ = s.session.SendFrame(s.id, MuxCmdRST, nil)
+        return false
+    }
 }
 
 func (s *MuxServerStream) deliveryLoop() {
-\tfor {
-\t\tselect {
-\t\tcase <-s.closed:
-\t\t\treturn
-\t\tcase frame := <-s.ingress:
-\t\t\tif !s.PushDataFrame(frame) {
-\t\t\t\tframe.release()
-\t\t\t}
-\t\t}
-\t}
+    for {
+        select {
+        case <-s.closed:
+            return
+        case frame := <-s.ingress:
+            if !s.PushDataFrame(frame) {
+                frame.release()
+            }
+        }
+    }
 }
 
 func (s *MuxServerStream) PushDataFrame(frame muxDataFrame) bool {
-\tdataLen := int64(len(frame.data))
-\tdeadline := time.NewTimer(muxPushStallTimeout)
-\tdefer deadline.Stop()
-\n\tfor {
-\t\ts.bufMu.Lock()
-\t\tselect {
-\t\tcase <-s.closed:
-\t\t\ts.bufMu.Unlock()
-\t\t\treturn false
-\t\tdefault:
-\t\t}
-\t\tif s.queuedBytes+dataLen <= muxServerStreamBufferLimit {
-\t\t\tselect {
-\t\t\tcase s.writeChan <- frame:
-\t\t\t\ts.queuedBytes += dataLen
-\t\t\t\ts.bufMu.Unlock()
-\t\t\t\treturn true
-\t\t\tdefault:
-\t\t\t}
-\t\t}
-\t\ts.bufMu.Unlock()
-\t\tselect {
-\t\tcase <-s.closed:
-\t\t\treturn false
-\t\tcase <-s.hasSpace:
-\t\t\tcontinue
-\t\tcase <-deadline.C:
-\t\t\tlogWarn("[SERVER-MUX] Stream %d receive backpressure timeout, resetting stream", s.id)
-\t\t\ts.Close()
-\t\t\t_ = s.session.SendFrame(s.id, MuxCmdRST, nil)
-\t\t\treturn false
-\t\t}
-\t}
+    dataLen := int64(len(frame.data))
+    deadline := time.NewTimer(muxPushStallTimeout)
+    defer deadline.Stop()
+
+    for {
+        s.bufMu.Lock()
+        select {
+        case <-s.closed:
+            s.bufMu.Unlock()
+            return false
+        default:
+        }
+        if s.queuedBytes+dataLen <= muxServerStreamBufferLimit {
+            select {
+            case s.writeChan <- frame:
+                s.queuedBytes += dataLen
+                s.bufMu.Unlock()
+                return true
+            default:
+            }
+        }
+        s.bufMu.Unlock()
+        select {
+        case <-s.closed:
+            return false
+        case <-s.hasSpace:
+            continue
+        case <-deadline.C:
+            logWarn("[SERVER-MUX] Stream %d receive backpressure timeout, resetting stream", s.id)
+            s.Close()
+            _ = s.session.SendFrame(s.id, MuxCmdRST, nil)
+            return false
+        }
+    }
 }
 
 func (s *MuxServerStream) PushData(data []byte) bool {
-\treturn s.PushDataFrame(muxDataFrame{data: data})
+    return s.PushDataFrame(muxDataFrame{data: data})
 }
 
-'''
+"""
           s = replace_range(s, 'func newMuxServerStream(', 'func (s *MuxServerStream) consumedBytes', server_block)
 
-          # Server read loop must only enqueue into per-stream ingress.
           s = s.replace('if !st.PushDataFrame(frame) {\n\t\t\t\t\tframe.release()\n\t\t\t\t\tsession.streamsMu.Lock()\n\t\t\t\t\tdelete(session.streams, streamID)\n\t\t\t\t\tsession.streamsMu.Unlock()\n\t\t\t\t}', 'st.enqueueDataFrame(frame)', 1)
           s = s.replace('if !st.PushDataFrame(muxDataFrame{data: nil}) {\n\t\t\t\tsession.streamsMu.Lock()\n\t\t\t\tdelete(session.streams, streamID)\n\t\t\t\tsession.streamsMu.Unlock()\n\t\t\t}', 'st.enqueueDataFrame(muxDataFrame{data: nil})', 1)
 
-          # Server Close drains both delivery queues.
           close_start = s.index('func (s *MuxServerStream) Close()')
           close_end = s.index('func (s *MuxServerSession) Close()', close_start)
-          close_block = r'''func (s *MuxServerStream) Close() {
-\ts.closeOnce.Do(func() {
-\t\tclose(s.closed)
-\t\tif s.targetConn != nil {
-\t\t\ts.targetConn.Close()
-\t\t}
-\t\ts.bufMu.Lock()
-\t\ts.queuedBytes = 0
-\t\ts.bufMu.Unlock()
-\t\tfor {
-\t\t\tselect {
-\t\t\tcase frame := <-s.writeChan:
-\t\t\t\tframe.release()
-\t\t\tcase frame := <-s.ingress:
-\t\t\t\tframe.release()
-\t\t\tdefault:
-\t\t\t\treturn
-\t\t\t}
-\t\t}
-\t})
+          close_block = """func (s *MuxServerStream) Close() {
+    s.closeOnce.Do(func() {
+        close(s.closed)
+        if s.targetConn != nil {
+            s.targetConn.Close()
+        }
+        s.bufMu.Lock()
+        s.queuedBytes = 0
+        s.bufMu.Unlock()
+        for {
+            select {
+            case frame := <-s.writeChan:
+                frame.release()
+            case frame := <-s.ingress:
+                frame.release()
+            default:
+                return
+            }
+        }
+    })
 }
 
-'''
+"""
           s = s[:close_start] + close_block + s[close_end:]
-
           src.write_text(s, encoding='utf-8')
 
-          # Make the subprocess integration test build the current-OS binary.
+          # Fix Linux/macOS subprocess tests: build a temporary binary for the current runner OS.
           test = Path('goway/goway_test.go')
           ts = test.read_text(encoding='utf-8')
           if '\t"path/filepath"\n' not in ts:
@@ -296,22 +300,22 @@ func (s *MuxServerStream) PushData(data []byte) bool {
           if '\t"runtime"\n' not in ts:
               ts = ts.replace('\t"path/filepath"\n', '\t"path/filepath"\n\t"runtime"\n', 1)
 
-          helper = r'''func buildTestBinary(t *testing.T) string {
-\tt.Helper()
-\tname := "goway-test"
-\tif runtime.GOOS == "windows" {
-\t\tname += ".exe"
-\t}
-\tpath := filepath.Join(t.TempDir(), name)
-\tcmd := exec.Command("go", "build", "-o", path, ".")
-\tout, err := cmd.CombinedOutput()
-\tif err != nil {
-\t\tt.Fatalf("Failed to build goway test binary: %v\n%s", err, out)
-\t}
-\treturn path
+          helper = """func buildTestBinary(t *testing.T) string {
+    t.Helper()
+    name := "goway-test"
+    if runtime.GOOS == "windows" {
+        name += ".exe"
+    }
+    path := filepath.Join(t.TempDir(), name)
+    cmd := exec.Command("go", "build", "-o", path, ".")
+    out, err := cmd.CombinedOutput()
+    if err != nil {
+        t.Fatalf("Failed to build goway test binary: %v\\n%s", err, out)
+    }
+    return path
 }
 
-'''
+"""
           if 'func buildTestBinary(' not in ts:
               ts = ts.replace('func TestEndToEndSubprocessIntegration(t *testing.T) {', helper + 'func TestEndToEndSubprocessIntegration(t *testing.T) {', 1)
           if 'binaryPath := buildTestBinary(t)' not in ts:
@@ -334,8 +338,7 @@ func (s *MuxServerStream) PushData(data []byte) bool {
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add goway/goway.go goway/goway_test.go
-          git rm -f .github/workflows/apply-goway-finalize.yml 2>/dev/null || true
-          git rm -f .github/workflows/apply-goway-v182-fix*.yml 2>/dev/null || true
+          git rm -f .github/workflows/apply-goway-finalize.yml .github/workflows/apply-goway-v182-fix*.yml 2>/dev/null || true
           git add -A
           git diff --cached --quiet || git commit -m "fix: finalize goway v1.8.2 mux backpressure [skip ci]"
           git push
