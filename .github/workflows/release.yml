@@ -2,8 +2,6 @@ name: Release GOWAY
 
 on:
   push:
-    branches:
-      - main
     tags:
       - 'v*'
 
@@ -11,98 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  refactor-v182:
-    if: github.ref == 'refs/heads/main' && github.event.head_commit.message != 'refactor: goway v1.8.2 adaptive transport and resource optimization'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-      - name: Apply v1.8.2 transport/resource refactor
-        working-directory: goway
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-          p = Path('goway.go')
-          s = p.read_text()
-          s = s.replace('Version        = "1.8.1"', 'Version        = "1.8.2"', 1)
-          s = s.replace('const maxChunk = 32 * 1024', 'const maxChunk = 60 * 1024', 1)
-          s = s.replace('muxClientStreamBufferLimit = 4 * 1024 * 1024', 'muxClientStreamBufferLimit = 2 * 1024 * 1024', 1)
-          s = s.replace('muxServerStreamBufferLimit = 8 * 1024 * 1024', 'muxServerStreamBufferLimit = 2 * 1024 * 1024', 1)
-          s = s.replace('\t\t"Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits",\n', '', 1)
-          s = s.replace('recommend 512-1024 for 4K streaming', 'adaptive 64-256 for high throughput')
-
-          dead_block = re.compile(r'\n\t// Skip known-dead IPs \(permanent for session\)\n\tp\.mu\.Lock\(\)\n\tif p\.deadIPs\[dialHost\] \{\n\t\tp\.mu\.Unlock\(\)\n\t\treturn p\.tryFallbackDial\(dialer, wsHost, wsPort, sniHostname\)\n\t\}\n\tp\.mu\.Unlock\(\)\n', re.M)
-          s, n = dead_block.subn('\n', s, count=1)
-          if n != 1: raise SystemExit('deadIPs skip block not found')
-          mark_block = re.compile(r'\n\t\t// Mark IP as dead for session\n\t\tp\.mu\.Lock\(\)\n\t\tp\.deadIPs\[dialHost\] = true\n\t\tp\.mu\.Unlock\(\)', re.M)
-          s, n = mark_block.subn('', s, count=1)
-          if n != 1: raise SystemExit('deadIPs mark block not found')
-          startup_mark = re.compile(r'\n\t\t\t\t\tif connPool != nil \{\n\t\t\t\t\t\tconnPool\.mu\.Lock\(\)\n\t\t\t\t\t\tconnPool\.deadIPs\[cfg\.UpstreamHost\] = true\n\t\t\t\t\t\tconnPool\.mu\.Unlock\(\)\n\t\t\t\t\t\}', re.M)
-          s, n = startup_mark.subn('', s, count=1)
-          if n != 1: raise SystemExit('startup deadIPs mark block not found')
-
-          client_push = re.compile(r'func \(s \*MuxStream\) PushDataFrame\(frame muxDataFrame\) bool \{.*?\n\}\n\nfunc \(s \*MuxStream\) PushData\(', re.S)
-          new_client = '''func (s *MuxStream) PushDataFrame(frame muxDataFrame) bool {\n\tdataLen := int64(len(frame.data))\n\ts.bufMu.Lock()\n\tdefer s.bufMu.Unlock()\n\tselect {\n\tcase <-s.closed:\n\t\treturn false\n\tdefault:\n\t}\n\tif s.queuedBytes+dataLen > muxClientStreamBufferLimit {\n\t\tgo s.Reset()\n\t\treturn false\n\t}\n\tselect {\n\tcase s.readChan <- frame:\n\t\ts.queuedBytes += dataLen\n\t\treturn true\n\tdefault:\n\t\tgo s.Reset()\n\t\treturn false\n\t}\n}\n\nfunc (s *MuxStream) PushData('''
-          s, n = client_push.subn(new_client, s, count=1)
-          if n != 1: raise SystemExit('client PushDataFrame not found')
-
-          server_push = re.compile(r'func \(s \*MuxServerStream\) PushDataFrame\(frame muxDataFrame\) bool \{.*?\n\}\n\nfunc \(s \*MuxServerStream\) PushData\(', re.S)
-          new_server = '''func (s *MuxServerStream) PushDataFrame(frame muxDataFrame) bool {\n\tdataLen := int64(len(frame.data))\n\ts.bufMu.Lock()\n\tdefer s.bufMu.Unlock()\n\tselect {\n\tcase <-s.closed:\n\t\treturn false\n\tdefault:\n\t}\n\tif s.queuedBytes+dataLen > muxServerStreamBufferLimit {\n\t\ts.Close()\n\t\treturn false\n\t}\n\tselect {\n\tcase s.writeChan <- frame:\n\t\ts.queuedBytes += dataLen\n\t\treturn true\n\tdefault:\n\t\ts.Close()\n\t\treturn false\n\t}\n}\n\nfunc (s *MuxServerStream) PushData('''
-          s, n = server_push.subn(new_server, s, count=1)
-          if n != 1: raise SystemExit('server PushDataFrame not found')
-
-          old_hb = '''\t\tcase <-ticker.C:\n\t\t\ts.writeMu.Lock()'''
-          new_hb = '''\t\tcase <-ticker.C:\n\t\t\tif s.ActiveStreams() > 0 {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\ts.writeMu.Lock()'''
-          if old_hb not in s: raise SystemExit('heartbeat block not found')
-          s = s.replace(old_hb, new_hb, 1)
-
-          marker = '// --- Main Logic ---\n'
-          helper = '''// tryAcquireConn atomically reserves one global connection slot.\nfunc tryAcquireConn(limit int64) bool {\n\tfor {\n\t\tcur := atomic.LoadInt64(&stats.activeConns)\n\t\tif cur >= limit {\n\t\t\treturn false\n\t\t}\n\t\tif atomic.CompareAndSwapInt64(&stats.activeConns, cur, cur+1) {\n\t\t\treturn true\n\t\t}\n\t}\n}\n\n'''
-          if marker not in s: raise SystemExit('main marker not found')
-          s = s.replace(marker, helper + marker, 1)
-
-          old_main = '''\t\tif atomic.LoadInt64(&stats.activeConns) >= int64(cfg.MaxConns) {\n\t\t\tlogWarn("MaxConns (%d) reached, rejecting connection", cfg.MaxConns)\n\t\t\tconn.Close()\n\t\t\tcontinue\n\t\t}\n\n\t\tstats.AddConn()'''
-          new_main = '''\t\tif !tryAcquireConn(int64(cfg.MaxConns)) {\n\t\t\tlogWarn("MaxConns (%d) reached, rejecting connection", cfg.MaxConns)\n\t\t\tconn.Close()\n\t\t\tcontinue\n\t\t}'''
-          if old_main not in s: raise SystemExit('main MaxConns block not found')
-          s = s.replace(old_main, new_main, 1)
-
-          old_quic = '''\t\tif atomic.LoadInt64(&stats.activeConns) >= int64(cfg.MaxConns) {\n\t\t\tlogWarn("[QUIC-SERVER] MaxConns (%d) reached, rejecting stream", cfg.MaxConns)\n\t\t\t_ = stream.Close()\n\t\t\tcontinue\n\t\t}\n\n\t\tstats.AddConn()'''
-          new_quic = '''\t\tif !tryAcquireConn(int64(cfg.MaxConns)) {\n\t\t\tlogWarn("[QUIC-SERVER] MaxConns (%d) reached, rejecting stream", cfg.MaxConns)\n\t\t\t_ = stream.Close()\n\t\t\tcontinue\n\t\t}'''
-          if old_quic not in s: raise SystemExit('QUIC MaxConns block not found')
-          s = s.replace(old_quic, new_quic, 1)
-
-          mux_pad = re.compile(r'\tbase := "MUX\\n"\n\tpadLen := 1 \+ mrand\.Intn\(40\)\n\ttargetPayload := make\(\[\]byte, len\(base\)\+padLen\)\n\tcopy\(targetPayload, base\)\n\tfor i := len\(base\); i < len\(targetPayload\); i\+\+ \{\n\t\ttargetPayload\[i\] = \' \'\n\t\}\n')
-          s, n1 = mux_pad.subn('\ttargetPayload := []byte("MUX\\n")\n', s, count=1)
-          if n1 != 1: raise SystemExit('MUX padding block not found')
-          udp_pad = re.compile(r'\tbase := "UDP\\n"\n\tpadLen := 1 \+ mrand\.Intn\(40\)\n\ttargetPayload := make\(\[\]byte, len\(base\)\+padLen\)\n\tcopy\(targetPayload, base\)\n\tfor i := len\(base\); i < len\(targetPayload\); i\+\+ \{\n\t\ttargetPayload\[i\] = \' \'\n\t\}\n')
-          s, n2 = udp_pad.subn('\ttargetPayload := []byte("UDP\\n")\n', s, count=1)
-          if n2 != 1: raise SystemExit('UDP padding block not found')
-          normal = re.compile(r'\tbase := targetHost \+ ":" \+ targetPort \+ "\\n"\n\tpadLen := 1 \+ mrand\.Intn\(40\)\n\ttargetPayload := make\(\[\]byte, len\(base\)\+padLen\)\n\tcopy\(targetPayload, base\)\n\t// fill padding with spaces .*?\n\t\}\n\n', re.S)
-          s, n3 = normal.subn('\ttargetPayload := []byte(targetHost + ":" + targetPort + "\\n")\n\n', s, count=1)
-          if n3 != 1: raise SystemExit('normal padding block not found')
-
-          p.write_text(s)
-          PY
-      - name: Format and verify
-        working-directory: goway
-        run: |
-          gofmt -w goway.go goway_test.go
-          go test ./...
-          go test -race ./...
-          go vet ./...
-      - name: Commit refactor
-        run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          rm -f .github/workflows/goway-v182-refactor.yml
-          git add goway/goway.go goway/goway_test.go goway/README.md README.md .github/workflows/goway-v182-refactor.yml .github/workflows/release.yml
-          git commit -m 'refactor: goway v1.8.2 adaptive transport and resource optimization'
-          git push origin main
-
   build:
-    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -123,6 +30,7 @@ jobs:
           - goos: darwin
             goarch: arm64
             output: goway-darwin-arm64
+          # OpenWrt targets
           - goos: linux
             goarch: arm
             goarm: '7'
@@ -143,6 +51,7 @@ jobs:
             goarch: mips64le
             gomips64: softfloat
             output: goway-openwrt-mips64le
+          # Android targets
           - goos: linux
             goarch: arm
             goarm: '7'
@@ -150,11 +59,14 @@ jobs:
           - goos: android
             goarch: arm64
             output: goway-android-arm8
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25'
+
       - name: Build
         env:
           GOOS: ${{ matrix.goos }}
@@ -169,6 +81,7 @@ jobs:
           [ -z "$GOMIPS" ] && unset GOMIPS
           [ -z "$GOMIPS64" ] && unset GOMIPS64
           go build -ldflags="-s -w" -o ../${{ matrix.output }} goway.go
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -176,15 +89,16 @@ jobs:
           path: ${{ matrix.output }}
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
