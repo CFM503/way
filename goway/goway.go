@@ -1557,7 +1557,7 @@ func NewConnPool(cfg *Config, maxSize int) *ConnPool {
 		maxSize:     maxSize,
 		maxAge:      5 * time.Minute,
 		idleTimeout: 30 * time.Second,
-		deadIPs:     make(map[string]bool),
+		deadIPs:     make(map[string]time.Time),
 		stopChan:    make(chan struct{}),
 		refillCh:    make(chan struct{}, 1),
 	}
