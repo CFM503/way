@@ -46,7 +46,7 @@ jobs:
           # Buffer hard max fallback: 12 MiB.
           s = s.replace('bufSize = 256*1024 + 14 + MuxHeaderLen', 'bufSize = 12*1024*1024 + 14 + MuxHeaderLen')
 
-          # deadIPs must be time-based and use a five-minute cooldown.
+          # deadIPs field/initializer and assignments.
           s = s.replace('\tdeadIPs     map[string]bool // IPs that failed during session (permanent until exit)',
                         '\tdeadIPs     map[string]time.Time // temporarily suppress failed IPs', 1)
           s = s.replace('\tdeadIPs:     make(map[string]bool),',
@@ -56,79 +56,106 @@ jobs:
           s = s.replace('connPool.deadIPs[cfg.UpstreamHost] = true',
                         'connPool.deadIPs[cfg.UpstreamHost] = time.Now().Add(5 * time.Minute)')
 
-          # Client MUX stream public PushDataFrame stays bounded-blocking; readLoop gets enqueue.
+          # Replace only the exact dead-IP check block.
+          old = '''\t// Skip known-dead IPs (permanent for session)
+\tp.mu.Lock()
+\tif p.deadIPs[dialHost] {
+\t\tp.mu.Unlock()
+\t\treturn p.tryFallbackDial(dialer, wsHost, wsPort, sniHostname)
+\t}
+\tp.mu.Unlock()'''
+          new = '''\t// Skip recently failed IPs, but allow retry after cooldown.
+\tp.mu.Lock()
+\tif until, ok := p.deadIPs[dialHost]; ok {
+\t\tif time.Now().Before(until) {
+\t\t\tp.mu.Unlock()
+\t\t\treturn p.tryFallbackDial(dialer, wsHost, wsPort, sniHostname)
+\t\t}
+\t\tdelete(p.deadIPs, dialHost)
+\t}
+\tp.mu.Unlock()'''
+          if old in s:
+              s = s.replace(old, new, 1)
+
+          # Client MUX stream: public PushDataFrame remains bounded blocking,
+          # while session readLoop uses enqueueDataFrame.
           cpat = re.compile(r'func \(s \*MuxStream\) PushDataFrame\(frame muxDataFrame\) bool \{.*?\n\}\n\nfunc \(s \*MuxStream\) PushData\(', re.S)
           crepl = '''func (s *MuxStream) enqueueDataFrame(frame muxDataFrame) bool {
-          \tdataLen := int64(len(frame.data))
-          \ts.bufMu.Lock()
-          \tdefer s.bufMu.Unlock()
-          \tselect { case <-s.closed: return false; default: }
-          \tif s.queuedBytes+dataLen > muxClientStreamBufferLimit { return false }
-          \tselect { case s.readChan <- frame: s.queuedBytes += dataLen; return true; default: return false }
-          }
+\tdataLen := int64(len(frame.data))
+\ts.bufMu.Lock()
+\tdefer s.bufMu.Unlock()
+\tselect { case <-s.closed: return false; default: }
+\tif s.queuedBytes+dataLen > muxClientStreamBufferLimit { return false }
+\tselect { case s.readChan <- frame: s.queuedBytes += dataLen; return true; default: return false }
+}
 
-          func (s *MuxStream) PushDataFrame(frame muxDataFrame) bool {
-          \tdataLen := int64(len(frame.data))
-          \tdeadline := time.Now().Add(3 * time.Second)
-          \tfor {
-          \t\ts.bufMu.Lock()
-          \t\tselect { case <-s.closed: s.bufMu.Unlock(); return false; default: }
-          \t\tif s.queuedBytes+dataLen <= muxClientStreamBufferLimit {
-          \t\t\tselect { case s.readChan <- frame: s.queuedBytes += dataLen; s.bufMu.Unlock(); return true; default: }
-          \t\t}
-          \t\ts.bufMu.Unlock()
-          \t\tremaining := time.Until(deadline)
-          \t\tif remaining <= 0 { s.Reset(); return false }
-          \t\tt := time.NewTimer(minDuration(100*time.Millisecond, remaining))
-          \t\tselect { case <-s.closed: if !t.Stop() { <-t.C }; return false; case <-s.hasSpace: if !t.Stop() { <-t.C }; case <-t.C: }
-          \t}
-          }
+func (s *MuxStream) PushDataFrame(frame muxDataFrame) bool {
+\tdataLen := int64(len(frame.data))
+\tdeadline := time.Now().Add(3 * time.Second)
+\tfor {
+\t\ts.bufMu.Lock()
+\t\tselect { case <-s.closed: s.bufMu.Unlock(); return false; default: }
+\t\tif s.queuedBytes+dataLen <= muxClientStreamBufferLimit {
+\t\t\tselect { case s.readChan <- frame: s.queuedBytes += dataLen; s.bufMu.Unlock(); return true; default: }
+\t\t}
+\t\ts.bufMu.Unlock()
+\t\tremaining := time.Until(deadline)
+\t\tif remaining <= 0 { s.Reset(); return false }
+\t\twait := 100 * time.Millisecond
+\t\tif remaining < wait { wait = remaining }
+\t\tt := time.NewTimer(wait)
+\t\tselect {
+\t\tcase <-s.closed: if !t.Stop() { <-t.C }; return false
+\t\tcase <-s.hasSpace: if !t.Stop() { <-t.C }
+\t\tcase <-t.C:
+\t\t}
+\t}
+}
 
-          func (s *MuxStream) PushData('''
+func (s *MuxStream) PushData('''
           s, n = cpat.subn(crepl, s, count=1)
           if n != 1: raise SystemExit(f'client PushDataFrame replacement: {n}')
-
           s = re.sub(r'func \(s \*MuxStream\) PushEOF\(\) \{.*?\n\}', '''func (s *MuxStream) PushEOF() {
-          \tif s.readClosed.Swap(true) { return }
-          \tselect { case <-s.closed: return; default: }
-          \tselect { case s.hasSpace <- struct{}{}: default: }
-          }''', s, count=1, flags=re.S)
+\tif s.readClosed.Swap(true) { return }
+\tselect { case <-s.closed: return; default: }
+\tselect { case s.hasSpace <- struct{}{}: default: }
+}''', s, count=1, flags=re.S)
 
-          # Helper is inserted only once.
-          if 'func minDuration(' not in s:
-              s = s.replace('func (s *MuxStream) enqueueDataFrame', '''func minDuration(a, b time.Duration) time.Duration { if a < b { return a }; return b }
-
-          func (s *MuxStream) enqueueDataFrame''', 1)
-
-          # Server MUX stream public backpressure + nonblocking enqueue.
+          # Server MUX stream: public bounded blocking + nonblocking enqueue.
           spat = re.compile(r'func \(s \*MuxServerStream\) PushDataFrame\(frame muxDataFrame\) bool \{.*?\n\}\n\nfunc \(s \*MuxServerStream\) PushData\(', re.S)
           srepl = '''func (s *MuxServerStream) enqueueDataFrame(frame muxDataFrame) bool {
-          \tdataLen := int64(len(frame.data))
-          \ts.bufMu.Lock()
-          \tdefer s.bufMu.Unlock()
-          \tselect { case <-s.closed: return false; default: }
-          \tif s.queuedBytes+dataLen > muxServerStreamBufferLimit { return false }
-          \tselect { case s.writeChan <- frame: s.queuedBytes += dataLen; return true; default: return false }
-          }
+\tdataLen := int64(len(frame.data))
+\ts.bufMu.Lock()
+\tdefer s.bufMu.Unlock()
+\tselect { case <-s.closed: return false; default: }
+\tif s.queuedBytes+dataLen > muxServerStreamBufferLimit { return false }
+\tselect { case s.writeChan <- frame: s.queuedBytes += dataLen; return true; default: return false }
+}
 
-          func (s *MuxServerStream) PushDataFrame(frame muxDataFrame) bool {
-          \tdataLen := int64(len(frame.data))
-          \tdeadline := time.Now().Add(3 * time.Second)
-          \tfor {
-          \t\ts.bufMu.Lock()
-          \t\tselect { case <-s.closed: s.bufMu.Unlock(); return false; default: }
-          \t\tif s.queuedBytes+dataLen <= muxServerStreamBufferLimit {
-          \t\t\tselect { case s.writeChan <- frame: s.queuedBytes += dataLen; s.bufMu.Unlock(); return true; default: }
-          \t\t}
-          \t\ts.bufMu.Unlock()
-          \t\tremaining := time.Until(deadline)
-          \t\tif remaining <= 0 { s.Close(); _ = s.session.SendFrame(s.id, MuxCmdRST, nil); return false }
-          \t\tt := time.NewTimer(minDuration(100*time.Millisecond, remaining))
-          \t\tselect { case <-s.closed: if !t.Stop() { <-t.C }; return false; case <-s.hasSpace: if !t.Stop() { <-t.C }; case <-t.C: }
-          \t}
-          }
+func (s *MuxServerStream) PushDataFrame(frame muxDataFrame) bool {
+\tdataLen := int64(len(frame.data))
+\tdeadline := time.Now().Add(3 * time.Second)
+\tfor {
+\t\ts.bufMu.Lock()
+\t\tselect { case <-s.closed: s.bufMu.Unlock(); return false; default: }
+\t\tif s.queuedBytes+dataLen <= muxServerStreamBufferLimit {
+\t\t\tselect { case s.writeChan <- frame: s.queuedBytes += dataLen; s.bufMu.Unlock(); return true; default: }
+\t\t}
+\t\ts.bufMu.Unlock()
+\t\tremaining := time.Until(deadline)
+\t\tif remaining <= 0 { s.Close(); _ = s.session.SendFrame(s.id, MuxCmdRST, nil); return false }
+\t\twait := 100 * time.Millisecond
+\t\tif remaining < wait { wait = remaining }
+\t\tt := time.NewTimer(wait)
+\t\tselect {
+\t\tcase <-s.closed: if !t.Stop() { <-t.C }; return false
+\t\tcase <-s.hasSpace: if !t.Stop() { <-t.C }
+\t\tcase <-t.C:
+\t\t}
+\t}
+}
 
-          func (s *MuxServerStream) PushData('''
+func (s *MuxServerStream) PushData('''
           s, n = spat.subn(srepl, s, count=1)
           if n != 1: raise SystemExit(f'server PushDataFrame replacement: {n}')
 
@@ -145,5 +172,5 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add goway/goway.go
           if git diff --cached --quiet; then exit 0; fi
-          git commit -m 'fix: restore bounded mux backpressure semantics [skip ci]'
+          git commit -m 'fix: harden goway mux backpressure [skip ci]'
           git push
