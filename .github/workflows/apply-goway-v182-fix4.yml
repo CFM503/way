@@ -1,0 +1,88 @@
+name: Apply GoWay v1.8.2 fix v4
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch source and tests
+        shell: python
+        run: |
+          from pathlib import Path
+
+          src = Path('goway/goway.go')
+          s = src.read_text(encoding='utf-8')
+
+          # Constants
+          s = s.replace('muxServerStreamBufferLimit = 8 * 1024 * 1024', 'muxServerStreamBufferLimit = 16 * 1024 * 1024', 1)
+          anchor = 'muxServerStreamBufferLimit = 16 * 1024 * 1024'
+          if 'muxStreamIngressQueue' not in s:
+              s = s.replace(anchor, anchor + '\n\tmuxStreamIngressQueue    = 16\n\tmuxPushStallTimeout       = 3 * time.Second', 1)
+
+          # Client MuxStream: add ingress and replace constructor + PushDataFrame.
+          s = s.replace('\treadMu      sync.Mutex\n}', '\treadMu      sync.Mutex\n\tingress     chan muxDataFrame\n}', 1)
+          start = s.index('func newMuxStream(')
+          end = s.index('func (s *MuxStream) PushEOF()', start)
+          client_block = '''func newMuxStream(id uint32, session MuxSessionInterface) *MuxStream {\n\tst := &MuxStream{\n\t\tid:       id,\n\t\tsession:  session,\n\t\treadChan: make(chan muxDataFrame, 128),\n\t\tclosed:   make(chan struct{}),\n\t\thasSpace: make(chan struct{}, 1),\n\t\tingress:  make(chan muxDataFrame, muxStreamIngressQueue),\n\t}\n\tgo st.deliveryLoop()\n\treturn st\n}\n\nfunc (s *MuxStream) enqueueDataFrame(frame muxDataFrame) bool {\n\tselect {\n\tcase <-s.closed:\n\t\tframe.release()\n\t\treturn false\n\tcase s.ingress <- frame:\n\t\treturn true\n\tdefault:\n\t\tlogWarn("[MUX] Stream %d ingress queue full, resetting stream", s.id)\n\t\tframe.release()\n\t\ts.Reset()\n\t\treturn false\n\t}\n}\n\nfunc (s *MuxStream) deliveryLoop() {\n\tfor {\n\t\tselect {\n\t\tcase <-s.closed:\n\t\t\treturn\n\t\tcase frame := <-s.ingress:\n\t\t\tif !s.PushDataFrame(frame) {\n\t\t\t\tframe.release()\n\t\t\t}\n\t\t}\n\t}\n}\n\nfunc (s *MuxStream) PushDataFrame(frame muxDataFrame) bool {\n\tdataLen := int64(len(frame.data))\n\tdeadline := time.NewTimer(muxPushStallTimeout)\n\tdefer deadline.Stop()\n\n\tfor {\n\t\ts.bufMu.Lock()\n\t\tselect {\n\t\tcase <-s.closed:\n\t\t\ts.bufMu.Unlock()\n\t\t\treturn false\n\t\tdefault:\n\t\t}\n\t\tif frame.data == nil {\n\t\t\ts.readClosed.Store(true)\n\t\t}\n\t\tif s.queuedBytes+dataLen <= muxClientStreamBufferLimit {\n\t\t\tselect {\n\t\t\tcase s.readChan <- frame:\n\t\t\t\ts.queuedBytes += dataLen\n\t\t\t\ts.bufMu.Unlock()\n\t\t\t\treturn true\n\t\t\tdefault:\n\t\t\t}\n\t\t}\n\t\ts.bufMu.Unlock()\n\t\tselect {\n\t\tcase <-s.closed:\n\t\t\treturn false\n\t\tcase <-s.hasSpace:\n\t\t\tcontinue\n\t\tcase <-deadline.C:\n\t\t\tlogWarn("[MUX] Stream %d receive backpressure timeout, resetting stream", s.id)\n\t\t\ts.Reset()\n\t\t\treturn false\n\t\t}\n\t}\n}\n\n'''
+          s = s[:start] + client_block + s[end:]
+
+          # Client session dispatcher must enqueue, never block on stream backpressure.
+          s = s.replace('if !st.PushDataFrame(frame) {\n\t\t\t\t\tframe.release()\n\t\t\t\t}', 'st.enqueueDataFrame(frame)', 1)
+          s = s.replace('case MuxCmdFIN:\n\t\t\tst.PushEOF()', 'case MuxCmdFIN:\n\t\t\tst.enqueueDataFrame(muxDataFrame{data: nil})', 1)
+
+          # Server stream: add ingress + same isolation pattern.
+          s = s.replace('\tqueuedBytes int64\n\thasSpace    chan struct{}\n}', '\tqueuedBytes int64\n\thasSpace    chan struct{}\n\tingress     chan muxDataFrame\n}', 1)
+          start = s.index('func newMuxServerStream(')
+          end = s.index('func (s *MuxServerStream) consumedBytes', start)
+          server_block = '''func newMuxServerStream(id uint32, session *MuxServerSession) *MuxServerStream {\n\tst := &MuxServerStream{\n\t\tid:        id,\n\t\tsession:   session,\n\t\twriteChan: make(chan muxDataFrame, 256),\n\t\tclosed:    make(chan struct{}),\n\t\thasSpace:  make(chan struct{}, 1),\n\t\tingress:   make(chan muxDataFrame, muxStreamIngressQueue),\n\t}\n\tgo st.deliveryLoop()\n\treturn st\n}\n\nfunc (s *MuxServerStream) enqueueDataFrame(frame muxDataFrame) bool {\n\tselect {\n\tcase <-s.closed:\n\t\tframe.release()\n\t\treturn false\n\tcase s.ingress <- frame:\n\t\treturn true\n\tdefault:\n\t\tlogWarn("[SERVER-MUX] Stream %d ingress queue full, resetting stream", s.id)\n\t\tframe.release()\n\t\ts.Close()\n\t\t_ = s.session.SendFrame(s.id, MuxCmdRST, nil)\n\t\treturn false\n\t}\n}\n\nfunc (s *MuxServerStream) deliveryLoop() {\n\tfor {\n\t\tselect {\n\t\tcase <-s.closed:\n\t\t\treturn\n\t\tcase frame := <-s.ingress:\n\t\t\tif !s.PushDataFrame(frame) {\n\t\t\t\tframe.release()\n\t\t\t}\n\t\t}\n\t}\n}\n\nfunc (s *MuxServerStream) PushDataFrame(frame muxDataFrame) bool {\n\tdataLen := int64(len(frame.data))\n\tdeadline := time.NewTimer(muxPushStallTimeout)\n\tdefer deadline.Stop()\n\n\tfor {\n\t\ts.bufMu.Lock()\n\t\tselect {\n\t\tcase <-s.closed:\n\t\t\ts.bufMu.Unlock()\n\t\t\treturn false\n\t\tdefault:\n\t\t}\n\t\tif s.queuedBytes+dataLen <= muxServerStreamBufferLimit {\n\t\t\tselect {\n\t\t\tcase s.writeChan <- frame:\n\t\t\t\ts.queuedBytes += dataLen\n\t\t\t\ts.bufMu.Unlock()\n\t\t\t\treturn true\n\t\t\tdefault:\n\t\t\t}\n\t\t}\n\t\ts.bufMu.Unlock()\n\t\tselect {\n\t\tcase <-s.closed:\n\t\t\treturn false\n\t\tcase <-s.hasSpace:\n\t\t\tcontinue\n\t\tcase <-deadline.C:\n\t\t\tlogWarn("[SERVER-MUX] Stream %d receive backpressure timeout, resetting stream", s.id)\n\t\t\ts.Close()\n\t\t\t_ = s.session.SendFrame(s.id, MuxCmdRST, nil)\n\t\t\treturn false\n\t\t}\n\t}\n}\n\n'''
+          s = s[:start] + server_block + s[end:]
+
+          # Server session dispatcher uses nonblocking stream ingress.
+          s = s.replace('if !st.PushDataFrame(frame) {\n\t\t\t\t\tframe.release()\n\t\t\t\t\tsession.streamsMu.Lock()\n\t\t\t\t\tdelete(session.streams, streamID)\n\t\t\t\t\tsession.streamsMu.Unlock()\n\t\t\t\t}', 'st.enqueueDataFrame(frame)', 1)
+          s = s.replace('if !st.PushDataFrame(muxDataFrame{data: nil}) {\n\t\t\t\tsession.streamsMu.Lock()\n\t\t\t\tdelete(session.streams, streamID)\n\t\t\t\tsession.streamsMu.Unlock()\n\t\t\t}', 'st.enqueueDataFrame(muxDataFrame{data: nil})', 1)
+
+          # Raise the application relay pooled buffer cap from 256 KiB to 512 KiB.
+          s = s.replace('if bufSize > 256*1024+14+MuxHeaderLen {', 'if bufSize > 512*1024+14+MuxHeaderLen {', 1)
+          s = s.replace('bufSize = 256*1024+14+MuxHeaderLen', 'bufSize = 512*1024+14+MuxHeaderLen', 1)
+          src.write_text(s, encoding='utf-8')
+
+          # Cross-platform subprocess integration tests: build the binary for the current runner OS.
+          test = Path('goway/goway_test.go')
+          ts = test.read_text(encoding='utf-8')
+          if '\t"path/filepath"\n' not in ts:
+              ts = ts.replace('\t"os/exec"\n', '\t"os/exec"\n\t"path/filepath"\n', 1)
+          marker = 'func TestEndToEndSubprocessIntegration(t *testing.T) {'
+          helper = '''func buildTestBinary(t *testing.T) string {\n\tt.Helper()\n\tname := "goway-test"\n\tif runtime.GOOS == "windows" {\n\t\tname += ".exe"\n\t}\n\tpath := filepath.Join(t.TempDir(), name)\n\tcmd := exec.Command("go", "build", "-o", path, ".")\n\tout, err := cmd.CombinedOutput()\n\tif err != nil {\n\t\tt.Fatalf("Failed to build goway test binary: %v\\n%s", err, out)\n\t}\n\treturn path\n}\n\n'''
+          if helper not in ts:
+              ts = ts.replace(marker, helper + marker, 1)
+          ts = ts.replace('serverCmd := exec.Command(".\\\\goway.exe",', 'serverCmd := exec.Command(buildTestBinary(t),', 1)
+          # Reuse one binary for both server and client by inserting variable before server command.
+          ts = ts.replace('serverPort := 18880\n\tserverCmd := exec.Command(buildTestBinary(t),', 'binaryPath := buildTestBinary(t)\n\tserverPort := 18880\n\tserverCmd := exec.Command(binaryPath,', 1)
+          ts = ts.replace('clientCmd := exec.Command(".\\\\goway.exe",', 'clientCmd := exec.Command(binaryPath,', 1)
+          test.write_text(ts, encoding='utf-8')
+
+      - name: Format and verify
+        run: |
+          gofmt -w goway/goway.go goway/goway_test.go
+          cd goway
+          go test ./...
+          go test -race ./...
+          go vet ./...
+
+      - name: Commit source and remove temporary patch workflows
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add goway/goway.go goway/goway_test.go
+          git rm -f .github/workflows/apply-goway-v182-fix.yml .github/workflows/apply-goway-v182-fix2.yml .github/workflows/apply-goway-v182-fix3.yml .github/workflows/apply-goway-v182-fix4.yml || true
+          git add -A
+          git diff --cached --quiet || git commit -m "fix: isolate mux stream backpressure [skip ci]"
+          git push
