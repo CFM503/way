@@ -1,4 +1,4 @@
-name: Repair GoWay initializer
+name: Repair GoWay deadIPs type
 
 on:
   push:
@@ -15,17 +15,27 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Fix deadIPs initializer
+      - name: Fix deadIPs type and initializer
         shell: python
         run: |
           from pathlib import Path
           p = Path('goway/goway.go')
           s = p.read_text(encoding='utf-8')
-          old = '\tdeadIPs:     make(map[string]bool),'
-          new = '\tdeadIPs:     make(map[string]time.Time),'
-          if s.count(old) != 1:
-              raise SystemExit(f'expected exactly one initializer, got {s.count(old)}')
-          p.write_text(s.replace(old, new, 1), encoding='utf-8')
+          replacements = [
+              ('\tdeadIPs     map[string]bool // IPs that failed during session (permanent until exit)',
+               '\tdeadIPs     map[string]time.Time // temporarily suppress failed IPs'),
+              ('\tdeadIPs:     make(map[string]bool),',
+               '\tdeadIPs:     make(map[string]time.Time),'),
+          ]
+          for old, new in replacements:
+              n = s.count(old)
+              if n != 1:
+                  raise SystemExit(f'expected exactly one match for {old!r}, got {n}')
+              s = s.replace(old, new, 1)
+          p.write_text(s, encoding='utf-8')
+      - name: Compile check
+        working-directory: goway
+        run: go test ./... -run '^$'
       - name: Commit fix
         shell: bash
         run: |
@@ -34,5 +44,5 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add goway/goway.go
           git diff --cached --quiet && exit 0
-          git commit -m 'fix: correct deadIPs initializer type'
+          git commit -m 'fix: make deadIPs type consistent'
           git push
