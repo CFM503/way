@@ -10,227 +10,333 @@ permissions:
   contents: write
 
 jobs:
-  repair:
-    name: Repair GoWay source
-    if: ${{ github.event_name == 'push' && !contains(github.event.head_commit.message, '[skip ci]') }}
+  goway:
+    name: Repair or verify GOWAY
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.25'
           cache-dependency-path: goway/go.mod
-      - name: Repair source deterministically
-        shell: python
+
+      - name: Repair main branch or verify release tag
+        shell: bash
         run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            cd goway
+            go test ./... -count=1
+            go test -race ./... -count=1
+            go vet ./...
+            GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o goway-windows-amd64.exe .
+            GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o goway-debian12-amd64 .
+            GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o goway-openwrt-arm7 .
+            exit 0
+          fi
+
+          if [[ "${GITHUB_EVENT_NAME:-}" == "push" && "${GITHUB_HEAD_COMMIT_MESSAGE:-}" == *"[skip ci]"* ]]; then
+            echo "Skip repair for [skip ci] commit"
+            exit 0
+          fi
+
+          python3 - <<'PY'
           from pathlib import Path
           import re
+
           p = Path('goway/goway.go')
           s = p.read_text(encoding='utf-8')
 
-          def replace_func(pattern, replacement, label):
-              global s
-              s2, n = re.subn(pattern, replacement, s, count=1, flags=re.S)
-              if n != 1:
-                  raise SystemExit(f'{label}: expected 1 match, got {n}')
-              s = s2
+          # Buffer: default is handled by the flag; internal hard fallback must stay at 12 MiB.
+          s = re.sub(r'(if bufSize > 12\*1024\*1024\+14\+MuxHeaderLen \{\s*)bufSize = \d+\*1024 \+ 14 \+ MuxHeaderLen',
+                     r'\g<1>bufSize = 12*1024*1024 + 14 + MuxHeaderLen', s, count=1)
 
-          # deadIPs -> time-based cooldown, idempotently.
+          # deadIPs: always use time.Time with a five-minute cooldown.
           s = re.sub(r'deadIPs\s+map\[string\](?:bool|time\.Time)(?:\s+//[^\n]*)?',
                      'deadIPs     map[string]time.Time // temporarily suppress failed IPs', s, count=1)
-          s = re.sub(r'deadIPs:\s+make\(map\[string\](?:bool|time\.Time)\)',
+          s = re.sub(r'deadIPs:\s*make\(map\[string\](?:bool|time\.Time)\)',
                      'deadIPs:     make(map[string]time.Time)', s, count=1)
           s = re.sub(r'deadIPs\[dialHost\]\s*=\s*true',
                      'deadIPs[dialHost] = time.Now().Add(5 * time.Minute)', s)
           s = re.sub(r'connPool\.deadIPs\[cfg\.UpstreamHost\]\s*=\s*true',
                      'connPool.deadIPs[cfg.UpstreamHost] = time.Now().Add(5 * time.Minute)', s)
-          s = re.sub(r'// Skip known-dead IPs \(permanent for session\).*?p\.mu\.Unlock\(\)',
-                     '''// Skip recently failed IPs, but allow retry after cooldown.
-\tp.mu.Lock()
-\tif until, ok := p.deadIPs[dialHost]; ok {
-\t\tif time.Now().Before(until) {
-\t\t\tp.mu.Unlock()
-\t\t\treturn p.tryFallbackDial(dialer, wsHost, wsPort, sniHostname)
-\t\t}
-\t\tdelete(p.deadIPs, dialHost)
-\t}
-\tp.mu.Unlock()''', s, count=1, flags=re.S)
+          s = re.sub(
+              r'// Skip known-dead IPs \(permanent for session\).*?p\.mu\.Unlock\(\)',
+              '''// Skip recently failed IPs, but allow retry after cooldown.
+          \tp.mu.Lock()
+          \tif until, ok := p.deadIPs[dialHost]; ok {
+          \t\tif time.Now().Before(until) {
+          \t\t\tp.mu.Unlock()
+          \t\t\treturn p.tryFallbackDial(dialer, wsHost, wsPort, sniHostname)
+          \t\t}
+          \t\tdelete(p.deadIPs, dialHost)
+          \t}
+          \tp.mu.Unlock()''', s, count=1, flags=re.S)
 
-          # Client MUX: keep public bounded-backpressure PushDataFrame, add nonblocking enqueue.
-          replace_func(r'func \(s \*MuxStream\) PushDataFrame\(frame muxDataFrame\) bool \{.*?\n\}\n\nfunc \(s \*MuxStream\) PushData\(', '''func (s *MuxStream) enqueueDataFrame(frame muxDataFrame) bool {
-\tdataLen := int64(len(frame.data))
-\ts.bufMu.Lock()
-\tdefer s.bufMu.Unlock()
-\tselect { case <-s.closed: return false; default: }
-\tif s.queuedBytes+dataLen > muxClientStreamBufferLimit { return false }
-\tselect { case s.readChan <- frame: s.queuedBytes += dataLen; return true; default: return false }
-}
+          # Client MUX stream public backpressure + nonblocking session enqueue.
+          client_pat = r'func \(s \*MuxStream\) PushDataFrame\(frame muxDataFrame\) bool \{.*?\n\}\n\nfunc \(s \*MuxStream\) PushData\('
+          client_repl = '''func (s *MuxStream) enqueueDataFrame(frame muxDataFrame) bool {
+          \tdataLen := int64(len(frame.data))
+          \ts.bufMu.Lock()
+          \tdefer s.bufMu.Unlock()
+          \tselect { case <-s.closed: return false; default: }
+          \tif s.queuedBytes+dataLen > muxClientStreamBufferLimit { return false }
+          \tselect { case s.readChan <- frame: s.queuedBytes += dataLen; return true; default: return false }
+          }
 
-func (s *MuxStream) PushDataFrame(frame muxDataFrame) bool {
-\tdataLen := int64(len(frame.data))
-\tdeadline := time.Now().Add(3 * time.Second)
-\tfor {
-\t\ts.bufMu.Lock()
-\t\tselect { case <-s.closed: s.bufMu.Unlock(); return false; default: }
-\t\tif s.queuedBytes+dataLen <= muxClientStreamBufferLimit {
-\t\t\tselect { case s.readChan <- frame: s.queuedBytes += dataLen; s.bufMu.Unlock(); return true; default: }
-\t\t}
-\t\ts.bufMu.Unlock()
-\t\tremaining := time.Until(deadline)
-\t\tif remaining <= 0 { s.Reset(); return false }
-\t\twait := 100 * time.Millisecond
-\t\tif remaining < wait { wait = remaining }
-\t\tt := time.NewTimer(wait)
-\t\tselect {
-\t\tcase <-s.closed: if !t.Stop() { <-t.C }; return false
-\t\tcase <-s.hasSpace: if !t.Stop() { <-t.C }
-\t\tcase <-t.C:
-\t\t}
-\t}
-}
+          func (s *MuxStream) PushDataFrame(frame muxDataFrame) bool {
+          \tdataLen := int64(len(frame.data))
+          \tdeadline := time.Now().Add(3 * time.Second)
+          \tfor {
+          \t\ts.bufMu.Lock()
+          \t\tselect { case <-s.closed: s.bufMu.Unlock(); return false; default: }
+          \t\tif s.queuedBytes+dataLen <= muxClientStreamBufferLimit {
+          \t\t\tselect { case s.readChan <- frame: s.queuedBytes += dataLen; s.bufMu.Unlock(); return true; default: }
+          \t\t}
+          \t\ts.bufMu.Unlock()
+          \t\tremaining := time.Until(deadline)
+          \t\tif remaining <= 0 { s.Reset(); return false }
+          \t\twait := 100 * time.Millisecond
+          \t\tif remaining < wait { wait = remaining }
+          \t\tt := time.NewTimer(wait)
+          \t\tselect {
+          \t\tcase <-s.closed: if !t.Stop() { <-t.C }; return false
+          \t\tcase <-s.hasSpace: if !t.Stop() { <-t.C }
+          \t\tcase <-t.C:
+          \t\t}
+          \t}
+          }
 
-func (s *MuxStream) PushData(''', 'client PushDataFrame')
+          func (s *MuxStream) PushData('''
+          s, n = re.subn(client_pat, client_repl, s, count=1, flags=re.S)
+          if n != 1: raise SystemExit('client PushDataFrame repair failed')
           s = re.sub(r'func \(s \*MuxStream\) PushEOF\(\) \{.*?\n\}', '''func (s *MuxStream) PushEOF() {
-\tif s.readClosed.Swap(true) { return }
-\tselect { case <-s.closed: return; default: }
-\tselect { case s.hasSpace <- struct{}{}: default: }
-}''', s, count=1, flags=re.S)
+          \tif s.readClosed.Swap(true) { return }
+          \tselect { case <-s.closed: return; default: }
+          \tselect { case s.hasSpace <- struct{}{}: default: }
+          }''', s, count=1, flags=re.S)
 
-          # Server MUX: nonblocking enqueue + bounded public backpressure.
-          replace_func(r'func \(s \*MuxServerStream\) PushDataFrame\(frame muxDataFrame\) bool \{.*?\n\}\n\nfunc \(s \*MuxServerStream\) PushData\(', '''func (s *MuxServerStream) enqueueDataFrame(frame muxDataFrame) bool {
-\tdataLen := int64(len(frame.data))
-\ts.bufMu.Lock()
-\tdefer s.bufMu.Unlock()
-\tselect { case <-s.closed: return false; case <-s.fin: return false; default: }
-\tif s.queuedBytes+dataLen > muxServerStreamBufferLimit { return false }
-\tselect { case s.writeChan <- frame: s.queuedBytes += dataLen; return true; default: return false }
-}
+          # Server MUX stream with identical bounded public backpressure and explicit FIN state.
+          server_pat = r'func \(s \*MuxServerStream\) PushDataFrame\(frame muxDataFrame\) bool \{.*?\n\}\n\nfunc \(s \*MuxServerStream\) PushData\('
+          server_repl = '''func (s *MuxServerStream) enqueueDataFrame(frame muxDataFrame) bool {
+          \tdataLen := int64(len(frame.data))
+          \ts.bufMu.Lock()
+          \tdefer s.bufMu.Unlock()
+          \tselect { case <-s.closed: return false; case <-s.fin: return false; default: }
+          \tif s.queuedBytes+dataLen > muxServerStreamBufferLimit { return false }
+          \tselect { case s.writeChan <- frame: s.queuedBytes += dataLen; return true; default: return false }
+          }
 
-func (s *MuxServerStream) PushDataFrame(frame muxDataFrame) bool {
-\tdataLen := int64(len(frame.data))
-\tdeadline := time.Now().Add(3 * time.Second)
-\tfor {
-\t\ts.bufMu.Lock()
-\t\tselect { case <-s.closed: s.bufMu.Unlock(); return false; case <-s.fin: s.bufMu.Unlock(); return false; default: }
-\t\tif s.queuedBytes+dataLen <= muxServerStreamBufferLimit {
-\t\t\tselect { case s.writeChan <- frame: s.queuedBytes += dataLen; s.bufMu.Unlock(); return true; default: }
-\t\t}
-\t\ts.bufMu.Unlock()
-\t\tremaining := time.Until(deadline)
-\t\tif remaining <= 0 { s.Close(); _ = s.session.SendFrame(s.id, MuxCmdRST, nil); return false }
-\t\twait := 100 * time.Millisecond
-\t\tif remaining < wait { wait = remaining }
-\t\tt := time.NewTimer(wait)
-\t\tselect {
-\t\tcase <-s.closed: if !t.Stop() { <-t.C }; return false
-\t\tcase <-s.fin: if !t.Stop() { <-t.C }; return false
-\t\tcase <-s.hasSpace: if !t.Stop() { <-t.C }
-\t\tcase <-t.C:
-\t\t}
-\t}
-}
+          func (s *MuxServerStream) PushDataFrame(frame muxDataFrame) bool {
+          \tdataLen := int64(len(frame.data))
+          \tdeadline := time.Now().Add(3 * time.Second)
+          \tfor {
+          \t\ts.bufMu.Lock()
+          \t\tselect { case <-s.closed: s.bufMu.Unlock(); return false; case <-s.fin: s.bufMu.Unlock(); return false; default: }
+          \t\tif s.queuedBytes+dataLen <= muxServerStreamBufferLimit {
+          \t\t\tselect { case s.writeChan <- frame: s.queuedBytes += dataLen; s.bufMu.Unlock(); return true; default: }
+          \t\t}
+          \t\ts.bufMu.Unlock()
+          \t\tremaining := time.Until(deadline)
+          \t\tif remaining <= 0 { s.Close(); _ = s.session.SendFrame(s.id, MuxCmdRST, nil); return false }
+          \t\twait := 100 * time.Millisecond
+          \t\tif remaining < wait { wait = remaining }
+          \t\tt := time.NewTimer(wait)
+          \t\tselect {
+          \t\tcase <-s.closed: if !t.Stop() { <-t.C }; return false
+          \t\tcase <-s.fin: if !t.Stop() { <-t.C }; return false
+          \t\tcase <-s.hasSpace: if !t.Stop() { <-t.C }
+          \t\tcase <-t.C:
+          \t\t}
+          \t}
+          }
 
-func (s *MuxServerStream) PushData(''', 'server PushDataFrame')
+          func (s *MuxServerStream) PushData('''
+          s, n = re.subn(server_pat, server_repl, s, count=1, flags=re.S)
+          if n != 1: raise SystemExit('server PushDataFrame repair failed')
+
           if 'fin         chan struct{}' not in s:
               s = s.replace('''type MuxServerStream struct {
-\tid          uint32
-\tsession     *MuxServerSession
-\twriteChan   chan muxDataFrame
-\ttargetConn  net.Conn''', '''type MuxServerStream struct {
-\tid          uint32
-\tsession     *MuxServerSession
-\twriteChan   chan muxDataFrame
-\tfin         chan struct{}
-\tfinOnce     sync.Once
-\ttargetConn  net.Conn''', 1)
+          \tid          uint32
+          \tsession     *MuxServerSession
+          \twriteChan   chan muxDataFrame
+          \ttargetConn  net.Conn''', '''type MuxServerStream struct {
+          \tid          uint32
+          \tsession     *MuxServerSession
+          \twriteChan   chan muxDataFrame
+          \tfin         chan struct{}
+          \tfinOnce     sync.Once
+          \ttargetConn  net.Conn''', 1)
           s = s.replace('''\treturn &MuxServerStream{
-\t\tid:        id,
-\t\tsession:   session,
-\t\twriteChan: make(chan muxDataFrame, 256),
-\t\tclosed:    make(chan struct{}),''', '''\treturn &MuxServerStream{
-\t\tid:        id,
-\t\tsession:   session,
-\t\twriteChan: make(chan muxDataFrame, 256),
-\t\tfin:       make(chan struct{}),
-\t\tclosed:    make(chan struct{}),''', 1)
+          \t\tid:        id,
+          \t\tsession:   session,
+          \t\twriteChan: make(chan muxDataFrame, 256),
+          \t\tclosed:    make(chan struct{}),''', '''\treturn &MuxServerStream{
+          \t\tid:        id,
+          \t\tsession:   session,
+          \t\twriteChan: make(chan muxDataFrame, 256),
+          \t\tfin:       make(chan struct{}),
+          \t\tclosed:    make(chan struct{}),''', 1)
           if 'func (s *MuxServerStream) PushEOF()' not in s:
               marker = '''func (s *MuxServerStream) QueuedBytes() int64 {
-\ts.bufMu.Lock()
-\tdefer s.bufMu.Unlock()
-\treturn s.queuedBytes
-}
-'''
-              if marker not in s: raise SystemExit('server QueuedBytes marker missing')
+          \ts.bufMu.Lock()
+          \tdefer s.bufMu.Unlock()
+          \treturn s.queuedBytes
+          }
+          '''
+              if marker not in s: raise SystemExit('server queued bytes marker missing')
               s = s.replace(marker, marker + '''
-func (s *MuxServerStream) PushEOF() {
-\ts.finOnce.Do(func() { close(s.fin) })
-\tselect { case s.hasSpace <- struct{}{}: default: }
-}
-''', 1)
+          func (s *MuxServerStream) PushEOF() {
+          \ts.finOnce.Do(func() { close(s.fin) })
+          \tselect { case s.hasSpace <- struct{}{}: default: }
+          }
+          ''', 1)
 
-          # Replace every remaining session delivery call with nonblocking enqueue.
+          # Every MUX session must enqueue without blocking on a slow stream.
           s = s.replace('if !st.PushDataFrame(frame) {', 'if !st.enqueueDataFrame(frame) {')
-          s = s.replace('''\t\tcase MuxCmdFIN:
-\t\t\tsession.streamsMu.RLock()
-\t\t\tst, ok := session.streams[streamID]
-\t\t\tsession.streamsMu.RUnlock()
-\t\t\tif ok {
-\t\t\t\tif !st.PushDataFrame(muxDataFrame{data: nil}) {
-\t\t\t\t\tsession.streamsMu.Lock()
-\t\t\t\t\tdelete(session.streams, streamID)
-\t\t\t\t\tsession.streamsMu.Unlock()
-\t\t\t\t}
-\t\t\t}''', '''\t\tcase MuxCmdFIN:
-\t\t\tsession.streamsMu.RLock()
-\t\t\tst, ok := session.streams[streamID]
-\t\t\tsession.streamsMu.RUnlock()
-\t\t\tif ok { st.PushEOF() }''', 1)
+          s = s.replace('''if !st.enqueueDataFrame(frame) {
+          \t\t\t\t\tframe.release()
+          \t\t\t\t}''', '''if !st.enqueueDataFrame(frame) {
+          \t\t\t\t\tframe.release()
+          \t\t\t\t\tst.Reset()
+          \t\t\t\t}''')
+          s = s.replace('''if !st.enqueueDataFrame(frame) {
+          \t\t\t\t\tframe.release()
+          \t\t\t\t\tst.Close()
+          \t\t\t\t\t_ = st.session.SendFrame(st.id, MuxCmdRST, nil)''', '''if !st.enqueueDataFrame(frame) {
+          \t\t\t\t\tframe.release()
+          \t\t\t\t\tst.Close()
+          \t\t\t\t\t_ = st.session.SendFrame(st.id, MuxCmdRST, nil)''')
+
+          # Server FIN is a half-close, never a nil DATA sentinel.
+          old_fin = '''\t\tcase MuxCmdFIN:
+          \t\t\tsession.streamsMu.RLock()
+          \t\t\tst, ok := session.streams[streamID]
+          \t\t\tsession.streamsMu.RUnlock()
+          \t\t\tif ok {
+          \t\t\t\tif !st.PushDataFrame(muxDataFrame{data: nil}) {
+          \t\t\t\t\tsession.streamsMu.Lock()
+          \t\t\t\t\tdelete(session.streams, streamID)
+          \t\t\t\t\tsession.streamsMu.Unlock()
+          \t\t\t\t}
+          \t\t\t}'''
+          new_fin = '''\t\tcase MuxCmdFIN:
+          \t\t\tsession.streamsMu.RLock()
+          \t\t\tst, ok := session.streams[streamID]
+          \t\t\tsession.streamsMu.RUnlock()
+          \t\t\tif ok { st.PushEOF() }'''
+          if s.count(old_fin) == 1:
+              s = s.replace(old_fin, new_fin, 1)
+
+          # Replace the entire server stream handler so target EOF and client FIN can coexist.
+          handler_pat = r'func \(s \*MuxServerSession\) handleNewStream\(st \*MuxServerStream, targetStr string, initialData \[\]byte\) \{.*?\n\}\n\nfunc handleConnection\('
+          handler_repl = '''func (s *MuxServerSession) handleNewStream(st *MuxServerStream, targetStr string, initialData []byte) {
+          \ttargetAddr := targetStr
+          \tif s.cfg.Resolver != nil {
+          \t\tif host, port, err := net.SplitHostPort(targetStr); err == nil {
+          \t\t\tif ip, err := s.cfg.Resolver.Resolve(host); err == nil { targetAddr = net.JoinHostPort(ip, port) }
+          \t\t}
+          \t}
+
+          \ttargetConn, err := net.DialTimeout("tcp", targetAddr, time.Duration(s.cfg.ConnTimeout)*time.Second)
+          \tif err != nil {
+          \t\tlogDebug("[SERVER-MUX] Dial %s failed: %v", targetAddr, err)
+          \t\t_ = s.SendFrame(st.id, MuxCmdRST, nil)
+          \t\tst.Close()
+          \t\ts.streamsMu.Lock(); delete(s.streams, st.id); s.streamsMu.Unlock()
+          \t\treturn
+          \t}
+          \toptimizeSocket(targetConn, s.cfg)
+          \tst.targetConn = targetConn
+
+          \tif len(initialData) > 0 {
+          \t\tif _, err := targetConn.Write(initialData); err != nil {
+          \t\t\t_ = s.SendFrame(st.id, MuxCmdRST, nil)
+          \t\t\tst.Close()
+          \t\t\ts.streamsMu.Lock(); delete(s.streams, st.id); s.streamsMu.Unlock()
+          \t\t\treturn
+          \t\t}
+          \t\tstats.AddBytes(int64(len(initialData)), 0)
+          \t}
+
+          \twriteDone := make(chan struct{})
+          \tgo func() {
+          \t\tdefer close(writeDone)
+          \t\tfor {
+          \t\t\tselect {
+          \t\t\tcase <-st.closed:
+          \t\t\t\treturn
+          \t\t\tcase frame := <-st.writeChan:
+          \t\t\t\tif frame.data == nil { frame.release(); continue }
+          \t\t\t\tdata := frame.data
+          \t\t\t\t_, err := targetConn.Write(data)
+          \t\t\t\tst.consumedBytes(len(data))
+          \t\t\t\tframe.release()
+          \t\t\t\tif err != nil { st.Close(); return }
+          \t\t\t\tstats.AddBytes(int64(len(data)), 0)
+          \t\t\tcase <-st.fin:
+          \t\t\t\tfor {
+          \t\t\t\t\tselect {
+          \t\t\t\t\tcase frame := <-st.writeChan:
+          \t\t\t\t\t\tif frame.data != nil { _, _ = targetConn.Write(frame.data); st.consumedBytes(len(frame.data)) }
+          \t\t\t\t\t\tframe.release()
+          \t\t\t\t\tdefault:
+          \t\t\t\t\t\tif tc, ok := targetConn.(*net.TCPConn); ok { _ = tc.CloseWrite() }
+          \t\t\t\t\t\treturn
+          \t\t\t\t\t}
+          \t\t\t\t}
+          \t\t\t}
+          \t\t}
+          \t}()
+
+          \tbPtr := s.cfg.BufPool.Get().(*[]byte)
+          \tdefer s.cfg.BufPool.Put(bPtr)
+          \tbuf := *bPtr
+          \tif len(buf) > 65535 { buf = buf[:65535] }
+          \tfor {
+          \t\tnr, errRead := targetConn.Read(buf)
+          \t\tif nr > 0 {
+          \t\t\tif err := s.SendFrame(st.id, MuxCmdDATA, buf[:nr]); err != nil { break }
+          \t\t\tstats.AddBytes(0, int64(nr))
+          \t\t}
+          \t\tif errRead != nil {
+          \t\t\tif errRead == io.EOF {
+          \t\t\t\tif s.SendFrame(st.id, MuxCmdFIN, nil) == nil {
+          \t\t\t\t\tselect { case <-writeDone: case <-time.After(time.Duration(s.cfg.ConnTimeout) * time.Second): }
+          \t\t\t\t}
+          \t\t\t} else { _ = s.SendFrame(st.id, MuxCmdRST, nil) }
+          \t\t\tbreak
+          \t\t}
+          \t}
+
+          \tst.Close()
+          \ts.streamsMu.Lock(); delete(s.streams, st.id); s.streamsMu.Unlock()
+          }
+
+          func handleConnection('''
+          s, n = re.subn(handler_pat, handler_repl, s, count=1, flags=re.S)
+          if n != 1: raise SystemExit('server handleNewStream replacement failed')
 
           p.write_text(s, encoding='utf-8')
-      - name: Validate
-        working-directory: goway
-        run: |
+          PY
+
+          cd goway
           gofmt -w goway.go
           go test ./... -run 'TestMux|TestConnPool|TestBuffer' -count=1
           go test ./... -run '^$'
           go vet ./...
-      - name: Commit repaired source
-        shell: bash
-        run: |
-          set -euo pipefail
+
+          cd ..
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add goway/goway.go
-          git diff --cached --quiet && exit 0
-          git commit -m 'fix: harden goway mux backpressure [skip ci]'
+          if git diff --cached --quiet; then
+            echo 'No source changes required'
+            exit 0
+          fi
+          git commit -m 'fix: harden goway mux flow control and half-close [skip ci]'
           git push
-
-  verify:
-    name: Verify GOWAY release
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.25'
-          cache-dependency-path: goway/go.mod
-      - name: Full verification
-        working-directory: goway
-        run: |
-          go test ./... -count=1
-          go test -race ./... -count=1
-          go vet ./...
-      - name: Build Windows amd64
-        working-directory: goway
-        run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o goway-windows-amd64.exe .
-      - name: Build Debian amd64
-        working-directory: goway
-        run: GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o goway-debian12-amd64 .
-      - name: Build OpenWrt ARMv7
-        working-directory: goway
-        run: GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o goway-openwrt-arm7 .
