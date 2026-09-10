@@ -1,0 +1,117 @@
+name: Apply GoWay v1.8.2 fix
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch mux backpressure and test harness
+        shell: python
+        run: |
+          from pathlib import Path
+
+          src = Path('goway/goway.go')
+          s = src.read_text(encoding='utf-8')
+
+          old = '''\tmuxServerStreamBufferLimit = 8 * 1024 * 1024\n)'''
+          new = '''\t// Per-stream receive limits. These are deliberately bounded so a single\n\t// stalled stream cannot consume the process memory budget.\n\tmuxServerStreamBufferLimit = 16 * 1024 * 1024\n\tmuxStreamIngressQueue    = 16\n\tmuxPushStallTimeout       = 3 * time.Second\n)'''
+          if old not in s:
+              raise SystemExit('server mux buffer constant block not found')
+          s = s.replace(old, new, 1)
+
+          old = '''\treadMu      sync.Mutex\n}'''
+          new = '''\treadMu      sync.Mutex\n\tingress     chan muxDataFrame\n}'''
+          if old not in s:
+              raise SystemExit('MuxStream struct tail not found')
+          s = s.replace(old, new, 1)
+
+          old = '''\t\treadChan: make(chan muxDataFrame, 128),\n\t\tclosed:   make(chan struct{}),\n\t\thasSpace: make(chan struct{}, 1),\n\t}\n}\n\nfunc (s *MuxStream) PushDataFrame(frame muxDataFrame) bool {\n\tdataLen := int64(len(frame.data))\n\ts.bufMu.Lock()\n\tselect {\n\tcase <-s.closed:\n\t\ts.bufMu.Unlock()\n\t\treturn false\n\tdefault:\n\t}\n\tif s.queuedBytes+dataLen > muxClientStreamBufferLimit {\n\t\ts.bufMu.Unlock()\n\t\tlogWarn("[MUX] Stream %d receive buffer limit reached, resetting stream", s.id)\n\t\ts.Reset()\n\t\treturn false\n\t}\n\tselect {\n\tcase s.readChan <- frame:\n\t\ts.queuedBytes += dataLen\n\t\ts.bufMu.Unlock()\n\t\treturn true\n\tdefault:\n\t\ts.bufMu.Unlock()\n\t\tlogWarn("[MUX] Stream %d receive queue full, resetting stream", s.id)\n\t\ts.Reset()\n\t\treturn false\n\t}\n}\n'''
+          new = '''\t\treadChan: make(chan muxDataFrame, 128),\n\t\tclosed:   make(chan struct{}),\n\t\thasSpace: make(chan struct{}, 1),\n\t\tingress:  make(chan muxDataFrame, muxStreamIngressQueue),\n\t}\n\tgo s.deliveryLoop()\n\treturn s\n}\n\n// enqueueDataFrame is the non-blocking session ingress. The session read loop\n// must never wait on a slow stream; when a stream's tiny ingress queue is full\n// only that stream is reset. The pooled buffer remains owned by the frame until\n// the delivery worker either queues or releases it.\nfunc (s *MuxStream) enqueueDataFrame(frame muxDataFrame) bool {\n\tselect {\n\tcase <-s.closed:\n\t\tframe.release()\n\t\treturn false\n\tcase s.ingress <- frame:\n\t\treturn true\n\tdefault:\n\t\tlogWarn("[MUX] Stream %d ingress queue full, resetting stream", s.id)\n\t\tframe.release()\n\t\ts.Reset()\n\t\treturn false\n\t}\n}\n\nfunc (s *MuxStream) deliveryLoop() {\n\tfor {\n\t\tselect {\n\t\tcase <-s.closed:\n\t\t\treturn\n\t\tcase frame := <-s.ingress:\n\t\t\tif !s.PushDataFrame(frame) {\n\t\t\t\tframe.release()\n\t\t\t}\n\t\t}\n\t}\n}\n\nfunc (s *MuxStream) PushDataFrame(frame muxDataFrame) bool {\n\tdataLen := int64(len(frame.data))\n\tdeadline := time.NewTimer(muxPushStallTimeout)\n\tdefer deadline.Stop()\n\n\tfor {\n\t\ts.bufMu.Lock()\n\t\tselect {\n\t\tcase <-s.closed:\n\t\t\ts.bufMu.Unlock()\n\t\t\treturn false\n\t\tdefault:\n\t\t}\n\t\tif frame.data == nil {\n\t\t\ts.readClosed.Store(true)\n\t\t}\n\t\tif s.queuedBytes+dataLen <= muxClientStreamBufferLimit {\n\t\t\tselect {\n\t\t\tcase s.readChan <- frame:\n\t\t\t\ts.queuedBytes += dataLen\n\t\t\t\ts.bufMu.Unlock()\n\t\t\t\treturn true\n\t\t\tdefault:\n\t\t\t}\n\t\t}\n\t\ts.bufMu.Unlock()\n\n\t\tselect {\n\t\tcase <-s.closed:\n\t\t\treturn false\n\t\tcase <-s.hasSpace:\n\t\t\tcontinue\n\t\tcase <-deadline.C:\n\t\t\tlogWarn("[MUX] Stream %d receive backpressure timeout, resetting stream", s.id)\n\t\t\ts.Reset()\n\t\t\treturn false\n\t\t}\n\t}\n}\n'''
+          if old not in s:
+              raise SystemExit('MuxStream constructor/function block not found')
+          s = s.replace(old, new, 1)
+
+          old = '''\t\t\t\tif !st.PushDataFrame(frame) {\n\t\t\t\t\tframe.release()\n\t\t\t\t}\n\t\t\t\tstats.AddBytes(0, int64(len(payload)))'''
+          new = '''\t\t\t\tst.enqueueDataFrame(frame)\n\t\t\t\tstats.AddBytes(0, int64(len(payload)))'''
+          if old not in s:
+              raise SystemExit('client mux readLoop delivery block not found')
+          s = s.replace(old, new, 1)
+
+          old = '''\t\tcase MuxCmdFIN:\n\t\t\tst.PushEOF()'''
+          new = '''\t\tcase MuxCmdFIN:\n\t\t\tst.enqueueDataFrame(muxDataFrame{data: nil})'''
+          if old not in s:
+              raise SystemExit('client FIN block not found')
+          s = s.replace(old, new, 1)
+
+          old = '''\tqueuedBytes int64\n\thasSpace    chan struct{}\n}'''
+          new = '''\tqueuedBytes int64\n\thasSpace    chan struct{}\n\tingress     chan muxDataFrame\n}'''
+          if old not in s:
+              raise SystemExit('server stream struct tail not found')
+          s = s.replace(old, new, 1)
+
+          old = '''\t\twriteChan: make(chan muxDataFrame, 256),\n\t\tclosed:    make(chan struct{}),\n\t\thasSpace:  make(chan struct{}, 1),\n\t}\n}\n\nfunc (s *MuxServerStream) PushDataFrame(frame muxDataFrame) bool {\n\tdataLen := int64(len(frame.data))\n\ts.bufMu.Lock()\n\tselect {\n\tcase <-s.closed:\n\t\ts.bufMu.Unlock()\n\t\treturn false\n\tdefault:\n\t}\n\tif s.queuedBytes+dataLen > muxServerStreamBufferLimit {\n\t\ts.bufMu.Unlock()\n\t\tlogWarn("[SERVER-MUX] Stream %d receive buffer limit reached, resetting stream", s.id)\n\t\ts.Close()\n\t\t_ = s.session.SendFrame(s.id, MuxCmdRST, nil)\n\t\treturn false\n\t}\n\tselect {\n\tcase s.writeChan <- frame:\n\t\ts.queuedBytes += dataLen\n\t\ts.bufMu.Unlock()\n\t\treturn true\n\tdefault:\n\t\ts.bufMu.Unlock()\n\t\tlogWarn("[SERVER-MUX] Stream %d receive queue full, resetting stream", s.id)\n\t\ts.Close()\n\t\t_ = s.session.SendFrame(s.id, MuxCmdRST, nil)\n\t\treturn false\n\t}\n}\n'''
+          new = '''\t\twriteChan: make(chan muxDataFrame, 256),\n\t\tclosed:    make(chan struct{}),\n\t\thasSpace:  make(chan struct{}, 1),\n\t\tingress:   make(chan muxDataFrame, muxStreamIngressQueue),\n\t}\n\tgo s.deliveryLoop()\n\treturn s\n}\n\nfunc (s *MuxServerStream) enqueueDataFrame(frame muxDataFrame) bool {\n\tselect {\n\tcase <-s.closed:\n\t\tframe.release()\n\t\treturn false\n\tcase s.ingress <- frame:\n\t\treturn true\n\tdefault:\n\t\tlogWarn("[SERVER-MUX] Stream %d ingress queue full, resetting stream", s.id)\n\t\tframe.release()\n\t\ts.Close()\n\t\t_ = s.session.SendFrame(s.id, MuxCmdRST, nil)\n\t\treturn false\n\t}\n}\n\nfunc (s *MuxServerStream) deliveryLoop() {\n\tfor {\n\t\tselect {\n\t\tcase <-s.closed:\n\t\t\treturn\n\t\tcase frame := <-s.ingress:\n\t\t\tif !s.PushDataFrame(frame) {\n\t\t\t\tframe.release()\n\t\t\t}\n\t\t}\n\t}\n}\n\nfunc (s *MuxServerStream) PushDataFrame(frame muxDataFrame) bool {\n\tdataLen := int64(len(frame.data))\n\tdeadline := time.NewTimer(muxPushStallTimeout)\n\tdefer deadline.Stop()\n\n\tfor {\n\t\ts.bufMu.Lock()\n\t\tselect {\n\t\tcase <-s.closed:\n\t\t\ts.bufMu.Unlock()\n\t\t\treturn false\n\t\tdefault:\n\t\t}\n\t\tif s.queuedBytes+dataLen <= muxServerStreamBufferLimit {\n\t\t\tselect {\n\t\t\tcase s.writeChan <- frame:\n\t\t\t\ts.queuedBytes += dataLen\n\t\t\t\ts.bufMu.Unlock()\n\t\t\t\treturn true\n\t\t\tdefault:\n\t\t\t}\n\t\t}\n\t\ts.bufMu.Unlock()\n\n\t\tselect {\n\t\tcase <-s.closed:\n\t\t\treturn false\n\t\tcase <-s.hasSpace:\n\t\t\tcontinue\n\t\tcase <-deadline.C:\n\t\t\tlogWarn("[SERVER-MUX] Stream %d receive backpressure timeout, resetting stream", s.id)\n\t\t\ts.Close()\n\t\t\t_ = s.session.SendFrame(s.id, MuxCmdRST, nil)\n\t\t\treturn false\n\t\t}\n\t}\n}\n'''
+          if old not in s:
+              raise SystemExit('MuxServerStream constructor/function block not found')
+          s = s.replace(old, new, 1)
+
+          old = '''\t\t\tif ok && len(payload) > 0 {\n\t\t\t\tframe := muxDataFrame{\n\t\t\t\t\tdata: payload,\n\t\t\t\t\tbPtr: bPtr,\n\t\t\t\t\tpool: cfg.BufPool,\n\t\t\t\t}\n\t\t\t\tbPtr = cfg.BufPool.Get().(*[]byte)\n\t\t\t\tbuf = *bPtr\n\t\t\t\tif !st.PushDataFrame(frame) {\n\t\t\t\t\tframe.release()\n\t\t\t\t\tsession.streamsMu.Lock()\n\t\t\t\t\tdelete(session.streams, streamID)\n\t\t\t\t\tsession.streamsMu.Unlock()\n\t\t\t\t}\n\t\t\t}\n\n\t\tcase MuxCmdFIN:\n\t\t\tsession.streamsMu.RLock()\n\t\t\tst, ok := session.streams[streamID]\n\t\t\tsession.streamsMu.RUnlock()\n\t\t\tif ok {\n\t\t\t\tif !st.PushDataFrame(muxDataFrame{data: nil}) {\n\t\t\t\t\tsession.streamsMu.Lock()\n\t\t\t\t\tdelete(session.streams, streamID)\n\t\t\t\t\tsession.streamsMu.Unlock()\n\t\t\t\t}\n\t\t\t}\n'''
+          new = '''\t\t\tif ok && len(payload) > 0 {\n\t\t\t\tframe := muxDataFrame{\n\t\t\t\t\tdata: payload,\n\t\t\t\t\tbPtr: bPtr,\n\t\t\t\t\tpool: cfg.BufPool,\n\t\t\t\t}\n\t\t\t\tbPtr = cfg.BufPool.Get().(*[]byte)\n\t\t\t\tbuf = *bPtr\n\t\t\t\tst.enqueueDataFrame(frame)\n\t\t\t}\n\n\t\tcase MuxCmdFIN:\n\t\t\tsession.streamsMu.RLock()\n\t\t\tst, ok := session.streams[streamID]\n\t\t\tsession.streamsMu.RUnlock()\n\t\t\tif ok {\n\t\t\t\tst.enqueueDataFrame(muxDataFrame{data: nil})\n\t\t\t}\n'''
+          if old not in s:
+              raise SystemExit('server mux DATA/FIN block not found')
+          s = s.replace(old, new, 1)
+
+          old = '''\tfor {\n\t\tselect {\n\t\tcase <-s.closed:\n\t\t\treturn\n\t\tcase frame := <-s.ingress:\n\t\t\tif !s.PushDataFrame(frame) {\n\t\t\t\tframe.release()\n\t\t\t}\n\t\t}\n\t}\n}\n\nfunc (s *MuxServerStream) PushDataFrame'''
+          # kept intentionally as a sanity check against accidental duplicate worker variants
+          if old not in s:
+              raise SystemExit('server delivery loop sanity check failed')
+
+          # Raise the internal application/relay buffer cap from 256 KiB to 512 KiB.\n          old = '''\tif bufSize > 256*1024+14+MuxHeaderLen {\n\t\tbufSize = 256*1024+14+MuxHeaderLen\n\t}'''
+          new = '''\tif bufSize > 512*1024+14+MuxHeaderLen {\n\t\tbufSize = 512*1024+14+MuxHeaderLen\n\t}'''
+          if old not in s:
+              raise SystemExit('256 KiB buffer cap not found')
+          s = s.replace(old, new, 1)
+
+          src.write_text(s, encoding='utf-8')
+
+          test = Path('goway/goway_test.go')
+          ts = test.read_text(encoding='utf-8')
+          ts = ts.replace('\t"os/exec"\n\t"runtime"\n', '\t"os/exec"\n\t"path/filepath"\n\t"runtime"\n', 1)
+
+          marker = 'func TestEndToEndSubprocessIntegration(t *testing.T) {'
+          helper = '''func buildTestBinary(t *testing.T) string {\n\tt.Helper()\n\tname := "goway-test"\n\tif runtime.GOOS == "windows" {\n\t\tname += ".exe"\n\t}\n\tpath := filepath.Join(t.TempDir(), name)\n\tcmd := exec.Command("go", "build", "-o", path, ".")\n\tout, err := cmd.CombinedOutput()\n\tif err != nil {\n\t\tt.Fatalf("Failed to build goway test binary: %v\\n%s", err, out)\n\t}\n\treturn path\n}\n\n'''
+          if helper not in ts:
+              if marker not in ts:
+                  raise SystemExit('integration test marker not found')
+              ts = ts.replace(marker, helper + marker, 1)
+
+          ts = ts.replace('''\t// 2. Start GOWAY Server subprocess\n\tserverPort := 18880\n\tserverCmd := exec.Command(".\\\\goway.exe",''', '''\t// 2. Start GOWAY Server subprocess\n\tbinaryPath := buildTestBinary(t)\n\tserverPort := 18880\n\tserverCmd := exec.Command(binaryPath,''', 1)
+          ts = ts.replace('''\tclientCmd := exec.Command(".\\\\goway.exe",''', '''\tclientCmd := exec.Command(binaryPath,''', 1)
+          test.write_text(ts, encoding='utf-8')
+
+          print('goway.go patched')
+          print('goway_test.go patched')
+
+      - name: Format
+        run: gofmt -w goway/goway.go goway/goway_test.go
+      - name: Test
+        working-directory: goway
+        run: |
+          go test ./...
+          go test -race ./...
+          go vet ./...
+      - name: Commit patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add goway/goway.go goway/goway_test.go
+          git diff --cached --quiet || git commit -m "fix: isolate mux stream backpressure [skip ci]"
+          git push
