@@ -1,0 +1,295 @@
+name: goway v1.8.2 refactor
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  refactor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Refactor goway source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/goway"
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('goway.go')
+          s = p.read_text(encoding='utf-8')
+
+          def replace_func(src, signature, replacement):
+              start = src.find(signature)
+              if start < 0:
+                  raise SystemExit(f'missing function: {signature}')
+              brace = src.find('{', start)
+              depth = 0
+              in_str = in_char = esc = line_comment = block_comment = False
+              i = brace
+              while i < len(src):
+                  c = src[i]
+                  n = src[i+1] if i+1 < len(src) else ''
+                  if line_comment:
+                      if c == '\n': line_comment = False
+                  elif block_comment:
+                      if c == '*' and n == '/': block_comment = False; i += 1
+                  elif in_str:
+                      if esc: esc = False
+                      elif c == '\\': esc = True
+                      elif c == '"': in_str = False
+                  elif in_char:
+                      if esc: esc = False
+                      elif c == '\\': esc = True
+                      elif c == "'": in_char = False
+                  elif c == '/' and n == '/': line_comment = True; i += 1
+                  elif c == '/' and n == '*': block_comment = True; i += 1
+                  elif c == '"': in_str = True
+                  elif c == "'": in_char = True
+                  elif c == '{': depth += 1
+                  elif c == '}':
+                      depth -= 1
+                      if depth == 0:
+                          return src[:start] + replacement + src[i+1:]
+                  i += 1
+              raise SystemExit(f'unclosed function: {signature}')
+
+          # Bump version.
+          s = s.replace('Version        = "1.8.1"', 'Version        = "1.8.2"', 1)
+
+          # No compression negotiation for already-compressed proxy payloads.
+          s = s.replace('\n\t\t"Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits",', '', 1)
+
+          # Remove artificial padding bytes from protocol bootstrap messages.
+          s = s.replace('''\tbase := "MUX\\n"
+\tpadLen := 1 + mrand.Intn(40)
+\ttargetPayload := make([]byte, len(base)+padLen)
+\tcopy(targetPayload, base)
+\tfor i := len(base); i < len(targetPayload); i++ {
+\t\ttargetPayload[i] = ' '
+\t}''', '''\ttargetPayload := []byte("MUX\\n")''', 1)
+          s = s.replace('''\tbase := "UDP\\n"
+\tpadLen := 1 + mrand.Intn(40)
+\ttargetPayload := make([]byte, len(base)+padLen)
+\tcopy(targetPayload, base)
+\tfor i := len(base); i < len(targetPayload); i++ {
+\t\ttargetPayload[i] = ' '
+\t}''', '''\ttargetPayload := []byte("UDP\\n")''', 1)
+          s = s.replace('''\tbase := targetHost + ":" + targetPort + "\\n"
+\tpadLen := 1 + mrand.Intn(40)
+\ttargetPayload := make([]byte, len(base)+padLen)
+\tcopy(targetPayload, base)
+\t// fill padding with spaces (constant, no allocation)
+\tfor i := len(base); i < len(targetPayload); i++ {
+\t\ttargetPayload[i] = ' '
+\t}''', '''\ttargetPayload := []byte(targetHost + ":" + targetPort + "\\n")''', 1)
+
+          # Global linearizable connection admission control.
+          marker = 'var stats Statistics\n'
+          limiter = '''var stats Statistics
+
+// tryAcquireConn reserves one global slot atomically and never overshoots max.
+func tryAcquireConn(max int64) bool {
+\tfor {
+\t\tcur := atomic.LoadInt64(&stats.activeConns)
+\t\tif cur >= max { return false }
+\t\tif atomic.CompareAndSwapInt64(&stats.activeConns, cur, cur+1) { return true }
+\t}
+}
+
+func releaseConn() {
+\tfor {
+\t\tcur := atomic.LoadInt64(&stats.activeConns)
+\t\tif cur <= 0 { atomic.StoreInt64(&stats.activeConns, 0); return }
+\t\tif atomic.CompareAndSwapInt64(&stats.activeConns, cur, cur-1) { return }
+\t}
+}
+'''
+          if marker not in s: raise SystemExit('stats marker missing')
+          s = s.replace(marker, limiter, 1)
+
+          old = '''\t\tif atomic.LoadInt64(&stats.activeConns) >= int64(cfg.MaxConns) {
+\t\t\tlogWarn("MaxConns (%d) reached, rejecting connection", cfg.MaxConns)
+\t\t\tconn.Close()
+\t\t\tcontinue
+\t\t}
+
+\t\tstats.AddConn()
+\t\tgo func(c net.Conn) {
+\t\t\tdefer stats.RemoveConn()
+\t\t\thandleConnection(c, &cfg)
+\t\t}(conn)'''
+          new = '''\t\tif !tryAcquireConn(int64(cfg.MaxConns)) {
+\t\t\tlogWarn("MaxConns (%d) reached, rejecting connection", cfg.MaxConns)
+\t\t\t_ = conn.Close()
+\t\t\tcontinue
+\t\t}
+
+\t\tgo func(c net.Conn) {
+\t\t\tdefer releaseConn()
+\t\t\thandleConnection(c, &cfg)
+\t\t}(conn)'''
+          if old not in s: raise SystemExit('main accept limiter missing')
+          s = s.replace(old, new, 1)
+
+          old = '''\t\tif atomic.LoadInt64(&stats.activeConns) >= int64(cfg.MaxConns) {
+\t\t\tlogWarn("[QUIC-SERVER] MaxConns (%d) reached, rejecting stream", cfg.MaxConns)
+\t\t\t_ = stream.Close()
+\t\t\tcontinue
+\t\t}
+
+\t\tstats.AddConn()
+\t\tgo func(st quic.Stream) {
+\t\t\tdefer stats.RemoveConn()
+\t\t\thandleQUICStream(st, cfg)
+\t\t}(stream)'''
+          new = '''\t\tif !tryAcquireConn(int64(cfg.MaxConns)) {
+\t\t\tlogWarn("[QUIC-SERVER] MaxConns (%d) reached, rejecting stream", cfg.MaxConns)
+\t\t\t_ = stream.Close()
+\t\t\tcontinue
+\t\t}
+
+\t\tgo func(st quic.Stream) {
+\t\t\tdefer releaseConn()
+\t\t\thandleQUICStream(st, cfg)
+\t\t}(stream)'''
+          if old not in s: raise SystemExit('QUIC limiter missing')
+          s = s.replace(old, new, 1)
+
+          # Larger Mux chunks reduce framing/syscall overhead while remaining below uint16 payload limit.
+          s = s.replace('const maxChunk = 32 * 1024', 'const maxChunk = 60 * 1024', 1)
+
+          # Do not generate heartbeats while a session is carrying traffic.
+          old = '''\t\tcase <-ticker.C:
+\t\t\ts.writeMu.Lock()'''
+          new = '''\t\tcase <-ticker.C:
+\t\t\tif s.ActiveStreams() > 0 { continue }
+\t\t\ts.writeMu.Lock()'''
+          if old not in s: raise SystemExit('heartbeat block missing')
+          s = s.replace(old, new, 1)
+
+          # Slow Mux streams must never stall the single session read loop.
+          client_sig = 'func (s *MuxStream) PushDataFrame(frame muxDataFrame) bool'
+          server_sig = 'func (s *MuxServerStream) PushDataFrame(frame muxDataFrame) bool'
+          client_new = '''func (s *MuxStream) PushDataFrame(frame muxDataFrame) bool {
+\tdataLen := int64(len(frame.data))
+\ts.bufMu.Lock()
+\tselect { case <-s.closed: s.bufMu.Unlock(); return false; default: }
+\tif s.queuedBytes+dataLen > muxClientStreamBufferLimit {
+\t\ts.bufMu.Unlock()
+\t\tlogWarn("[MUX] Stream %d receive buffer limit reached, resetting stream", s.id)
+\t\ts.Reset()
+\t\treturn false
+\t}
+\tselect {
+\tcase s.readChan <- frame:
+\t\ts.queuedBytes += dataLen
+\t\ts.bufMu.Unlock()
+\t\treturn true
+\tdefault:
+\t\ts.bufMu.Unlock()
+\t\tlogWarn("[MUX] Stream %d receive queue full, resetting stream", s.id)
+\t\ts.Reset()
+\t\treturn false
+\t}
+}'''
+          server_new = '''func (s *MuxServerStream) PushDataFrame(frame muxDataFrame) bool {
+\tdataLen := int64(len(frame.data))
+\ts.bufMu.Lock()
+\tselect { case <-s.closed: s.bufMu.Unlock(); return false; default: }
+\tif s.queuedBytes+dataLen > muxServerStreamBufferLimit {
+\t\ts.bufMu.Unlock()
+\t\tlogWarn("[SERVER-MUX] Stream %d receive buffer limit reached, resetting stream", s.id)
+\t\ts.Close()
+\t\t_ = s.session.SendFrame(s.id, MuxCmdRST, nil)
+\t\treturn false
+\t}
+\tselect {
+\tcase s.writeChan <- frame:
+\t\ts.queuedBytes += dataLen
+\t\ts.bufMu.Unlock()
+\t\treturn true
+\tdefault:
+\t\ts.bufMu.Unlock()
+\t\tlogWarn("[SERVER-MUX] Stream %d receive queue full, resetting stream", s.id)
+\t\ts.Close()
+\t\t_ = s.session.SendFrame(s.id, MuxCmdRST, nil)
+\t\treturn false
+\t}
+}'''
+          # Replace by signature parser, because bodies change frequently.
+          s = replace_func(s, client_sig, client_new)
+          s = replace_func(s, server_sig, server_new)
+
+          # Limit pooled relay buffer size so -W cannot multiply into multi-GB memory at 1000 streams.
+          old = '''\tbufSize := cfg.BufferSize + 14
+\tif bufSize < 65536+14+MuxHeaderLen {
+\t\tbufSize = 65536 + 14 + MuxHeaderLen
+\t}'''
+          new = '''\tbufSize := cfg.BufferSize + 14
+\tif bufSize < 65536+14+MuxHeaderLen {
+\t\tbufSize = 65536 + 14 + MuxHeaderLen
+\t}
+\tif bufSize > 256*1024+14+MuxHeaderLen {
+\t\tbufSize = 256*1024 + 14 + MuxHeaderLen
+\t}'''
+          if old not in s: raise SystemExit('buffer sizing block missing')
+          s = s.replace(old, new, 1)
+
+          # Remove permanent dead-IP suppression; failed endpoints can recover on later attempts.
+          s = s.replace('\n\tdeadIPs     map[string]bool // IPs that failed during session (permanent until exit)', '', 1)
+          s = s.replace('\n\t\tdeadIPs:     make(map[string]bool),', '', 1)
+          old = '''\t// Skip known-dead IPs (permanent for session)
+\tp.mu.Lock()
+\tif p.deadIPs[dialHost] {
+\t\tp.mu.Unlock()
+\t\treturn p.tryFallbackDial(dialer, wsHost, wsPort, sniHostname)
+\t}
+\tp.mu.Unlock()
+
+'''
+          s = s.replace(old, '', 1)
+          old = '''\t\t// Mark IP as dead for session
+\t\tp.mu.Lock()
+\t\tp.deadIPs[dialHost] = true
+\t\tp.mu.Unlock()
+\t\tif cfg.FakeHost != "" {'''
+          s = s.replace(old, '''\t\tif cfg.FakeHost != "" {''', 1)
+
+          # Cheap OK-frame check without converting a byte slice to string.
+          s = s.replace('if !strings.HasPrefix(string(okFrame), "OK") {', 'if len(okFrame) < 2 || okFrame[0] != \'O\' || okFrame[1] != \'K\' {', 3)
+
+          p.write_text(s, encoding='utf-8')
+          print('refactored', len(s), 'bytes')
+          PY
+          gofmt -w goway.go
+
+      - name: Verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/goway"
+          go test ./...
+          go test -race ./...
+          go vet ./...
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /tmp/goway-v1.8.2.exe .
+          test -s /tmp/goway-v1.8.2.exe
+
+      - name: Commit and remove temporary workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add goway/goway.go .github/workflows/goway-v182-refactor.yml
+          git rm -f .github/workflows/goway-v182-refactor.yml
+          git commit -m "refactor(goway): v1.8.2 performance and mux hardening"
+          git push origin HEAD:main
