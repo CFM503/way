@@ -2,7 +2,6 @@ name: Release GOWAY
 
 on:
   push:
-    branches: [ main ]
     tags:
       - 'v*'
 
@@ -10,93 +9,24 @@ permissions:
   contents: write
 
 jobs:
-  goway:
-    name: GOWAY CI
+  verify:
+    name: Verify GOWAY
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.25'
           cache-dependency-path: goway/go.mod
-
-      - name: Repair source and test
-        shell: bash
+      - name: Test and build
+        working-directory: goway
         run: |
           set -euo pipefail
-
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            cd goway
-            go test ./... -count=1
-            go test -race ./... -count=1
-            go vet ./...
-            GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o goway-windows-amd64.exe .
-            GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o goway-debian12-amd64 .
-            GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o goway-openwrt-arm7 .
-            exit 0
-          fi
-
-          if [[ "${GITHUB_HEAD_COMMIT_MESSAGE:-}" == *"[skip ci]"* ]]; then
-            echo "skip-ci commit; validation already completed"
-            exit 0
-          fi
-
-          python3 - <<'PY'
-          from pathlib import Path
-
-          p = Path('goway/goway.go')
-          s = p.read_text(encoding='utf-8')
-
-          s = s.replace('bufSize = 256*1024 + 14 + MuxHeaderLen',
-                        'bufSize = 12*1024*1024 + 14 + MuxHeaderLen')
-
-          s = s.replace('\tdeadIPs     map[string]bool // IPs that failed during session (permanent until exit)',
-                        '\tdeadIPs     map[string]time.Time // temporarily suppress failed IPs', 1)
-          s = s.replace('\tdeadIPs:     make(map[string]bool),',
-                        '\tdeadIPs:     make(map[string]time.Time),', 1)
-          s = s.replace('p.deadIPs[dialHost] = true',
-                        'p.deadIPs[dialHost] = time.Now().Add(5 * time.Minute)')
-          s = s.replace('connPool.deadIPs[cfg.UpstreamHost] = true',
-                        'connPool.deadIPs[cfg.UpstreamHost] = time.Now().Add(5 * time.Minute)')
-
-          old = '''\t// Skip known-dead IPs (permanent for session)
-\tp.mu.Lock()
-\tif p.deadIPs[dialHost] {
-\t\tp.mu.Unlock()
-\t\treturn p.tryFallbackDial(dialer, wsHost, wsPort, sniHostname)
-\t}
-\tp.mu.Unlock()'''
-          new = '''\t// Skip recently failed IPs, but allow retry after cooldown.
-\tp.mu.Lock()
-\tif until, ok := p.deadIPs[dialHost]; ok {
-\t\tif time.Now().Before(until) {
-\t\t\tp.mu.Unlock()
-\t\t\treturn p.tryFallbackDial(dialer, wsHost, wsPort, sniHostname)
-\t\t}
-\t\tdelete(p.deadIPs, dialHost)
-\t}
-\tp.mu.Unlock()'''
-          if old in s:
-              s = s.replace(old, new, 1)
-
-          p.write_text(s, encoding='utf-8')
-          PY
-
-          cd goway
-          gofmt -w goway.go
-          go test ./... -run '^$'
+          go test ./... -count=1
+          go test -race ./... -count=1
           go vet ./...
-          cd ..
-
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add goway/goway.go
-          if git diff --cached --quiet; then
-            echo 'No source changes required'
-            exit 0
-          fi
-          git commit -m 'fix: repair goway deadIPs cooldown and buffer cap [skip ci]'
-          git push
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o goway-windows-amd64.exe .
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o goway-debian12-amd64 .
+          GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o goway-openwrt-arm7 .
