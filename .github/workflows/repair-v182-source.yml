@@ -1,0 +1,89 @@
+name: Repair GOWAY v1.8.2 source
+
+on:
+  push:
+    paths:
+      - '.github/workflows/repair-v182-source.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache-dependency-path: goway/go.mod
+
+      - name: Repair source
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('goway/goway.go')
+          s = p.read_text(encoding='utf-8')
+
+          def replace_once(old, new, label):
+              global s
+              n = s.count(old)
+              if n != 1:
+                  raise SystemExit(f'{label}: expected 1 match, got {n}')
+              s = s.replace(old, new, 1)
+
+          replace_once(
+              '\tif bufSize > 12*1024*1024+14+MuxHeaderLen {\n\t\tbufSize = 256*1024 + 14 + MuxHeaderLen\n\t}',
+              '\tif bufSize > 12*1024*1024+14+MuxHeaderLen {\n\t\tbufSize = 12*1024*1024 + 14 + MuxHeaderLen\n\t}',
+              'buffer fallback')
+
+          replace_once(
+              '\tdeadIPs     map[string]bool // IPs that failed during session (permanent until exit)',
+              '\tdeadIPs     map[string]time.Time // temporarily suppress failed IPs',
+              'deadIPs field')
+
+          replace_once(
+              '\t\tdeadIPs:     make(map[string]bool),',
+              '\t\tdeadIPs:     make(map[string]time.Time),',
+              'deadIPs initializer')
+
+          replace_once(
+              '''\t// Skip known-dead IPs (permanent for session)\n\tp.mu.Lock()\n\tif p.deadIPs[dialHost] {\n\t\tp.mu.Unlock()\n\t\treturn p.tryFallbackDial(dialer, wsHost, wsPort, sniHostname)\n\t}\n\tp.mu.Unlock()''',
+              '''\t// Skip recently failed IPs, but allow retry after cooldown.\n\tp.mu.Lock()\n\tif until, ok := p.deadIPs[dialHost]; ok {\n\t\tif time.Now().Before(until) {\n\t\t\tp.mu.Unlock()\n\t\t\treturn p.tryFallbackDial(dialer, wsHost, wsPort, sniHostname)\n\t\t}\n\t\tdelete(p.deadIPs, dialHost)\n\t}\n\tp.mu.Unlock()''',
+              'deadIPs check')
+
+          replace_once(
+              '''\t\t// Mark IP as dead for session\n\t\tp.mu.Lock()\n\t\tp.deadIPs[dialHost] = true\n\t\tp.mu.Unlock()''',
+              '''\t\t// Temporarily suppress this IP; retry it after cooldown.\n\t\tp.mu.Lock()\n\t\tp.deadIPs[dialHost] = time.Now().Add(5 * time.Minute)\n\t\tp.mu.Unlock()''',
+              'deadIPs set')
+
+          old = '''\t\t\t\t\t\tconnPool.mu.Lock()\n\t\t\t\t\t\tconnPool.deadIPs[cfg.UpstreamHost] = true\n\t\t\t\t\t\tconnPool.mu.Unlock()'''
+          new = '''\t\t\t\t\t\tconnPool.mu.Lock()\n\t\t\t\t\t\tconnPool.deadIPs[cfg.UpstreamHost] = time.Now().Add(5 * time.Minute)\n\t\t\t\t\t\tconnPool.mu.Unlock()'''
+          if old in s:
+              s = s.replace(old, new, 1)
+
+          p.write_text(s, encoding='utf-8')
+          PY
+
+      - name: Validate
+        working-directory: goway
+        run: |
+          gofmt -w goway.go
+          go test ./... -run '^$'
+          go vet ./...
+          grep -F 'deadIPs     map[string]time.Time' goway.go
+          grep -F 'deadIPs:     make(map[string]time.Time)' goway.go
+          grep -F 'bufSize = 12*1024*1024 + 14 + MuxHeaderLen' goway.go
+
+      - name: Commit and remove workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add goway/goway.go .github/workflows/repair-v182-source.yml
+          git commit -m 'fix: complete goway v1.8.2 buffer and deadIPs repair [skip ci]'
+          git push
