@@ -1546,7 +1546,7 @@ type ConnPool struct {
 	closed      bool
 	stopChan    chan struct{}
 	stopOnce    sync.Once
-	deadIPs     map[string]bool // IPs that failed during session (permanent until exit)
+	deadIPs     map[string]time.Time // temporarily suppress failed IPs
 	refillCh    chan struct{}
 }
 
@@ -1557,7 +1557,7 @@ func NewConnPool(cfg *Config, maxSize int) *ConnPool {
 		maxSize:     maxSize,
 		maxAge:      5 * time.Minute,
 		idleTimeout: 30 * time.Second,
-		deadIPs:     make(map[string]bool),
+		deadIPs:     make(map[string]time.Time),
 		stopChan:    make(chan struct{}),
 		refillCh:    make(chan struct{}, 1),
 	}
@@ -1646,11 +1646,14 @@ func (p *ConnPool) createConn() *PooledConn {
 
 	dialer := &net.Dialer{Timeout: time.Duration(cfg.ConnTimeout) * time.Second}
 
-	// Skip known-dead IPs (permanent for session)
+	// Skip recently failed IPs, but allow retry after cooldown.
 	p.mu.Lock()
-	if p.deadIPs[dialHost] {
-		p.mu.Unlock()
-		return p.tryFallbackDial(dialer, wsHost, wsPort, sniHostname)
+	if until, ok := p.deadIPs[dialHost]; ok {
+		if time.Now().Before(until) {
+			p.mu.Unlock()
+			return p.tryFallbackDial(dialer, wsHost, wsPort, sniHostname)
+		}
+		delete(p.deadIPs, dialHost)
 	}
 	p.mu.Unlock()
 
@@ -1665,9 +1668,9 @@ func (p *ConnPool) createConn() *PooledConn {
 	}
 	if err != nil {
 		logDebug("[POOL] Dial %s failed: %v", dialAddr, err)
-		// Mark IP as dead for session
+		// Temporarily suppress this IP; retry it after cooldown.
 		p.mu.Lock()
-		p.deadIPs[dialHost] = true
+		p.deadIPs[dialHost] = time.Now().Add(5 * time.Minute)
 		p.mu.Unlock()
 		if cfg.FakeHost != "" {
 			fallbackConn := p.tryFallbackDial(dialer, wsHost, wsPort, sniHostname)
@@ -2243,7 +2246,7 @@ func main() {
 		bufSize = 65536 + 14 + MuxHeaderLen
 	}
 	if bufSize > 12*1024*1024+14+MuxHeaderLen {
-		bufSize = 256*1024 + 14 + MuxHeaderLen
+		bufSize = 12*1024*1024 + 14 + MuxHeaderLen
 	}
 	cfg.BufPool = &sync.Pool{
 		New: func() interface{} {
@@ -2289,7 +2292,7 @@ func main() {
 					logWarn("All connections will use DNS-resolved Cloudflare edges via -fakehost")
 					if connPool != nil {
 						connPool.mu.Lock()
-						connPool.deadIPs[cfg.UpstreamHost] = true
+						connPool.deadIPs[cfg.UpstreamHost] = time.Now().Add(5 * time.Minute)
 						connPool.mu.Unlock()
 					}
 				} else {
