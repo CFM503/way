@@ -1,0 +1,57 @@
+name: Pre-release validation
+
+on:
+  push:
+    paths:
+      - '.github/workflows/pre-release-validation.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux full validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache-dependency-path: goway/go.mod
+      - name: Test
+        working-directory: goway
+        run: |
+          set -euo pipefail
+          go test ./... -count=1
+          go test -race ./... -count=1
+          go vet ./...
+      - name: Cross build Windows amd64
+        working-directory: goway
+        run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /tmp/goway-windows-amd64.exe .
+      - name: Cross build Debian amd64
+        working-directory: goway
+        run: GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /tmp/goway-linux-amd64 .
+      - name: Cross build OpenWrt ARMv7
+        working-directory: goway
+        run: GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /tmp/goway-openwrt-arm7 .
+
+  windows:
+    name: Windows integration
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache-dependency-path: goway/go.mod
+      - name: Build test binary
+        working-directory: goway
+        run: go build -trimpath -o goway.exe .
+      - name: Run integration tests
+        working-directory: goway
+        shell: pwsh
+        run: go test ./... -count=1 -run 'Test(EndToEndSubprocessIntegration|ViolentStressSimulation)$' -timeout 15m
