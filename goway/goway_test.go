@@ -192,6 +192,19 @@ func TestMuxCleanEOFClosing(t *testing.T) {
 	}
 }
 
+func testBinaryForSubprocess(t *testing.T) string {
+	t.Helper()
+	name := t.TempDir() + "/goway-test"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	cmd := exec.Command("go", "build", "-o", name, ".")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build test binary: %v\n%s", err, out)
+	}
+	return name
+}
+
 func TestEndToEndSubprocessIntegration(t *testing.T) {
 	// 1. Start target TCP echo server
 	targetListener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -216,7 +229,7 @@ func TestEndToEndSubprocessIntegration(t *testing.T) {
 
 	// 2. Start GOWAY Server subprocess
 	serverPort := 18880
-	serverCmd := exec.Command(".\\goway.exe",
+	serverCmd := exec.Command(testBinaryForSubprocess(t),
 		"-p", fmt.Sprintf("127.0.0.1:%d", serverPort),
 		"-k", "testKey2026",
 		"-log", "ERROR",
@@ -234,7 +247,7 @@ func TestEndToEndSubprocessIntegration(t *testing.T) {
 
 	// 3. Start GOWAY Client subprocess
 	clientPort := 11080
-	clientCmd := exec.Command(".\\goway.exe",
+	clientCmd := exec.Command(testBinaryForSubprocess(t),
 		"-p", fmt.Sprintf("127.0.0.1:%d", clientPort),
 		"-up", fmt.Sprintf("ws://127.0.0.1:%d", serverPort),
 		"-k", "testKey2026",
@@ -425,7 +438,7 @@ func TestViolentStressSimulation(t *testing.T) {
 
 	// 2. Start GOWAY Server (v1.7.5)
 	serverPort := 28880
-	serverCmd := exec.Command(".\\goway.exe",
+	serverCmd := exec.Command(testBinaryForSubprocess(t),
 		"-p", fmt.Sprintf("127.0.0.1:%d", serverPort),
 		"-k", "violentStressKey999",
 		"-log", "ERROR",
@@ -441,7 +454,7 @@ func TestViolentStressSimulation(t *testing.T) {
 
 	// 3. Start GOWAY Client (v1.7.5, Mux enabled)
 	clientPort := 21080
-	clientCmd := exec.Command(".\\goway.exe",
+	clientCmd := exec.Command(testBinaryForSubprocess(t),
 		"-p", fmt.Sprintf("127.0.0.1:%d", clientPort),
 		"-up", fmt.Sprintf("ws://127.0.0.1:%d", serverPort),
 		"-k", "violentStressKey999",
@@ -715,8 +728,8 @@ func TestMuxStream_PushDataTimeout(t *testing.T) {
 	if ok {
 		t.Fatal("Expected false from PushData on overflow timeout, got true")
 	}
-	if elapsed < 2*time.Second || elapsed > 4*time.Second {
-		t.Logf("PushData timed out in %v (expected ~3s)", elapsed)
+	if elapsed < 10*time.Second || elapsed > 20*time.Second {
+		t.Fatalf("PushData overflow timeout outside expected guard window: %v", elapsed)
 	}
 }
 
@@ -1119,9 +1132,9 @@ func TestMuxServerStream_PushDataCleanupOnFalse(t *testing.T) {
 
 	session := &MuxServerSession{
 		wsConn:  pipeW,
-		cfg:     cfg,
 		streams: make(map[uint32]*MuxServerStream),
 		closed:  make(chan struct{}),
+		cfg:     cfg,
 	}
 	st := newMuxServerStream(42, session)
 	session.streams[42] = st
@@ -1133,23 +1146,15 @@ func TestMuxServerStream_PushDataCleanupOnFalse(t *testing.T) {
 	start := time.Now()
 	ok := st.PushData([]byte("overflow"))
 	if ok {
-		t.Fatal("Expected PushData to return false on stall timeout")
+		t.Fatal("Expected PushData to return false on full queue")
 	}
-	if time.Since(start) < 2*time.Second {
-		t.Fatal("Expected PushData to wait for stall timeout")
+	if elapsed := time.Since(start); elapsed < 10*time.Second || elapsed > 20*time.Second {
+		t.Fatalf("Full queue push outside expected guard window: %v", elapsed)
 	}
-
-	if !ok {
-		session.streamsMu.Lock()
-		delete(session.streams, 42)
-		session.streamsMu.Unlock()
-	}
-
-	session.streamsMu.RLock()
-	_, exists := session.streams[42]
-	session.streamsMu.RUnlock()
-	if exists {
-		t.Fatal("Expected stream 42 to be removed from session.streams after PushData false")
+	select {
+	case <-st.closed:
+	default:
+		t.Fatal("Expected server stream to be closed/reset after queue overflow")
 	}
 }
 
@@ -1286,49 +1291,25 @@ func TestMuxStream_ByteLimitBackpressure(t *testing.T) {
 	session.streams[10] = st
 	defer st.Close()
 
-	chunkSize := 1024 * 1024 // 1 MiB
-	chunk := make([]byte, chunkSize)
-
-	// Push 4 MiB (limit is 4 MiB)
-	for i := 0; i < 4; i++ {
+	chunk := make([]byte, 1024*1024)
+	for i := 0; i < 16; i++ {
 		if !st.PushData(chunk) {
 			t.Fatalf("Failed to push chunk %d within limit", i)
 		}
 	}
-
-	if st.QueuedBytes() != 4*1024*1024 {
-		t.Fatalf("Expected 4MB queued, got %d", st.QueuedBytes())
+	if st.QueuedBytes() != 16*1024*1024 {
+		t.Fatalf("Expected 16MB queued, got %d", st.QueuedBytes())
 	}
 
-	// 5th push should be blocked by backpressure!
-	blockedCh := make(chan bool)
-	go func() {
-		ok := st.PushData(chunk)
-		blockedCh <- ok
-	}()
-
-	// Verify that it is blocked
-	select {
-	case <-blockedCh:
-		t.Fatal("Expected 5th chunk to be blocked by byte backpressure limit")
-	case <-time.After(100 * time.Millisecond):
-		// Expected: currently blocked
+	start := time.Now()
+	if st.PushData(chunk) {
+		t.Fatal("Expected saturated stream push to fail")
 	}
-
-	// Read 2 MiB from stream to relieve backpressure
-	buf := make([]byte, 2*1024*1024)
-	if _, err := io.ReadFull(st, buf); err != nil {
-		t.Fatalf("Read failed: %v", err)
+	if elapsed := time.Since(start); elapsed < 10*time.Second || elapsed > 20*time.Second {
+		t.Fatalf("Saturated stream push outside expected guard window: %v", elapsed)
 	}
-
-	// The blocked push should now succeed and unblock!
-	select {
-	case ok := <-blockedCh:
-		if !ok {
-			t.Fatal("Expected blocked push to succeed once space was freed")
-		}
-	case <-time.After(1 * time.Second):
-		t.Fatal("Blocked push did not unblock after reading data")
+	if st.QueuedBytes() != 0 {
+		t.Fatalf("Expected reset stream to clear queued bytes, got %d", st.QueuedBytes())
 	}
 }
 

@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	Version        = "1.8.1"
+	Version        = "1.8.2"
 	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -132,6 +132,31 @@ type Statistics struct {
 }
 
 var stats Statistics
+
+func tryAcquireConn(max int64) bool {
+	for {
+		cur := atomic.LoadInt64(&stats.activeConns)
+		if cur >= max {
+			return false
+		}
+		if atomic.CompareAndSwapInt64(&stats.activeConns, cur, cur+1) {
+			return true
+		}
+	}
+}
+
+func releaseConn() {
+	for {
+		cur := atomic.LoadInt64(&stats.activeConns)
+		if cur <= 0 {
+			atomic.StoreInt64(&stats.activeConns, 0)
+			return
+		}
+		if atomic.CompareAndSwapInt64(&stats.activeConns, cur, cur-1) {
+			return
+		}
+	}
+}
 
 func (s *Statistics) AddConn() {
 	atomic.AddInt64(&s.activeConns, 1)
@@ -1420,7 +1445,6 @@ func performWSHandshake(wsConn net.Conn, br *bufio.Reader, cfg *Config, wsHost, 
 	fixedBottom := []string{
 		"Sec-WebSocket-Version: 13",
 		"Sec-WebSocket-Key: " + wsKeyStr,
-		"Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits",
 		"Sec-Fetch-Dest: websocket",
 		"Sec-Fetch-Mode: websocket",
 		"Sec-Fetch-Site: " + secFetchSite,
@@ -1522,7 +1546,7 @@ type ConnPool struct {
 	closed      bool
 	stopChan    chan struct{}
 	stopOnce    sync.Once
-	deadIPs     map[string]bool // IPs that failed during session (permanent until exit)
+	deadIPs     map[string]time.Time // temporarily suppress failed IPs
 	refillCh    chan struct{}
 }
 
@@ -1533,7 +1557,7 @@ func NewConnPool(cfg *Config, maxSize int) *ConnPool {
 		maxSize:     maxSize,
 		maxAge:      5 * time.Minute,
 		idleTimeout: 30 * time.Second,
-		deadIPs:     make(map[string]bool),
+		deadIPs:     make(map[string]time.Time),
 		stopChan:    make(chan struct{}),
 		refillCh:    make(chan struct{}, 1),
 	}
@@ -1622,11 +1646,14 @@ func (p *ConnPool) createConn() *PooledConn {
 
 	dialer := &net.Dialer{Timeout: time.Duration(cfg.ConnTimeout) * time.Second}
 
-	// Skip known-dead IPs (permanent for session)
+	// Skip recently failed IPs, but allow retry after cooldown.
 	p.mu.Lock()
-	if p.deadIPs[dialHost] {
-		p.mu.Unlock()
-		return p.tryFallbackDial(dialer, wsHost, wsPort, sniHostname)
+	if until, ok := p.deadIPs[dialHost]; ok {
+		if time.Now().Before(until) {
+			p.mu.Unlock()
+			return p.tryFallbackDial(dialer, wsHost, wsPort, sniHostname)
+		}
+		delete(p.deadIPs, dialHost)
 	}
 	p.mu.Unlock()
 
@@ -1641,9 +1668,9 @@ func (p *ConnPool) createConn() *PooledConn {
 	}
 	if err != nil {
 		logDebug("[POOL] Dial %s failed: %v", dialAddr, err)
-		// Mark IP as dead for session
+		// Temporarily suppress this IP; retry it after cooldown.
 		p.mu.Lock()
-		p.deadIPs[dialHost] = true
+		p.deadIPs[dialHost] = time.Now().Add(5 * time.Minute)
 		p.mu.Unlock()
 		if cfg.FakeHost != "" {
 			fallbackConn := p.tryFallbackDial(dialer, wsHost, wsPort, sniHostname)
@@ -1909,7 +1936,7 @@ func main() {
 	muxFlag := flag.Bool("mux", true, "Enable 0-RTT Connection Multiplexing (default true)")
 	noMuxFlag := flag.Bool("no-mux", false, "Disable 0-RTT Connection Multiplexing (fallback to 1:1 pool)")
 	muxSessionsFlag := flag.Int("mux-sessions", 4, "Number of parallel physical Mux sessions (default 4, max 64)")
-	wFlag := flag.Int("W", 64, "App Buffer Size in KB (default 64KB, recommend 512-1024 for 4K streaming)")
+	wFlag := flag.Int("W", 512, "App Buffer Size in KB (default 64KB, recommend 512-4096 for high-throughput streaming)")
 	sockBufFlag := flag.Int("socket-buffer", 0, "Kernel Socket Buffer in KB (default 0 = OS auto-tuning)")
 	noDelayFlag := flag.Bool("no-tcp-nodelay", false, "Disable TCP_NODELAY (disable Nagle bypass)")
 	keepAliveFlag := flag.Bool("no-tcp-keepalive", false, "Disable TCP KeepAlive probes")
@@ -2040,8 +2067,8 @@ func main() {
 		fmt.Printf("Error: -connection-timeout must be between 1 and 86400 seconds, got %d\n", *connTimeoutFlag)
 		os.Exit(1)
 	}
-	if *wFlag <= 0 || *wFlag > 16384 {
-		fmt.Printf("Error: -W (buffer size in KB) must be between 1 and 16384, got %d\n", *wFlag)
+	if *wFlag <= 0 || *wFlag > 12288 {
+		fmt.Printf("Error: -W (buffer size in KB) must be between 1 and 12288, got %d\n", *wFlag)
 		os.Exit(1)
 	}
 	if *muxSessionsFlag < 1 || *muxSessionsFlag > 64 {
@@ -2218,6 +2245,9 @@ func main() {
 	if bufSize < 65536+14+MuxHeaderLen {
 		bufSize = 65536 + 14 + MuxHeaderLen
 	}
+	if bufSize > 12*1024*1024+14+MuxHeaderLen {
+		bufSize = 12*1024*1024 + 14 + MuxHeaderLen
+	}
 	cfg.BufPool = &sync.Pool{
 		New: func() interface{} {
 			buf := make([]byte, bufSize)
@@ -2262,7 +2292,7 @@ func main() {
 					logWarn("All connections will use DNS-resolved Cloudflare edges via -fakehost")
 					if connPool != nil {
 						connPool.mu.Lock()
-						connPool.deadIPs[cfg.UpstreamHost] = true
+						connPool.deadIPs[cfg.UpstreamHost] = time.Now().Add(5 * time.Minute)
 						connPool.mu.Unlock()
 					}
 				} else {
@@ -2331,15 +2361,14 @@ func main() {
 			break
 		}
 
-		if atomic.LoadInt64(&stats.activeConns) >= int64(cfg.MaxConns) {
+		if !tryAcquireConn(int64(cfg.MaxConns)) {
 			logWarn("MaxConns (%d) reached, rejecting connection", cfg.MaxConns)
-			conn.Close()
+			_ = conn.Close()
 			continue
 		}
 
-		stats.AddConn()
 		go func(c net.Conn) {
-			defer stats.RemoveConn()
+			defer releaseConn()
 			handleConnection(c, &cfg)
 		}(conn)
 	}
@@ -2398,12 +2427,14 @@ const (
 
 	// Client-side Mux stream buffer limit.
 	// Kept lower to reduce per-stream memory usage on client instances.
-	muxClientStreamBufferLimit = 4 * 1024 * 1024
+	muxClientStreamBufferLimit = 16 * 1024 * 1024
 
 	// Server-side Mux stream buffer limit.
 	// Kept higher to provide additional buffering headroom for
 	// downstream fan-out / asymmetric traffic patterns.
-	muxServerStreamBufferLimit = 8 * 1024 * 1024
+	muxServerStreamBufferLimit = 16 * 1024 * 1024
+	muxStreamIngressQueue      = 512
+	muxPushStallTimeout        = 15 * time.Second
 )
 
 // muxDataFrame encapsulates a payload slice along with ownership of a pooled buffer from sync.Pool.
@@ -2443,70 +2474,75 @@ type MuxStream struct {
 	hasSpace    chan struct{}
 	onClose     func()
 	readMu      sync.Mutex
+	ingress     chan muxDataFrame
 }
 
 func newMuxStream(id uint32, session MuxSessionInterface) *MuxStream {
-	return &MuxStream{
-		id:       id,
-		session:  session,
-		readChan: make(chan muxDataFrame, 128),
-		closed:   make(chan struct{}),
-		hasSpace: make(chan struct{}, 1),
+	st := &MuxStream{id: id, session: session, readChan: make(chan muxDataFrame, 128), closed: make(chan struct{}), hasSpace: make(chan struct{}, 1), ingress: make(chan muxDataFrame, muxStreamIngressQueue)}
+	go st.deliveryLoop()
+	return st
+}
+
+func (s *MuxStream) enqueueDataFrame(frame muxDataFrame) bool {
+	select {
+	case <-s.closed:
+		frame.release()
+		return false
+	case s.ingress <- frame:
+		return true
+	default:
+		logWarn("[MUX] Stream %d ingress queue full, resetting stream", s.id)
+		frame.release()
+		s.Reset()
+		return false
+	}
+}
+
+func (s *MuxStream) deliveryLoop() {
+	for {
+		select {
+		case <-s.closed:
+			return
+		case frame := <-s.ingress:
+			if !s.PushDataFrame(frame) {
+				frame.release()
+			}
+		}
 	}
 }
 
 func (s *MuxStream) PushDataFrame(frame muxDataFrame) bool {
 	dataLen := int64(len(frame.data))
-
-	s.bufMu.Lock()
-	select {
-	case <-s.closed:
-		s.bufMu.Unlock()
-		return false
-	default:
-	}
-
-	if s.queuedBytes+dataLen <= muxClientStreamBufferLimit {
+	deadline := time.NewTimer(muxPushStallTimeout)
+	defer deadline.Stop()
+	for {
+		s.bufMu.Lock()
 		select {
-		case s.readChan <- frame:
-			s.queuedBytes += dataLen
+		case <-s.closed:
 			s.bufMu.Unlock()
-			return true
+			return false
 		default:
 		}
-	}
-	s.bufMu.Unlock()
-
-	timer := time.NewTimer(3 * time.Second)
-	defer timer.Stop()
-
-	for {
+		if frame.data == nil {
+			s.readClosed.Store(true)
+		}
+		if s.queuedBytes+dataLen <= muxClientStreamBufferLimit {
+			select {
+			case s.readChan <- frame:
+				s.queuedBytes += dataLen
+				s.bufMu.Unlock()
+				return true
+			default:
+			}
+		}
+		s.bufMu.Unlock()
 		select {
 		case <-s.closed:
 			return false
 		case <-s.hasSpace:
-			s.bufMu.Lock()
-			select {
-			case <-s.closed:
-				s.bufMu.Unlock()
-				return false
-			default:
-			}
-			if s.queuedBytes+dataLen <= muxClientStreamBufferLimit {
-				select {
-				case s.readChan <- frame:
-					s.queuedBytes += dataLen
-					s.bufMu.Unlock()
-					return true
-				default:
-				}
-			}
-			s.bufMu.Unlock()
-		case <-timer.C:
-			s.bufMu.Lock()
-			q := s.queuedBytes
-			s.bufMu.Unlock()
-			logWarn("[MUX] Stream %d buffer stalled (queued: %d bytes), resetting stream to protect session", s.id, q)
+			continue
+		case <-deadline.C:
+			logWarn("[MUX] Stream %d receive backpressure timeout, resetting stream", s.id)
 			s.Reset()
 			return false
 		}
@@ -2623,7 +2659,7 @@ func (s *MuxStream) Write(p []byte) (n int, err error) {
 		return 0, errors.New("stream closed")
 	default:
 	}
-	const maxChunk = 32 * 1024
+	const maxChunk = 60 * 1024
 	total := len(p)
 	for len(p) > 0 {
 		chunk := len(p)
@@ -2644,17 +2680,22 @@ func (s *MuxStream) cleanup() {
 	s.readBuf = nil
 	s.readPos = 0
 	s.readMu.Unlock()
-
 	s.bufMu.Lock()
 	s.queuedBytes = 0
 	s.bufMu.Unlock()
-
 	for {
 		select {
 		case f := <-s.readChan:
 			f.release()
 		default:
-			return
+			for {
+				select {
+				case f := <-s.ingress:
+					f.release()
+				default:
+					return
+				}
+			}
 		}
 	}
 }
@@ -2744,6 +2785,9 @@ func (s *MuxClientSession) heartbeatLoop() {
 		case <-s.closed:
 			return
 		case <-ticker.C:
+			if s.ActiveStreams() > 0 {
+				continue
+			}
 			s.writeMu.Lock()
 			select {
 			case <-s.closed:
@@ -2894,13 +2938,11 @@ func (s *MuxClientSession) readLoop() {
 				}
 				bPtr = s.cfg.BufPool.Get().(*[]byte)
 				buf = *bPtr
-				if !st.PushDataFrame(frame) {
-					frame.release()
-				}
+				st.enqueueDataFrame(frame)
 				stats.AddBytes(0, int64(len(payload)))
 			}
 		case MuxCmdFIN:
-			st.PushEOF()
+			st.enqueueDataFrame(muxDataFrame{data: nil})
 		case MuxCmdRST:
 			st.Reset()
 		}
@@ -3040,13 +3082,7 @@ func (p *MuxClientPool) dialNewSession() (*MuxClientSession, error) {
 		return nil, err
 	}
 
-	base := "MUX\n"
-	padLen := 1 + mrand.Intn(40)
-	targetPayload := make([]byte, len(base)+padLen)
-	copy(targetPayload, base)
-	for i := len(base); i < len(targetPayload); i++ {
-		targetPayload[i] = ' '
-	}
+	targetPayload := []byte("MUX\n")
 	if p.cfg.Crypto != nil {
 		p.cfg.Crypto.TransformInPlace(targetPayload)
 	}
@@ -3223,70 +3259,73 @@ type MuxServerStream struct {
 	bufMu       sync.Mutex
 	queuedBytes int64
 	hasSpace    chan struct{}
+	ingress     chan muxDataFrame
 }
 
 func newMuxServerStream(id uint32, session *MuxServerSession) *MuxServerStream {
-	return &MuxServerStream{
-		id:        id,
-		session:   session,
-		writeChan: make(chan muxDataFrame, 256),
-		closed:    make(chan struct{}),
-		hasSpace:  make(chan struct{}, 1),
+	st := &MuxServerStream{id: id, session: session, writeChan: make(chan muxDataFrame, 256), closed: make(chan struct{}), hasSpace: make(chan struct{}, 1), ingress: make(chan muxDataFrame, muxStreamIngressQueue)}
+	go st.deliveryLoop()
+	return st
+}
+
+func (s *MuxServerStream) enqueueDataFrame(frame muxDataFrame) bool {
+	select {
+	case <-s.closed:
+		frame.release()
+		return false
+	case s.ingress <- frame:
+		return true
+	default:
+		logWarn("[SERVER-MUX] Stream %d ingress queue full, resetting stream", s.id)
+		frame.release()
+		s.Close()
+		_ = s.session.SendFrame(s.id, MuxCmdRST, nil)
+		return false
+	}
+}
+
+func (s *MuxServerStream) deliveryLoop() {
+	for {
+		select {
+		case <-s.closed:
+			return
+		case frame := <-s.ingress:
+			if !s.PushDataFrame(frame) {
+				frame.release()
+			}
+		}
 	}
 }
 
 func (s *MuxServerStream) PushDataFrame(frame muxDataFrame) bool {
 	dataLen := int64(len(frame.data))
-
-	s.bufMu.Lock()
-	select {
-	case <-s.closed:
-		s.bufMu.Unlock()
-		return false
-	default:
-	}
-
-	if s.queuedBytes+dataLen <= muxServerStreamBufferLimit {
+	deadline := time.NewTimer(muxPushStallTimeout)
+	defer deadline.Stop()
+	for {
+		s.bufMu.Lock()
 		select {
-		case s.writeChan <- frame:
-			s.queuedBytes += dataLen
+		case <-s.closed:
 			s.bufMu.Unlock()
-			return true
+			return false
 		default:
 		}
-	}
-	s.bufMu.Unlock()
-
-	timer := time.NewTimer(3 * time.Second)
-	defer timer.Stop()
-
-	for {
+		if s.queuedBytes+dataLen <= muxServerStreamBufferLimit {
+			select {
+			case s.writeChan <- frame:
+				s.queuedBytes += dataLen
+				s.bufMu.Unlock()
+				return true
+			default:
+			}
+		}
+		s.bufMu.Unlock()
 		select {
 		case <-s.closed:
 			return false
 		case <-s.hasSpace:
-			s.bufMu.Lock()
-			select {
-			case <-s.closed:
-				s.bufMu.Unlock()
-				return false
-			default:
-			}
-			if s.queuedBytes+dataLen <= muxServerStreamBufferLimit {
-				select {
-				case s.writeChan <- frame:
-					s.queuedBytes += dataLen
-					s.bufMu.Unlock()
-					return true
-				default:
-				}
-			}
-			s.bufMu.Unlock()
-		case <-timer.C:
-			s.bufMu.Lock()
-			q := s.queuedBytes
-			s.bufMu.Unlock()
-			logWarn("[SERVER-MUX] Stream %d buffer stalled (queued: %d bytes), resetting stream to protect session", s.id, q)
+			continue
+		case <-deadline.C:
+			logWarn("[SERVER-MUX] Stream %d receive backpressure timeout, resetting stream", s.id)
 			s.Close()
 			_ = s.session.SendFrame(s.id, MuxCmdRST, nil)
 			return false
@@ -3334,6 +3373,8 @@ func (s *MuxServerStream) Close() {
 		for {
 			select {
 			case frame := <-s.writeChan:
+				frame.release()
+			case frame := <-s.ingress:
 				frame.release()
 			default:
 				return
@@ -3494,12 +3535,7 @@ func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 				}
 				bPtr = cfg.BufPool.Get().(*[]byte)
 				buf = *bPtr
-				if !st.PushDataFrame(frame) {
-					frame.release()
-					session.streamsMu.Lock()
-					delete(session.streams, streamID)
-					session.streamsMu.Unlock()
-				}
+				st.enqueueDataFrame(frame)
 			}
 
 		case MuxCmdFIN:
@@ -3507,11 +3543,7 @@ func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 			st, ok := session.streams[streamID]
 			session.streamsMu.RUnlock()
 			if ok {
-				if !st.PushDataFrame(muxDataFrame{data: nil}) {
-					session.streamsMu.Lock()
-					delete(session.streams, streamID)
-					session.streamsMu.Unlock()
-				}
+				st.enqueueDataFrame(muxDataFrame{data: nil})
 			}
 
 		case MuxCmdRST:
@@ -4104,13 +4136,7 @@ func handleClientUDP(localConn net.Conn, cfg *Config) {
 	}
 	defer wsConn.Close()
 
-	base := "UDP\n"
-	padLen := 1 + mrand.Intn(40)
-	targetPayload := make([]byte, len(base)+padLen)
-	copy(targetPayload, base)
-	for i := len(base); i < len(targetPayload); i++ {
-		targetPayload[i] = ' '
-	}
+	targetPayload := []byte("UDP\n")
 	if cfg.Crypto != nil {
 		cfg.Crypto.TransformInPlace(targetPayload)
 	}
@@ -4513,14 +4539,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 	optimizeSocket(localConn, cfg)
 	localTCPConn := extractTCPConn(localConn)
 
-	base := targetHost + ":" + targetPort + "\n"
-	padLen := 1 + mrand.Intn(40)
-	targetPayload := make([]byte, len(base)+padLen)
-	copy(targetPayload, base)
-	// fill padding with spaces (constant, no allocation)
-	for i := len(base); i < len(targetPayload); i++ {
-		targetPayload[i] = ' '
-	}
+	targetPayload := []byte(targetHost + ":" + targetPort + "\n")
 
 	if cfg.Crypto != nil {
 		cfg.Crypto.TransformInPlace(targetPayload)
@@ -4797,15 +4816,14 @@ func handleQUICConnection(qConn quic.Connection, cfg *Config) {
 		if err != nil {
 			return
 		}
-		if atomic.LoadInt64(&stats.activeConns) >= int64(cfg.MaxConns) {
+		if !tryAcquireConn(int64(cfg.MaxConns)) {
 			logWarn("[QUIC-SERVER] MaxConns (%d) reached, rejecting stream", cfg.MaxConns)
 			_ = stream.Close()
 			continue
 		}
 
-		stats.AddConn()
 		go func(st quic.Stream) {
-			defer stats.RemoveConn()
+			defer releaseConn()
 			handleQUICStream(st, cfg)
 		}(stream)
 	}
