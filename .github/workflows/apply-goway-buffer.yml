@@ -1,0 +1,53 @@
+name: Apply GoWay buffer settings
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch buffer settings
+        shell: python
+        run: |
+          from pathlib import Path
+
+          src = Path('goway/goway.go')
+          s = src.read_text(encoding='utf-8')
+
+          changes = {
+              'wFlag := flag.Int("W", 64,': 'wFlag := flag.Int("W", 512,',
+              'recommend 512-1024 for 4K streaming': 'recommend 512-4096 for high-throughput streaming',
+              '*wFlag > 16384': '*wFlag > 12288',
+              'must be between 1 and 16384': 'must be between 1 and 12288',
+              'if bufSize > 256*1024+14+MuxHeaderLen {': 'if bufSize > 12*1024*1024+14+MuxHeaderLen {',
+              'bufSize = 256*1024+14+MuxHeaderLen': 'bufSize = 12*1024*1024+14+MuxHeaderLen',
+          }
+          for old, new in changes.items():
+              s = s.replace(old, new, 1)
+          src.write_text(s, encoding='utf-8')
+
+      - name: Format and compile-check
+        run: |
+          set -euo pipefail
+          gofmt -w goway/goway.go
+          cd goway
+          go test ./... -run '^$'
+          go vet ./...
+          grep -F 'wFlag := flag.Int("W", 512,' goway.go
+          grep -F 'bufSize > 12*1024*1024+14+MuxHeaderLen' goway.go
+
+      - name: Commit and self-remove
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add goway/goway.go
+          git rm -f .github/workflows/apply-goway-buffer.yml
+          git commit -m "perf: default goway buffer 512K, cap 12M [skip ci]"
+          git push
