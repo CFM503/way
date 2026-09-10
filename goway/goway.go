@@ -1933,7 +1933,7 @@ func main() {
 	muxFlag := flag.Bool("mux", true, "Enable 0-RTT Connection Multiplexing (default true)")
 	noMuxFlag := flag.Bool("no-mux", false, "Disable 0-RTT Connection Multiplexing (fallback to 1:1 pool)")
 	muxSessionsFlag := flag.Int("mux-sessions", 4, "Number of parallel physical Mux sessions (default 4, max 64)")
-	wFlag := flag.Int("W", 64, "App Buffer Size in KB (default 64KB, recommend 512-1024 for 4K streaming)")
+	wFlag := flag.Int("W", 512, "App Buffer Size in KB (default 64KB, recommend 512-4096 for high-throughput streaming)")
 	sockBufFlag := flag.Int("socket-buffer", 0, "Kernel Socket Buffer in KB (default 0 = OS auto-tuning)")
 	noDelayFlag := flag.Bool("no-tcp-nodelay", false, "Disable TCP_NODELAY (disable Nagle bypass)")
 	keepAliveFlag := flag.Bool("no-tcp-keepalive", false, "Disable TCP KeepAlive probes")
@@ -2064,8 +2064,8 @@ func main() {
 		fmt.Printf("Error: -connection-timeout must be between 1 and 86400 seconds, got %d\n", *connTimeoutFlag)
 		os.Exit(1)
 	}
-	if *wFlag <= 0 || *wFlag > 16384 {
-		fmt.Printf("Error: -W (buffer size in KB) must be between 1 and 16384, got %d\n", *wFlag)
+	if *wFlag <= 0 || *wFlag > 12288 {
+		fmt.Printf("Error: -W (buffer size in KB) must be between 1 and 12288, got %d\n", *wFlag)
 		os.Exit(1)
 	}
 	if *muxSessionsFlag < 1 || *muxSessionsFlag > 64 {
@@ -2242,7 +2242,7 @@ func main() {
 	if bufSize < 65536+14+MuxHeaderLen {
 		bufSize = 65536 + 14 + MuxHeaderLen
 	}
-	if bufSize > 256*1024+14+MuxHeaderLen {
+	if bufSize > 12*1024*1024+14+MuxHeaderLen {
 		bufSize = 256*1024 + 14 + MuxHeaderLen
 	}
 	cfg.BufPool = &sync.Pool{
