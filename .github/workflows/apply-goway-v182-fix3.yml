@@ -1,0 +1,95 @@
+name: Apply GoWay v1.8.2 fix v3
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch source and tests
+        shell: python
+        run: |
+          from pathlib import Path
+
+          src = Path('goway/goway.go')
+          s = src.read_text(encoding='utf-8')
+
+          s = s.replace('''\tmuxServerStreamBufferLimit = 8 * 1024 * 1024\n)''', '''\t// Per-stream receive limits. A stalled stream cannot consume the whole process memory budget.\n\tmuxServerStreamBufferLimit = 16 * 1024 * 1024\n\tmuxStreamIngressQueue    = 16\n\tmuxPushStallTimeout       = 3 * time.Second\n)''', 1)
+          if 'muxStreamIngressQueue' not in s:
+              raise SystemExit('mux constants patch failed')
+
+          s = s.replace('''\treadMu      sync.Mutex\n}''', '''\treadMu      sync.Mutex\n\tingress     chan muxDataFrame\n}''', 1)
+
+          start = s.index('func newMuxStream(')
+          end = s.index('func (s *MuxStream) PushEOF()', start)
+          client_block = '''func newMuxStream(id uint32, session MuxSessionInterface) *MuxStream {\n\tst := &MuxStream{\n\t\tid:       id,\n\t\tsession:  session,\n\t\treadChan: make(chan muxDataFrame, 128),\n\t\tclosed:   make(chan struct{}),\n\t\thasSpace: make(chan struct{}, 1),\n\t\tingress:  make(chan muxDataFrame, muxStreamIngressQueue),\n\t}\n\tgo st.deliveryLoop()\n\treturn st\n}\n\nfunc (s *MuxStream) enqueueDataFrame(frame muxDataFrame) bool {\n\tselect {\n\tcase <-s.closed:\n\t\tframe.release()\n\t\treturn false\n\tcase s.ingress <- frame:\n\t\treturn true\n\tdefault:\n\t\tlogWarn("[MUX] Stream %d ingress queue full, resetting stream", s.id)\n\t\tframe.release()\n\t\ts.Reset()\n\t\treturn false\n\t}\n}\n\nfunc (s *MuxStream) deliveryLoop() {\n\tfor {\n\t\tselect {\n\t\tcase <-s.closed:\n\t\t\treturn\n\t\tcase frame := <-s.ingress:\n\t\t\tif !s.PushDataFrame(frame) {\n\t\t\t\tframe.release()\n\t\t\t}\n\t\t}\n\t}\n}\n\nfunc (s *MuxStream) PushDataFrame(frame muxDataFrame) bool {\n\tdataLen := int64(len(frame.data))\n\tdeadline := time.NewTimer(muxPushStallTimeout)\n\tdefer deadline.Stop()\n\n\tfor {\n\t\ts.bufMu.Lock()\n\t\tselect {\n\t\tcase <-s.closed:\n\t\t\ts.bufMu.Unlock()\n\t\t\treturn false\n\t\tdefault:\n\t\t}\n\t\tif frame.data == nil {\n\t\t\ts.readClosed.Store(true)\n\t\t}\n\t\tif s.queuedBytes+dataLen <= muxClientStreamBufferLimit {\n\t\t\tselect {\n\t\t\tcase s.readChan <- frame:\n\t\t\t\ts.queuedBytes += dataLen\n\t\t\t\ts.bufMu.Unlock()\n\t\t\t\treturn true\n\t\t\tdefault:\n\t\t\t}\n\t\t}\n\t\ts.bufMu.Unlock()\n\n\t\tselect {\n\t\tcase <-s.closed:\n\t\t\treturn false\n\t\tcase <-s.hasSpace:\n\t\t\tcontinue\n\t\tcase <-deadline.C:\n\t\t\tlogWarn("[MUX] Stream %d receive backpressure timeout, resetting stream", s.id)\n\t\t\ts.Reset()\n\t\t\treturn false\n\t\t}\n\t}\n}\n\n'''
+          s = s[:start] + client_block + s[end:]
+
+          old = '''\t\t\tif len(payload) > 0 {\n\t\t\t\tframe := muxDataFrame{\n\t\t\t\t\tdata: payload,\n\t\t\t\t\tbPtr: bPtr,\n\t\t\t\t\tpool: s.cfg.BufPool,\n\t\t\t\t}\n\t\t\t\tbPtr = s.cfg.BufPool.Get().(*[]byte)\n\t\t\t\tbuf = *bPtr\n\t\t\t\tif !st.PushDataFrame(frame) {\n\t\t\t\t\tframe.release()\n\t\t\t\t}\n\t\t\t\tstats.AddBytes(0, int64(len(payload)))\n\t\t\t}'''
+          if old not in s:
+              raise SystemExit('client read delivery block missing')
+          s = s.replace(old, old.replace('if !st.PushDataFrame(frame) {\n\t\t\t\t\tframe.release()\n\t\t\t\t}', 'st.enqueueDataFrame(frame)'), 1)
+          s = s.replace('''\t\tcase MuxCmdFIN:\n\t\t\tst.PushEOF()''', '''\t\tcase MuxCmdFIN:\n\t\t\tst.enqueueDataFrame(muxDataFrame{data: nil})''', 1)
+
+          s = s.replace('''\tqueuedBytes int64\n\thasSpace    chan struct{}\n}''', '''\tqueuedBytes int64\n\thasSpace    chan struct{}\n\tingress     chan muxDataFrame\n}''', 1)
+
+          start = s.index('func newMuxServerStream(')
+          end = s.index('func (s *MuxServerStream) consumedBytes', start)
+          server_block = '''func newMuxServerStream(id uint32, session *MuxServerSession) *MuxServerStream {\n\tst := &MuxServerStream{\n\t\tid:        id,\n\t\tsession:   session,\n\t\twriteChan: make(chan muxDataFrame, 256),\n\t\tclosed:    make(chan struct{}),\n\t\thasSpace:  make(chan struct{}, 1),\n\t\tingress:   make(chan muxDataFrame, muxStreamIngressQueue),\n\t}\n\tgo st.deliveryLoop()\n\treturn st\n}\n\nfunc (s *MuxServerStream) enqueueDataFrame(frame muxDataFrame) bool {\n\tselect {\n\tcase <-s.closed:\n\t\tframe.release()\n\t\treturn false\n\tcase s.ingress <- frame:\n\t\treturn true\n\tdefault:\n\t\tlogWarn("[SERVER-MUX] Stream %d ingress queue full, resetting stream", s.id)\n\t\tframe.release()\n\t\ts.Close()\n\t\t_ = s.session.SendFrame(s.id, MuxCmdRST, nil)\n\t\treturn false\n\t}\n}\n\nfunc (s *MuxServerStream) deliveryLoop() {\n\tfor {\n\t\tselect {\n\t\tcase <-s.closed:\n\t\t\treturn\n\t\tcase frame := <-s.ingress:\n\t\t\tif !s.PushDataFrame(frame) {\n\t\t\t\tframe.release()\n\t\t\t}\n\t\t}\n\t}\n}\n\nfunc (s *MuxServerStream) PushDataFrame(frame muxDataFrame) bool {\n\tdataLen := int64(len(frame.data))\n\tdeadline := time.NewTimer(muxPushStallTimeout)\n\tdefer deadline.Stop()\n\n\tfor {\n\t\ts.bufMu.Lock()\n\t\tselect {\n\t\tcase <-s.closed:\n\t\t\ts.bufMu.Unlock()\n\t\t\treturn false\n\t\tdefault:\n\t\t}\n\t\tif s.queuedBytes+dataLen <= muxServerStreamBufferLimit {\n\t\t\tselect {\n\t\t\tcase s.writeChan <- frame:\n\t\t\t\ts.queuedBytes += dataLen\n\t\t\t\ts.bufMu.Unlock()\n\t\t\t\treturn true\n\t\t\tdefault:\n\t\t\t}\n\t\t}\n\t\ts.bufMu.Unlock()\n\n\t\tselect {\n\t\tcase <-s.closed:\n\t\t\treturn false\n\t\tcase <-s.hasSpace:\n\t\t\tcontinue\n\t\tcase <-deadline.C:\n\t\t\tlogWarn("[SERVER-MUX] Stream %d receive backpressure timeout, resetting stream", s.id)\n\t\t\ts.Close()\n\t\t\t_ = s.session.SendFrame(s.id, MuxCmdRST, nil)\n\t\t\treturn false\n\t\t}\n\t}\n}\n\n'''
+          s = s[:start] + server_block + s[end:]
+
+          old = '''\t\t\tif ok && len(payload) > 0 {\n\t\t\t\tframe := muxDataFrame{\n\t\t\t\t\tdata: payload,\n\t\t\t\t\tbPtr: bPtr,\n\t\t\t\t\tpool: cfg.BufPool,\n\t\t\t\t}\n\t\t\t\tbPtr = cfg.BufPool.Get().(*[]byte)\n\t\t\t\tbuf = *bPtr\n\t\t\t\tif !st.PushDataFrame(frame) {\n\t\t\t\t\tframe.release()\n\t\t\t\t\tsession.streamsMu.Lock()\n\t\t\t\t\tdelete(session.streams, streamID)\n\t\t\t\t\tsession.streamsMu.Unlock()\n\t\t\t\t}\n\t\t\t}'''
+          if old not in s:
+              raise SystemExit('server read delivery block missing')
+          s = s.replace(old, '''\t\t\tif ok && len(payload) > 0 {\n\t\t\t\tframe := muxDataFrame{\n\t\t\t\t\tdata: payload,\n\t\t\t\t\tbPtr: bPtr,\n\t\t\t\t\tpool: cfg.BufPool,\n\t\t\t\t}\n\t\t\t\tbPtr = cfg.BufPool.Get().(*[]byte)\n\t\t\t\tbuf = *bPtr\n\t\t\t\tst.enqueueDataFrame(frame)\n\t\t\t}''', 1)
+
+          old = '''\t\tcase MuxCmdFIN:\n\t\t\tsession.streamsMu.RLock()\n\t\t\tst, ok := session.streams[streamID]\n\t\t\tsession.streamsMu.RUnlock()\n\t\t\tif ok {\n\t\t\t\tif !st.PushDataFrame(muxDataFrame{data: nil}) {\n\t\t\t\t\tsession.streamsMu.Lock()\n\t\t\t\t\tdelete(session.streams, streamID)\n\t\t\t\t\tsession.streamsMu.Unlock()\n\t\t\t\t}\n\t\t\t}'''
+          if old not in s:
+              raise SystemExit('server FIN block missing')
+          s = s.replace(old, '''\t\tcase MuxCmdFIN:\n\t\t\tsession.streamsMu.RLock()\n\t\t\tst, ok := session.streams[streamID]\n\t\t\tsession.streamsMu.RUnlock()\n\t\t\tif ok {\n\t\t\t\tst.enqueueDataFrame(muxDataFrame{data: nil})\n\t\t\t}''', 1)
+
+          old = '''\tif bufSize > 256*1024+14+MuxHeaderLen {\n\t\tbufSize = 256*1024+14+MuxHeaderLen\n\t}'''
+          if old not in s:
+              raise SystemExit('buffer cap block missing')
+          s = s.replace(old, '''\tif bufSize > 512*1024+14+MuxHeaderLen {\n\t\tbufSize = 512*1024+14+MuxHeaderLen\n\t}''', 1)
+
+          src.write_text(s, encoding='utf-8')
+
+          test = Path('goway/goway_test.go')
+          ts = test.read_text(encoding='utf-8')
+          if '\t"path/filepath"\n' not in ts:
+              ts = ts.replace('\t"os/exec"\n', '\t"os/exec"\n\t"path/filepath"\n', 1)
+          marker = 'func TestEndToEndSubprocessIntegration(t *testing.T) {'
+          helper = '''func buildTestBinary(t *testing.T) string {\n\tt.Helper()\n\tname := "goway-test"\n\tif runtime.GOOS == "windows" {\n\t\tname += ".exe"\n\t}\n\tpath := filepath.Join(t.TempDir(), name)\n\tcmd := exec.Command("go", "build", "-o", path, ".")\n\tout, err := cmd.CombinedOutput()\n\tif err != nil {\n\t\tt.Fatalf("Failed to build goway test binary: %v\\n%s", err, out)\n\t}\n\treturn path\n}\n\n'''
+          if helper not in ts:
+              if marker not in ts:
+                  raise SystemExit('integration test marker missing')
+              ts = ts.replace(marker, helper + marker, 1)
+          ts = ts.replace('''\t// 2. Start GOWAY Server subprocess\n\tserverPort := 18880\n\tserverCmd := exec.Command(".\\\\goway.exe",''', '''\t// 2. Start GOWAY Server subprocess\n\tbinaryPath := buildTestBinary(t)\n\tserverPort := 18880\n\tserverCmd := exec.Command(binaryPath,''', 1)
+          ts = ts.replace('''\tclientCmd := exec.Command(".\\\\goway.exe",''', '''\tclientCmd := exec.Command(binaryPath,''', 1)
+          test.write_text(ts, encoding='utf-8')
+
+      - name: Format
+        run: gofmt -w goway/goway.go goway/goway_test.go
+      - name: Test
+        working-directory: goway
+        run: |
+          go test ./...
+          go test -race ./...
+          go vet ./...
+      - name: Commit source and remove temporary workflows
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add goway/goway.go goway/goway_test.go
+          git rm -f .github/workflows/apply-goway-v182-fix.yml .github/workflows/apply-goway-v182-fix2.yml .github/workflows/apply-goway-v182-fix3.yml || true
+          git add -A
+          git diff --cached --quiet || git commit -m "fix: isolate mux stream backpressure [skip ci]"
+          git push
