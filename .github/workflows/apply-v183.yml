@@ -30,10 +30,8 @@ jobs:
           once('wFlag := flag.Int("W", 512, "App Buffer Size in KB (default 64KB, recommend 512-4096 for high-throughput streaming)")','wFlag := flag.Int("W", 128, "App Buffer Size in KB (default 128KB, recommend 256-1024 for high-throughput streaming)")')
           once('muxClientStreamBufferLimit = 16 * 1024 * 1024','muxClientStreamBufferLimit = 8 * 1024 * 1024')
           once('muxServerStreamBufferLimit = 16 * 1024 * 1024','muxServerStreamBufferLimit = 8 * 1024 * 1024')
-          once('muxStreamIngressQueue      = 512','muxStreamIngressQueue      = 16')
+          once('muxStreamIngressQueue      = 512','muxStreamIngressQueue      = 64')
           once('const maxChunk = 60 * 1024','const maxChunk = 65528')
-          once('readChan: make(chan muxDataFrame, 128)','readChan: make(chan muxDataFrame, 64)')
-          once('writeChan: make(chan muxDataFrame, 256)','writeChan: make(chan muxDataFrame, 64)')
           pat=r'func \(s \*MuxStream\) PushDataFrame\(frame muxDataFrame\) bool \{.*?\n\}\n\nfunc \(s \*MuxStream\) PushData\(data \[\]byte\) bool'
           m=re.search(pat,s,re.S)
           if not m: raise SystemExit('client PushDataFrame not found')
