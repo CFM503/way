@@ -1,0 +1,59 @@
+name: Apply v1.8.3 performance patch
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: write
+jobs:
+  patch:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+      - name: Apply patch and validate
+        env: { BRANCH: ${{ github.event.pull_request.head.ref }} }
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          p=Path('goway/goway.go'); s=p.read_text()
+          def once(a,b):
+            global s
+            if s.count(a)!=1: raise SystemExit(f'expected one occurrence: {a!r}, got {s.count(a)}')
+            s=s.replace(a,b,1)
+          once('Version        = "1.8.2"','Version        = "1.8.3"')
+          once('wFlag := flag.Int("W", 512, "App Buffer Size in KB (default 64KB, recommend 512-4096 for high-throughput streaming)")','wFlag := flag.Int("W", 128, "App Buffer Size in KB (default 128KB, recommend 256-1024 for high-throughput streaming)")')
+          once('muxClientStreamBufferLimit = 16 * 1024 * 1024','muxClientStreamBufferLimit = 8 * 1024 * 1024')
+          once('muxServerStreamBufferLimit = 16 * 1024 * 1024','muxServerStreamBufferLimit = 8 * 1024 * 1024')
+          once('muxStreamIngressQueue      = 512','muxStreamIngressQueue      = 16')
+          once('const maxChunk = 60 * 1024','const maxChunk = 65528')
+          once('readChan: make(chan muxDataFrame, 128)','readChan: make(chan muxDataFrame, 64)')
+          once('writeChan: make(chan muxDataFrame, 256)','writeChan: make(chan muxDataFrame, 64)')
+          c=re.compile(r'func \(s \*MuxStream\) PushDataFrame\(frame muxDataFrame\) bool \{.*?\n\}\n\nfunc \(s \*MuxStream\) PushData\(data \[\]byte\) bool',re.S)
+          m=c.search(s)
+          if not m: raise SystemExit('client PushDataFrame not found')
+          n='''func (s *MuxStream) PushDataFrame(frame muxDataFrame) bool {\n\tdataLen := int64(len(frame.data))\n\tfor {\n\t\ts.bufMu.Lock()\n\t\tselect { case <-s.closed: s.bufMu.Unlock(); return false; default: }\n\t\tif frame.data == nil { s.readClosed.Store(true) }\n\t\tif s.queuedBytes+dataLen <= muxClientStreamBufferLimit {\n\t\t\tselect { case s.readChan <- frame: s.queuedBytes += dataLen; s.bufMu.Unlock(); return true; default: }\n\t\t}\n\t\ts.bufMu.Unlock()\n\t\tdeadline := time.NewTimer(muxPushStallTimeout)\n\t\tselect {\n\t\tcase <-s.closed: if !deadline.Stop() { <-deadline.C }; return false\n\t\tcase <-s.hasSpace: if !deadline.Stop() { <-deadline.C }; continue\n\t\tcase <-deadline.C: logWarn("[MUX] Stream %d receive backpressure timeout, resetting stream", s.id); s.Reset(); return false\n\t\t}\n\t}\n}\n\nfunc (s *MuxStream) PushData(data []byte) bool'''
+          s=s[:m.start()]+n+s[m.end():]
+          c=re.compile(r'func \(s \*MuxServerStream\) PushDataFrame\(frame muxDataFrame\) bool \{.*?\n\}\n\nfunc \(s \*MuxServerStream\) PushData\(data \[\]byte\) bool',re.S)
+          m=c.search(s)
+          if not m: raise SystemExit('server PushDataFrame not found')
+          n='''func (s *MuxServerStream) PushDataFrame(frame muxDataFrame) bool {\n\tdataLen := int64(len(frame.data))\n\tfor {\n\t\ts.bufMu.Lock()\n\t\tselect { case <-s.closed: s.bufMu.Unlock(); return false; default: }\n\t\tif s.queuedBytes+dataLen <= muxServerStreamBufferLimit {\n\t\t\tselect { case s.writeChan <- frame: s.queuedBytes += dataLen; s.bufMu.Unlock(); return true; default: }\n\t\t}\n\t\ts.bufMu.Unlock()\n\t\tdeadline := time.NewTimer(muxPushStallTimeout)\n\t\tselect {\n\t\tcase <-s.closed: if !deadline.Stop() { <-deadline.C }; return false\n\t\tcase <-s.hasSpace: if !deadline.Stop() { <-deadline.C }; continue\n\t\tcase <-deadline.C: logWarn("[SERVER-MUX] Stream %d receive backpressure timeout, resetting stream", s.id); s.Close(); _ = s.session.SendFrame(s.id, MuxCmdRST, nil); return false\n\t\t}\n\t}\n}\n\nfunc (s *MuxServerStream) PushData(data []byte) bool'''
+          s=s[:m.start()]+n+s[m.end():]
+          p.write_text(s)
+          PY
+          gofmt -w goway/goway.go
+          go test ./...
+          go test -race ./...
+          go vet ./...
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /tmp/goway-windows-amd64.exe ./goway
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /tmp/goway-linux-amd64 ./goway
+          rm -f .github/workflows/apply-v183.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add goway/goway.go .github/workflows/apply-v183.yml
+          git commit -m 'Release v1.8.3: reduce MUX timer and buffer overhead'
+          git push origin "HEAD:${BRANCH}"
