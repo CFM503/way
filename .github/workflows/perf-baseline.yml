@@ -1,0 +1,58 @@
+name: Temporary v1.8.3 vs v1.8.4 performance baseline
+
+on:
+  push:
+    branches:
+      - tmp-v184-performance-baseline
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: false
+
+      - name: Benchmark v1.8.3
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout --detach 226d312e09b1f9eacca831cf5ab7d9ba17e8792c
+          cd goway
+          go test -run '^$' -bench='BenchmarkMuxDataTransfer' -benchmem -count=10 | tee /tmp/v183.txt
+          go test -run '^$' -bench='.' -benchmem -count=5 | tee /tmp/v183-all.txt
+
+      - name: Benchmark v1.8.4
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          git checkout --detach 538dbee86b9fbf248a68c8c6d8eee5d6f8bdb0dc
+          cd goway
+          go test -run '^$' -bench='BenchmarkMuxDataTransfer' -benchmem -count=10 | tee /tmp/v184.txt
+          go test -run '^$' -bench='.' -benchmem -count=5 | tee /tmp/v184-all.txt
+
+      - name: Compare benchmark results
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '===== v1.8.3 MUX ====='
+          cat /tmp/v183.txt
+          echo '===== v1.8.4 MUX ====='
+          cat /tmp/v184.txt
+          echo '===== v1.8.3 ALL ====='
+          cat /tmp/v183-all.txt
+          echo '===== v1.8.4 ALL ====='
+          cat /tmp/v184-all.txt
+          echo '===== machine ====='
+          uname -a
+          go version
+          lscpu | grep -E 'Model name|CPU\(s\)|MHz' || true
