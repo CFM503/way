@@ -43,6 +43,85 @@ jobs:
           go test -run '^$' -bench='BenchmarkMuxDataTransfer' -benchmem -count=10 | tee /tmp/v184.txt
           go test -run '^$' -bench='.' -benchmem -count=5 | tee /tmp/v184-all.txt
 
+      - name: Diagnostic writer pool benchmarks
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/goway"
+          cat > z_v184_diag_test.go <<'EOF'
+          package main
+
+          import (
+            "bufio"
+            "io"
+            "net"
+            "sync"
+            "testing"
+            "time"
+          )
+
+          type diagConn struct { mu sync.Mutex; writes int; delay time.Duration }
+          func (c *diagConn) Read([]byte) (int,error) { return 0, io.EOF }
+          func (c *diagConn) Write(p []byte) (int,error) { if c.delay > 0 { time.Sleep(c.delay) }; c.mu.Lock(); c.writes++; c.mu.Unlock(); return len(p),nil }
+          func (c *diagConn) Close() error { return nil }
+          func (c *diagConn) LocalAddr() net.Addr { return diagAddr("local") }
+          func (c *diagConn) RemoteAddr() net.Addr { return diagAddr("remote") }
+          func (c *diagConn) SetDeadline(time.Time) error { return nil }
+          func (c *diagConn) SetReadDeadline(time.Time) error { return nil }
+          func (c *diagConn) SetWriteDeadline(time.Time) error { return nil }
+          type diagAddr string
+          func (a diagAddr) Network() string { return "diag" }
+          func (a diagAddr) String() string { return string(a) }
+
+          func newDiagSession(delay time.Duration) *MuxClientSession {
+            cfg := &Config{BufPool:&sync.Pool{New:func() interface{} { b:=make([]byte, 128*1024); return &b }}}
+            return &MuxClientSession{wsConn:&diagConn{delay:delay}, br:bufio.NewReader(nil), cfg:cfg, streams:map[uint32]*MuxStream{}, closed:make(chan struct{}), prng:maskPool.Get().(*maskPRNG)}
+          }
+
+          func BenchmarkDiagSendFrameParallel(b *testing.B) {
+            for _, n := range []int{1,8,32,128} {
+              b.Run("streams="+itoaDiag(n), func(b *testing.B) {
+                s:=newDiagSession(0); defer s.Close(); payload:=make([]byte,32768)
+                b.ResetTimer(); b.RunParallel(func(pb *testing.PB){ for pb.Next(){ _=s.SendFrame(1,MuxCmdDATA,payload) } })
+              })
+            }
+          }
+
+          func BenchmarkDiagWSFrame(b *testing.B) {
+            for _, sz := range []int{1024,16384,65528} {
+              b.Run("bytes="+itoaDiag(sz), func(b *testing.B){
+                buf:=make([]byte,sz+64); p:=&maskPRNG{state:1}; data:=buf[14:14+sz]
+                b.SetBytes(int64(sz)); b.ResetTimer(); for i:=0;i<b.N;i++ { _=writeWSFramePreallocatedFast(io.Discard,buf,14,sz,2,p); for j:=range data { data[j]=0 } }
+              })
+            }
+          }
+
+          func TestDiagWriteMuSerialization(t *testing.T) {
+            const workers=16
+            const delay=5*time.Millisecond
+            s:=newDiagSession(delay); start:=time.Now(); var wg sync.WaitGroup; wg.Add(workers)
+            for i:=0;i<workers;i++ { go func(){ defer wg.Done(); _=s.SendFrame(1,MuxCmdDATA,make([]byte,64)) }() }
+            wg.Wait(); elapsed:=time.Since(start); s.Close()
+            if elapsed < time.Duration(workers)*delay*8/10 { t.Fatalf("unexpectedly low serialized time: %v",elapsed) }
+            t.Logf("writeMu serialization: %d writers x %v => %v",workers,delay,elapsed)
+          }
+
+          func TestDiagPoolGetPutRace(t *testing.T) {
+            p:=NewConnPool(&Config{},64); p.conns=make([]*PooledConn,0,64)
+            for i:=0;i<64;i++ { p.conns=append(p.conns,&PooledConn{wsConn:&diagConn{},created:time.Now(),lastUsed:time.Now()}) }
+            var wg sync.WaitGroup
+            for i:=0;i<32;i++ { wg.Add(1); go func(){ defer wg.Done(); for j:=0;j<1000;j++ { c:=p.Get(); if c!=nil { p.Put(c) } } }() }
+            wg.Wait(); p.Close()
+          }
+
+          func itoaDiag(v int) string { if v==1{return "1"}; if v==8{return "8"}; if v==32{return "32"}; if v==128{return "128"}; if v==1024{return "1024"}; if v==16384{return "16384"}; return "65528" }
+          var _ = bufio.NewReader
+          EOF
+          gofmt -w z_v184_diag_test.go
+          go test -run '^TestDiag' -race -count=3 -timeout=5m | tee /tmp/v184-diag-tests.txt
+          go test -run '^$' -bench='BenchmarkDiag' -benchmem -count=5 | tee /tmp/v184-diag-bench.txt
+          rm -f z_v184_diag_test.go
+
       - name: Compare benchmark results
         shell: bash
         run: |
@@ -55,6 +134,10 @@ jobs:
           cat /tmp/v183-all.txt
           echo '===== v1.8.4 ALL ====='
           cat /tmp/v184-all.txt
+          echo '===== v1.8.4 DIAGNOSTIC TESTS ====='
+          cat /tmp/v184-diag-tests.txt
+          echo '===== v1.8.4 DIAGNOSTIC BENCH ====='
+          cat /tmp/v184-diag-bench.txt
           echo '===== machine ====='
           uname -a
           go version
