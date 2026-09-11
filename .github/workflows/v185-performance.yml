@@ -9,7 +9,6 @@ permissions:
 
 jobs:
   fix:
-    if: "!contains(github.event.head_commit.message, '[skip ci]')"
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -24,12 +23,10 @@ jobs:
         shell: python
         run: |
           from pathlib import Path
-
           path = Path('goway/goway.go')
           text = path.read_text()
           old_start = text.index('type MuxClientSession struct {')
           old_end = text.index('func (s *MuxClientSession) readLoop() {', old_start)
-
           new_block = r'''type muxOutboundFrame struct {
 	bPtr       *[]byte
 	pool       *sync.Pool
@@ -39,9 +36,6 @@ jobs:
 	ping       bool
 }
 
-// muxOutboundWriter is the single physical WebSocket writer for one MUX session.
-// It removes writeMu from the data hot path while retaining strict ordering and
-// bounded memory. Data frames are backpressured rather than dropped.
 type muxOutboundWriter struct {
 	conn    net.Conn
 	prng    *maskPRNG
@@ -54,30 +48,18 @@ type muxOutboundWriter struct {
 const muxOutboundQueueDepth = 8
 
 func newMuxOutboundWriter(conn net.Conn, prng *maskPRNG) *muxOutboundWriter {
-	w := &muxOutboundWriter{
-		conn:   conn,
-		prng:   prng,
-		q:      make(chan muxOutboundFrame, muxOutboundQueueDepth),
-		closed: make(chan struct{}),
-		done:   make(chan struct{}),
-	}
+	w := &muxOutboundWriter{conn: conn, prng: prng, q: make(chan muxOutboundFrame, muxOutboundQueueDepth), closed: make(chan struct{}), done: make(chan struct{})}
 	go w.loop()
 	return w
 }
 
 func (w *muxOutboundWriter) releaseFrame(f muxOutboundFrame) {
-	if f.bPtr != nil && f.pool != nil {
-		f.pool.Put(f.bPtr)
-	}
+	if f.bPtr != nil && f.pool != nil { f.pool.Put(f.bPtr) }
 }
 
 func (w *muxOutboundWriter) writeFrame(f muxOutboundFrame) error {
-	if f.ping {
-		return writeWSFrame(w.conn, nil, 0x9, true)
-	}
-	if f.bPtr == nil || f.pool == nil {
-		return errors.New("invalid mux outbound frame")
-	}
+	if f.ping { return writeWSFrame(w.conn, nil, 0x9, true) }
+	if f.bPtr == nil || f.pool == nil { return errors.New("invalid mux outbound frame") }
 	return writeWSFramePreallocatedFast(w.conn, *f.bPtr, f.payloadOff, f.payloadLen, f.opcode, w.prng)
 }
 
@@ -86,26 +68,12 @@ func (w *muxOutboundWriter) loop() {
 	for {
 		select {
 		case <-w.closed:
-			for {
-				select {
-				case f := <-w.q:
-					w.releaseFrame(f)
-				default:
-					return
-				}
-			}
+			for { select { case f := <-w.q: w.releaseFrame(f); default: return } }
 		case f := <-w.q:
 			if err := w.writeFrame(f); err != nil {
 				w.releaseFrame(f)
 				_ = w.conn.Close()
-				for {
-					select {
-					case queued := <-w.q:
-						w.releaseFrame(queued)
-					default:
-						return
-					}
-				}
+				for { select { case queued := <-w.q: w.releaseFrame(queued); default: return } }
 			}
 			w.releaseFrame(f)
 		}
@@ -114,27 +82,19 @@ func (w *muxOutboundWriter) loop() {
 
 func (w *muxOutboundWriter) enqueue(f muxOutboundFrame) bool {
 	select {
-	case <-w.closed:
-		w.releaseFrame(f)
-		return false
-	case <-w.done:
-		w.releaseFrame(f)
-		return false
-	case w.q <- f:
-		return true
+	case <-w.closed: w.releaseFrame(f); return false
+	case <-w.done: w.releaseFrame(f); return false
+	case w.q <- f: return true
 	}
 }
 
-func (w *muxOutboundWriter) enqueuePing() bool {
-	return w.enqueue(muxOutboundFrame{ping: true})
-}
+func (w *muxOutboundWriter) enqueuePing() bool { return w.enqueue(muxOutboundFrame{ping: true}) }
 
 func (w *muxOutboundWriter) close() {
 	w.closeMu.Do(func() { close(w.closed) })
 	<-w.done
 }
 
-// MuxClientSession handles a single WebSocket tunnel carrying multiple MuxStreams.
 type MuxClientSession struct {
 	wsConn        net.Conn
 	br            *bufio.Reader
@@ -151,37 +111,16 @@ type MuxClientSession struct {
 }
 
 func (s *MuxClientSession) ActiveStreams() int64 {
-	cnt := s.activeStreams.Load()
-	if cnt < 0 {
-		return 0
-	}
-	return cnt
+	cnt := s.activeStreams.Load(); if cnt < 0 { return 0 }; return cnt
 }
 
 func (s *MuxClientSession) decrementActiveStreams() {
-	for {
-		cur := s.activeStreams.Load()
-		if cur <= 0 {
-			s.activeStreams.Store(0)
-			return
-		}
-		if s.activeStreams.CompareAndSwap(cur, cur-1) {
-			return
-		}
-	}
+	for { cur := s.activeStreams.Load(); if cur <= 0 { s.activeStreams.Store(0); return }; if s.activeStreams.CompareAndSwap(cur, cur-1) { return } }
 }
 
 func newMuxClientSession(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, cfg *Config) *MuxClientSession {
 	prng := maskPool.Get().(*maskPRNG)
-	s := &MuxClientSession{
-		wsConn:    wsConn,
-		br:        br,
-		wsTCPConn: wsTCPConn,
-		cfg:       cfg,
-		streams:   make(map[uint32]*MuxStream),
-		closed:    make(chan struct{}),
-		prng:      prng,
-	}
+	s := &MuxClientSession{wsConn: wsConn, br: br, wsTCPConn: wsTCPConn, cfg: cfg, streams: make(map[uint32]*MuxStream), closed: make(chan struct{}), prng: prng}
 	s.writer = newMuxOutboundWriter(wsConn, prng)
 	go s.readLoop()
 	go s.heartbeatLoop()
@@ -189,110 +128,50 @@ func newMuxClientSession(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPCo
 }
 
 func (s *MuxClientSession) heartbeatLoop() {
-	ticker := time.NewTicker(25 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-s.closed:
-			return
-		case <-ticker.C:
-			if s.ActiveStreams() > 0 || s.writer == nil {
-				continue
-			}
-			_ = s.writer.enqueuePing()
-		}
-	}
+	ticker := time.NewTicker(25 * time.Second); defer ticker.Stop()
+	for { select { case <-s.closed: return; case <-ticker.C: if s.ActiveStreams() > 0 || s.writer == nil { continue }; _ = s.writer.enqueuePing() } }
 }
 
 func (s *MuxClientSession) IsAlive() bool {
-	select {
-	case <-s.closed:
-		return false
-	default:
-		return true
-	}
+	select { case <-s.closed: return false; default: return true }
 }
 
 func (s *MuxClientSession) Close() {
 	s.closeOnce.Do(func() {
 		close(s.closed)
-		if s.wsConn != nil {
-			_ = s.wsConn.Close()
-		}
-		if s.writer != nil {
-			s.writer.close()
-		}
-
+		if s.wsConn != nil { _ = s.wsConn.Close() }
+		if s.writer != nil { s.writer.close() }
 		s.streamsMu.Lock()
 		activeStreams := make([]*MuxStream, 0, len(s.streams))
-		for _, st := range s.streams {
-			activeStreams = append(activeStreams, st)
-		}
+		for _, st := range s.streams { activeStreams = append(activeStreams, st) }
 		s.streams = make(map[uint32]*MuxStream)
 		s.streamsMu.Unlock()
-
-		for _, st := range activeStreams {
-			st.Reset()
-		}
-
-		if s.prng != nil {
-			maskPool.Put(s.prng)
-			s.prng = nil
-		}
+		for _, st := range activeStreams { st.Reset() }
+		if s.prng != nil { maskPool.Put(s.prng); s.prng = nil }
 	})
 }
 
 func (s *MuxClientSession) RemoveStream(streamID uint32) {
-	s.streamsMu.Lock()
-	delete(s.streams, streamID)
-	s.streamsMu.Unlock()
+	s.streamsMu.Lock(); delete(s.streams, streamID); s.streamsMu.Unlock()
 }
 
 func (s *MuxClientSession) SendFrame(streamID uint32, cmd byte, payload []byte) error {
-	select {
-	case <-s.closed:
-		return errors.New("mux session closed")
-	default:
-	}
-
-	if s.wsConn == nil || s.cfg == nil || s.cfg.BufPool == nil || s.writer == nil {
-		return nil
-	}
-
+	select { case <-s.closed: return errors.New("mux session closed"); default: }
+	if s.wsConn == nil || s.cfg == nil || s.cfg.BufPool == nil || s.writer == nil { return nil }
 	payloadLen := len(payload)
-	if payloadLen > 65535 {
-		return fmt.Errorf("mux frame payload %d exceeds maximum uint16 length (65535)", payloadLen)
-	}
-
+	if payloadLen > 65535 { return fmt.Errorf("mux frame payload %d exceeds maximum uint16 length (65535)", payloadLen) }
 	frameLen := MuxHeaderLen + payloadLen
 	bPtr := s.cfg.BufPool.Get().(*[]byte)
 	buf := *bPtr
-	if frameLen+14 > len(buf) {
-		s.cfg.BufPool.Put(bPtr)
-		return errors.New("mux frame exceeds buffer size")
-	}
-
+	if frameLen+14 > len(buf) { s.cfg.BufPool.Put(bPtr); return errors.New("mux frame exceeds buffer size") }
 	frameStart := 14
 	binary.BigEndian.PutUint32(buf[frameStart:frameStart+4], streamID)
 	buf[frameStart+4] = cmd
 	binary.BigEndian.PutUint16(buf[frameStart+5:frameStart+7], uint16(payloadLen))
-	if payloadLen > 0 {
-		copy(buf[frameStart+7:frameStart+7+payloadLen], payload)
-	}
-	if s.cfg.Crypto != nil {
-		s.cfg.Crypto.TransformInPlace(buf[frameStart : frameStart+frameLen])
-	}
-
-	frame := muxOutboundFrame{
-		bPtr:       bPtr,
-		pool:       s.cfg.BufPool,
-		payloadOff: frameStart,
-		payloadLen: frameLen,
-		opcode:     0x2,
-	}
-	if !s.writer.enqueue(frame) {
-		return errors.New("mux session writer closed")
-	}
+	if payloadLen > 0 { copy(buf[frameStart+7:frameStart+7+payloadLen], payload) }
+	if s.cfg.Crypto != nil { s.cfg.Crypto.TransformInPlace(buf[frameStart : frameStart+frameLen]) }
+	frame := muxOutboundFrame{bPtr: bPtr, pool: s.cfg.BufPool, payloadOff: frameStart, payloadLen: frameLen, opcode: 0x2}
+	if !s.writer.enqueue(frame) { return errors.New("mux session writer closed") }
 	return nil
 }
 
@@ -301,9 +180,7 @@ func (s *MuxClientSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
           text = text.replace('Version        = "1.8.4"', 'Version        = "1.8.5-performance"', 1)
           Path('goway/goway.go').write_text(text)
           proto = Path('goway/v185_performance_prototype_test.go')
-          if proto.exists():
-              proto.unlink()
-
+          if proto.exists(): proto.unlink()
       - name: Add integrated regression tests
         shell: python
         run: |
@@ -314,57 +191,29 @@ func (s *MuxClientSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
               marker = 'func TestV184ConcurrentLogRingSave(t *testing.T) {'
               tests = r'''
 func TestV185MuxOutboundWriterOrdering(t *testing.T) {
-	pr, pw := net.Pipe()
-	defer pr.Close()
+	pr, pw := net.Pipe(); defer pr.Close()
 	writer := newMuxOutboundWriter(pw, &maskPRNG{state: 1})
-	bufPool := &sync.Pool{New: func() interface{} { b := make([]byte, 128); return &b }}
-	for i := byte(0); i < 8; i++ {
-		bPtr := bufPool.Get().(*[]byte)
-		(*bPtr)[14] = i
-		if !writer.enqueue(muxOutboundFrame{bPtr: bPtr, pool: bufPool, payloadOff: 14, payloadLen: 1, opcode: 0x2}) {
-			t.Fatalf("enqueue %d failed", i)
-		}
-	}
-	got := make([]byte, 0, 8)
-	readDone := make(chan struct{})
-	go func() {
-		defer close(readDone)
-		for len(got) < 8 {
-			h := make([]byte, 2)
-			if _, err := io.ReadFull(pr, h); err != nil { return }
-			payload := make([]byte, 1)
-			if _, err := io.ReadFull(pr, payload); err != nil { return }
-			got = append(got, payload[0])
-		}
-	}()
-	select { case <-readDone: case <-time.After(2*time.Second): t.Fatal("writer did not drain") }
+	pool := &sync.Pool{New: func() interface{} { b := make([]byte, 128); return &b }}
+	for i := byte(0); i < muxOutboundQueueDepth; i++ { b := pool.Get().(*[]byte); (*b)[14] = i; if !writer.enqueue(muxOutboundFrame{bPtr:b,pool:pool,payloadOff:14,payloadLen:1,opcode:0x2}) { t.Fatal("enqueue failed") } }
+	got := make([]byte, 0, muxOutboundQueueDepth)
+	done := make(chan struct{})
+	go func(){ defer close(done); for len(got)<muxOutboundQueueDepth { h:=make([]byte,2); if _,e:=io.ReadFull(pr,h); e!=nil{return}; p:=make([]byte,1); if _,e:=io.ReadFull(pr,p); e!=nil{return}; got=append(got,p[0]) } }()
+	select { case <-done: case <-time.After(2*time.Second): t.Fatal("writer did not drain") }
 	writer.close()
-	for i, v := range got { if v != byte(i) { t.Fatalf("order[%d]=%d", i, v) } }
+	for i,v := range got { if v != byte(i) { t.Fatalf("order[%d]=%d",i,v) } }
 }
 
-func TestV185MuxOutboundWriterSlowBackpressure(t *testing.T) {
-	pr, pw := net.Pipe()
-	writer := newMuxOutboundWriter(pw, &maskPRNG{state: 1})
-	bufPool := &sync.Pool{New: func() interface{} { b := make([]byte, 128); return &b }}
-	for i := 0; i < muxOutboundQueueDepth; i++ {
-		bPtr := bufPool.Get().(*[]byte)
-		(*bPtr)[14] = byte(i)
-		if !writer.enqueue(muxOutboundFrame{bPtr: bPtr, pool: bufPool, payloadOff: 14, payloadLen: 1, opcode: 0x2}) { t.Fatalf("enqueue %d failed", i) }
-	}
-	blocked := make(chan bool, 1)
-	bPtr := bufPool.Get().(*[]byte)
-	go func() { blocked <- writer.enqueue(muxOutboundFrame{bPtr: bPtr, pool: bufPool, payloadOff: 14, payloadLen: 1, opcode: 0x2}) }()
-	select { case <-blocked: t.Fatal("enqueue bypassed bounded backpressure"); case <-time.After(50*time.Millisecond): }
-	_ = pr.Close()
-	_ = pw.Close()
-	writer.close()
+func TestV185MuxOutboundWriterBackpressure(t *testing.T) {
+	pr,pw:=net.Pipe(); writer:=newMuxOutboundWriter(pw,&maskPRNG{state:1}); pool:=&sync.Pool{New:func()interface{}{b:=make([]byte,128);return &b}}
+	for i:=0;i<muxOutboundQueueDepth;i++{b:=pool.Get().(*[]byte);(*b)[14]=byte(i);if !writer.enqueue(muxOutboundFrame{bPtr:b,pool:pool,payloadOff:14,payloadLen:1,opcode:0x2}){t.Fatal("enqueue failed")}}
+	blocked:=make(chan bool,1); b:=pool.Get().(*[]byte); go func(){blocked<-writer.enqueue(muxOutboundFrame{bPtr:b,pool:pool,payloadOff:14,payloadLen:1,opcode:0x2})}()
+	select{case <-blocked:t.Fatal("queue was not bounded");case <-time.After(50*time.Millisecond):}
+	_ = pr.Close(); _ = pw.Close(); writer.close()
 }
 
 '''
-              if marker not in text:
-                  raise SystemExit('test insertion marker not found')
-              p.write_text(text.replace(marker, tests + marker, 1))
-
+              if marker not in text: raise SystemExit('marker missing')
+              p.write_text(text.replace(marker, tests+marker, 1))
       - name: Format, test and stress
         run: |
           gofmt -w goway/goway.go goway/goway_v184_test.go
@@ -373,7 +222,6 @@ func TestV185MuxOutboundWriterSlowBackpressure(t *testing.T) {
           go test -race ./... -count=2 -timeout=9m
           go vet ./...
           GOOS=windows GOARCH=amd64 go build -o /tmp/goway-v185-performance.exe .
-
       - name: Commit fixed branch
         run: |
           git config user.name 'github-actions[bot]'
