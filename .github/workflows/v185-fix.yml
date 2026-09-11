@@ -1,0 +1,394 @@
+name: v1.8.5 performance fix
+
+on:
+  push:
+    branches: [v1.8.5-performance]
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply production MUX writer refactor
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          path = Path('goway/goway.go')
+          text = path.read_text()
+
+          old_start = text.index('type MuxClientSession struct {')
+          old_end = text.index('func (s *MuxClientSession) readLoop() {', old_start)
+
+          new_block = r'''type muxOutboundFrame struct {
+	bPtr       *[]byte
+	pool       *sync.Pool
+	payloadOff int
+	payloadLen int
+	opcode     byte
+	ping       bool
+}
+
+// muxOutboundWriter is the single physical WebSocket writer for one MUX session.
+// It removes the writeMu critical section from the hot path while retaining strict
+// frame ordering and bounded memory. The queue applies backpressure instead of
+// dropping data frames. The writer goroutine is the sole owner of the session PRNG.
+type muxOutboundWriter struct {
+	conn    net.Conn
+	prng    *maskPRNG
+	q       chan muxOutboundFrame
+	closed  chan struct{}
+	done    chan struct{}
+	closeMu sync.Once
+}
+
+const muxOutboundQueueDepth = 8
+
+func newMuxOutboundWriter(conn net.Conn, prng *maskPRNG) *muxOutboundWriter {
+	w := &muxOutboundWriter{
+		conn:   conn,
+		prng:   prng,
+		q:      make(chan muxOutboundFrame, muxOutboundQueueDepth),
+		closed: make(chan struct{}),
+		done:   make(chan struct{}),
+	}
+	go w.loop()
+	return w
+}
+
+func (w *muxOutboundWriter) releaseFrame(f muxOutboundFrame) {
+	if f.bPtr != nil && f.pool != nil {
+		f.pool.Put(f.bPtr)
+	}
+}
+
+func (w *muxOutboundWriter) writeFrame(f muxOutboundFrame) error {
+	if f.ping {
+		return writeWSFrame(w.conn, nil, 0x9, true)
+	}
+	if f.bPtr == nil || f.pool == nil {
+		return errors.New("invalid mux outbound frame")
+	}
+	return writeWSFramePreallocatedFast(w.conn, *f.bPtr, f.payloadOff, f.payloadLen, f.opcode, w.prng)
+}
+
+func (w *muxOutboundWriter) loop() {
+	defer close(w.done)
+	for {
+		select {
+		case <-w.closed:
+			for {
+				select {
+				case f := <-w.q:
+					w.releaseFrame(f)
+				default:
+					return
+				}
+			}
+		case f := <-w.q:
+			if err := w.writeFrame(f); err != nil {
+				w.releaseFrame(f)
+				// Closing the physical connection wakes readLoop and makes the
+				// session converge on the normal Close lifecycle.
+				_ = w.conn.Close()
+				for {
+					select {
+					case queued := <-w.q:
+						w.releaseFrame(queued)
+					default:
+						return
+					}
+				}
+			}
+			w.releaseFrame(f)
+		}
+	}
+}
+
+func (w *muxOutboundWriter) enqueue(f muxOutboundFrame) bool {
+	select {
+	case <-w.closed:
+		w.releaseFrame(f)
+		return false
+	case <-w.done:
+		w.releaseFrame(f)
+		return false
+	case w.q <- f:
+		return true
+	}
+}
+
+func (w *muxOutboundWriter) enqueuePing() bool {
+	return w.enqueue(muxOutboundFrame{ping: true})
+}
+
+func (w *muxOutboundWriter) close() {
+	w.closeMu.Do(func() { close(w.closed) })
+	<-w.done
+}
+
+// MuxClientSession handles a single WebSocket tunnel carrying multiple MuxStreams.
+type MuxClientSession struct {
+	wsConn        net.Conn
+	br            *bufio.Reader
+	wsTCPConn     *net.TCPConn
+	cfg           *Config
+	streams       map[uint32]*MuxStream
+	streamsMu     sync.RWMutex
+	nextStreamID  uint32
+	closed        chan struct{}
+	closeOnce     sync.Once
+	prng          *maskPRNG
+	writer        *muxOutboundWriter
+	activeStreams atomic.Int64
+}
+
+func (s *MuxClientSession) ActiveStreams() int64 {
+	cnt := s.activeStreams.Load()
+	if cnt < 0 {
+		return 0
+	}
+	return cnt
+}
+
+func (s *MuxClientSession) decrementActiveStreams() {
+	for {
+		cur := s.activeStreams.Load()
+		if cur <= 0 {
+			s.activeStreams.Store(0)
+			return
+		}
+		if s.activeStreams.CompareAndSwap(cur, cur-1) {
+			return
+		}
+	}
+}
+
+func newMuxClientSession(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, cfg *Config) *MuxClientSession {
+	prng := maskPool.Get().(*maskPRNG)
+	s := &MuxClientSession{
+		wsConn:    wsConn,
+		br:        br,
+		wsTCPConn: wsTCPConn,
+		cfg:       cfg,
+		streams:   make(map[uint32]*MuxStream),
+		closed:    make(chan struct{}),
+		prng:      prng,
+	}
+	s.writer = newMuxOutboundWriter(wsConn, prng)
+	go s.readLoop()
+	go s.heartbeatLoop()
+	return s
+}
+
+func (s *MuxClientSession) heartbeatLoop() {
+	ticker := time.NewTicker(25 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.closed:
+			return
+		case <-ticker.C:
+			if s.ActiveStreams() > 0 || s.writer == nil {
+				continue
+			}
+			// Heartbeats use the same writer as data frames, so no physical
+			// WebSocket writes can interleave.
+			_ = s.writer.enqueuePing()
+		}
+	}
+}
+
+func (s *MuxClientSession) IsAlive() bool {
+	select {
+	case <-s.closed:
+		return false
+	default:
+		return true
+	}
+}
+
+func (s *MuxClientSession) Close() {
+	s.closeOnce.Do(func() {
+		close(s.closed)
+		if s.wsConn != nil {
+			// Close first so a blocked physical write is interrupted immediately.
+			_ = s.wsConn.Close()
+		}
+		if s.writer != nil {
+			s.writer.close()
+		}
+
+		s.streamsMu.Lock()
+		activeStreams := make([]*MuxStream, 0, len(s.streams))
+		for _, st := range s.streams {
+			activeStreams = append(activeStreams, st)
+		}
+		s.streams = make(map[uint32]*MuxStream)
+		s.streamsMu.Unlock()
+
+		for _, st := range activeStreams {
+			st.Reset()
+		}
+
+		if s.prng != nil {
+			maskPool.Put(s.prng)
+			s.prng = nil
+		}
+	})
+}
+
+func (s *MuxClientSession) RemoveStream(streamID uint32) {
+	s.streamsMu.Lock()
+	delete(s.streams, streamID)
+	s.streamsMu.Unlock()
+}
+
+func (s *MuxClientSession) SendFrame(streamID uint32, cmd byte, payload []byte) error {
+	select {
+	case <-s.closed:
+		return errors.New("mux session closed")
+	default:
+	}
+
+	if s.wsConn == nil || s.cfg == nil || s.cfg.BufPool == nil || s.writer == nil {
+		return nil
+	}
+
+	payloadLen := len(payload)
+	if payloadLen > 65535 {
+		return fmt.Errorf("mux frame payload %d exceeds maximum uint16 length (65535)", payloadLen)
+	}
+
+	frameLen := MuxHeaderLen + payloadLen
+	bPtr := s.cfg.BufPool.Get().(*[]byte)
+	buf := *bPtr
+	if frameLen+14 > len(buf) {
+		s.cfg.BufPool.Put(bPtr)
+		return errors.New("mux frame exceeds buffer size")
+	}
+
+	frameStart := 14
+	binary.BigEndian.PutUint32(buf[frameStart:frameStart+4], streamID)
+	buf[frameStart+4] = cmd
+	binary.BigEndian.PutUint16(buf[frameStart+5:frameStart+7], uint16(payloadLen))
+	if payloadLen > 0 {
+		copy(buf[frameStart+7:frameStart+7+payloadLen], payload)
+	}
+
+	if s.cfg.Crypto != nil {
+		s.cfg.Crypto.TransformInPlace(buf[frameStart : frameStart+frameLen])
+	}
+
+	frame := muxOutboundFrame{
+		bPtr:       bPtr,
+		pool:       s.cfg.BufPool,
+		payloadOff: frameStart,
+		payloadLen: frameLen,
+		opcode:     0x2,
+	}
+	if !s.writer.enqueue(frame) {
+		return errors.New("mux session writer closed")
+	}
+	return nil
+}
+
+'''
+
+          text = text[:old_start] + new_block + text[old_end:]
+          text = text.replace('Version        = "1.8.4"', 'Version        = "1.8.5-performance"', 1)
+          path.write_text(text)
+
+          # Remove the isolated prototype: production writer is now integrated.
+          proto = Path('goway/v185_performance_prototype_test.go')
+          if proto.exists():
+              proto.unlink()
+
+      - name: Add integrated writer regression tests
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('goway/goway_v184_test.go')
+          text = p.read_text()
+          marker = 'func TestV184ConcurrentLogRingSave(t *testing.T) {'
+          tests = r'''
+func TestV185MuxOutboundWriterOrdering(t *testing.T) {
+	pr, pw := net.Pipe()
+	defer pr.Close()
+	writer := newMuxOutboundWriter(pw, &maskPRNG{state: 1})
+	bufPool := &sync.Pool{New: func() interface{} { b := make([]byte, 128); return &b }}
+	for i := byte(0); i < 8; i++ {
+		bPtr := bufPool.Get().(*[]byte)
+		(*bPtr)[14] = i
+		if !writer.enqueue(muxOutboundFrame{bPtr: bPtr, pool: bufPool, payloadOff: 14, payloadLen: 1, opcode: 0x2}) {
+			t.Fatalf("enqueue %d failed", i)
+		}
+	}
+	got := make([]byte, 0, 8)
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		for len(got) < 8 {
+			h := make([]byte, 2)
+			if _, err := io.ReadFull(pr, h); err != nil { return }
+			var payload []byte
+			if h[1]&0x7f == 1 {
+				payload = make([]byte, 1)
+				_, _ = io.ReadFull(pr, payload)
+			} else { return }
+			got = append(got, payload[0])
+		}
+	}()
+	select { case <-readDone: case <-time.After(2*time.Second): t.Fatal("writer did not drain") }
+	writer.close()
+	for i, v := range got { if v != byte(i) { t.Fatalf("order[%d]=%d", i, v) } }
+}
+
+func TestV185MuxOutboundWriterSlowBackpressure(t *testing.T) {
+	pr, pw := net.Pipe()
+	writer := newMuxOutboundWriter(pw, &maskPRNG{state: 1})
+	bufPool := &sync.Pool{New: func() interface{} { b := make([]byte, 128); return &b }}
+	bPtr := bufPool.Get().(*[]byte)
+	(*bPtr)[14] = 1
+	for i := 0; i < muxOutboundQueueDepth; i++ {
+		f := muxOutboundFrame{bPtr: bPtr, pool: bufPool, payloadOff: 14, payloadLen: 1, opcode: 0x2}
+		if i > 0 { bPtr = bufPool.Get().(*[]byte); (*bPtr)[14] = byte(i+1) }
+		if !writer.enqueue(f) { t.Fatalf("enqueue %d failed", i) }
+	}
+	blocked := make(chan bool, 1)
+	bPtr = bufPool.Get().(*[]byte)
+	go func() { blocked <- writer.enqueue(muxOutboundFrame{bPtr: bPtr, pool: bufPool, payloadOff: 14, payloadLen: 1, opcode: 0x2}) }()
+	select { case <-blocked: t.Fatal("enqueue bypassed bounded backpressure"); case <-time.After(50*time.Millisecond): }
+	_ = pr.Close()
+	_ = pw.Close()
+	writer.close()
+}
+
+'''
+          if marker not in text:
+              raise SystemExit('test insertion marker not found')
+          text = text.replace(marker, tests + marker, 1)
+          p.write_text(text)
+
+      - name: Format and test
+        run: |
+          gofmt -w goway/goway.go goway/goway_v184_test.go
+          cd goway
+          go test ./... -count=2 -timeout=8m
+          go test -race ./... -count=2 -timeout=8m
+          go vet ./...
+
+      - name: Commit fixed branch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add goway/goway.go goway/goway_v184_test.go goway/v185_performance_prototype_test.go
+          git commit -m 'perf: integrate bounded MUX writer for v1.8.5-performance [skip ci]'
+          git push origin HEAD:v1.8.5-performance
