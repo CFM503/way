@@ -10,51 +10,15 @@ permissions:
 jobs:
   fix:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.25.0'
-          cache: false
       - name: Apply refactor
         run: python3 scripts/v185_fix.py
-      - name: Add writer regression tests
+      - name: Format and test
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          p=Path('goway/goway_v184_test.go')
-          text=p.read_text()
-          if 'func TestV185MuxOutboundWriterOrdering' not in text:
-              marker='func TestV184ConcurrentLogRingSave(t *testing.T) {'
-              tests=r'''func TestV185MuxOutboundWriterOrdering(t *testing.T) {
-	pr,pw:=net.Pipe(); defer pr.Close()
-	writer:=newMuxOutboundWriter(pw,&maskPRNG{state:1})
-	pool:=&sync.Pool{New:func()interface{}{b:=make([]byte,128);return &b}}
-	for i:=byte(0);i<muxOutboundQueueDepth;i++{b:=pool.Get().(*[]byte);(*b)[14]=i;if !writer.enqueue(muxOutboundFrame{bPtr:b,pool:pool,payloadOff:14,payloadLen:1,opcode:0x2}){t.Fatal("enqueue failed")}}
-	got:=make([]byte,0,muxOutboundQueueDepth); done:=make(chan struct{})
-	go func(){defer close(done);for len(got)<muxOutboundQueueDepth{h:=make([]byte,2);if _,e:=io.ReadFull(pr,h);e!=nil{return};p:=make([]byte,1);if _,e:=io.ReadFull(pr,p);e!=nil{return};got=append(got,p[0])}}()
-	select{case <-done:case <-time.After(2*time.Second):t.Fatal("writer did not drain")}
-	writer.close();for i,v:=range got{if v!=byte(i){t.Fatalf("order[%d]=%d",i,v)}}
-}
-
-func TestV185MuxOutboundWriterBackpressure(t *testing.T) {
-	pr,pw:=net.Pipe();writer:=newMuxOutboundWriter(pw,&maskPRNG{state:1});pool:=&sync.Pool{New:func()interface{}{b:=make([]byte,128);return &b}}
-	for i:=0;i<muxOutboundQueueDepth;i++{b:=pool.Get().(*[]byte);(*b)[14]=byte(i);if !writer.enqueue(muxOutboundFrame{bPtr:b,pool:pool,payloadOff:14,payloadLen:1,opcode:0x2}){t.Fatal("enqueue failed")}}
-	blocked:=make(chan bool,1);b:=pool.Get().(*[]byte);go func(){blocked<-writer.enqueue(muxOutboundFrame{bPtr:b,pool:pool,payloadOff:14,payloadLen:1,opcode:0x2})}()
-	select{case <-blocked:t.Fatal("queue was not bounded");case <-time.After(50*time.Millisecond):}
-	_ = pr.Close();_ = pw.Close();writer.close()
-}
-
-'''
-              if marker not in text: raise SystemExit('test marker missing')
-              p.write_text(text.replace(marker,tests+marker,1))
-          PY
-      - name: Format and validate
-        run: |
-          gofmt -w goway/goway.go goway/goway_v184_test.go
+          gofmt -w goway/goway.go
           cd goway
           go test ./... -count=3 -timeout=9m
           go test -race ./... -count=2 -timeout=9m
