@@ -1,0 +1,54 @@
+name: v1.8.5 performance prototype
+
+on:
+  push:
+    branches: [v1.8.5-performance]
+  workflow_dispatch:
+
+jobs:
+  performance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.0'
+          cache: false
+      - name: Baseline v1.8.4
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout --detach 538dbee86b9fbf248a68c8c6d8eee5d6f8bdb0dc
+          cd goway
+          go test -run '^$' -bench='BenchmarkMuxDataTransferPooled' -benchmem -count=10 | tee /tmp/v184.txt
+      - name: Prototype tests and benchmarks
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout --detach b54e19c95ace9c907d741b158d1de70736d84be3
+          cd goway
+          go test -race -run '^TestV185' -count=10 -timeout=5m
+          go test -run '^$' -bench='BenchmarkV185BoundedWriterEnqueue' -benchmem -count=10 | tee /tmp/v185.txt
+      - name: Integrated regression and stress
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          git checkout --detach b54e19c95ace9c907d741b158d1de70736d84be3
+          cd goway
+          go test ./... -count=3 -timeout=7m
+          go test -race ./... -count=2 -timeout=7m
+          go vet ./...
+      - name: Report
+        shell: bash
+        run: |
+          echo '===== v1.8.4 baseline ====='
+          cat /tmp/v184.txt
+          echo '===== v1.8.5 bounded-writer prototype ====='
+          cat /tmp/v185.txt
+          echo '===== decision gates ====='
+          echo 'Prototype is not integrated into production SendFrame.'
+          echo 'Promotion requires throughput >= v1.8.4, bounded memory, no race, and no regression.'
