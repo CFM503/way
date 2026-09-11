@@ -4,38 +4,92 @@ on:
   push:
     branches: [v1.8.5-performance]
 
+concurrency:
+  group: v1.8.5-performance-validation
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
   validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: A/B benchmark v1.8.4 vs v1.8.5-performance
+      - name: A/B SendFrame benchmark on identical runner
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p /tmp/goway-ab
+          cat > /tmp/bench_v184.go <<'EOF'
+          package main
+          import (
+            "io"
+            "net"
+            "sync"
+            "testing"
+          )
+          type benchConn struct{}
+          func (benchConn) Read([]byte) (int,error) { return 0, io.EOF }
+          func (benchConn) Write(p []byte) (int,error) { return len(p),nil }
+          func (benchConn) Close() error { return nil }
+          func (benchConn) LocalAddr() net.Addr { return benchAddr{} }
+          func (benchConn) RemoteAddr() net.Addr { return benchAddr{} }
+          func (benchConn) SetDeadline(_ time.Time) error { return nil }
+          func (benchConn) SetReadDeadline(_ time.Time) error { return nil }
+          func (benchConn) SetWriteDeadline(_ time.Time) error { return nil }
+          type benchAddr struct{}
+          func (benchAddr) Network() string { return "bench" }
+          func (benchAddr) String() string { return "bench" }
+          var _ = sync.Pool{}
+          EOF
+          # Add time import without maintaining two copies of the helper.
+          sed -i 's/"testing"/"testing"\n            "time"/' /tmp/bench_v184.go
+
           git checkout --detach v1.8.4
-          cd goway
-          go test -run '^$' ./...
-          go test -bench='BenchmarkMuxDataTransferPooled' -benchmem -count=10 ./... | tee /tmp/goway-ab/v184.txt
-          cd ..
+          cp /tmp/bench_v184.go goway/v185_ab_bench_test.go
+          cat >> goway/v185_ab_bench_test.go <<'EOF'
+          func BenchmarkSendFrameAB(b *testing.B) {
+            pool := &sync.Pool{New: func() interface{} { x := make([]byte, 32*1024+14); return &x }}
+            s := &MuxClientSession{wsConn: benchConn{}, cfg: &Config{BufPool: pool}, streams: map[uint32]*MuxStream{}, closed: make(chan struct{}), prng: maskPool.Get().(*maskPRNG)}
+            payload := make([]byte, 32*1024)
+            b.SetBytes(int64(len(payload)))
+            b.ResetTimer()
+            for i := 0; i < b.N; i++ { if err := s.SendFrame(1, MuxCmdDATA, payload); err != nil { b.Fatal(err) } }
+            b.StopTimer()
+            s.Close()
+          }
+          EOF
+          (cd goway && go test -run '^$' ./... && go test -bench='^BenchmarkSendFrameAB$' -benchmem -benchtime=500ms -count=8 ./...) | tee /tmp/goway-ab/v184.txt
+
           git checkout --detach v1.8.5-performance
-          cd goway
-          go test -run '^$' ./...
-          go test -bench='BenchmarkMuxDataTransferPooled' -benchmem -count=10 ./... | tee /tmp/goway-ab/v185.txt
-          echo '=== v1.8.4 ==='
+          cp /tmp/bench_v184.go goway/v185_ab_bench_test.go
+          cat >> goway/v185_ab_bench_test.go <<'EOF'
+          func BenchmarkSendFrameAB(b *testing.B) {
+            pool := &sync.Pool{New: func() interface{} { x := make([]byte, 32*1024+14); return &x }}
+            conn := benchConn{}
+            s := &MuxClientSession{wsConn: conn, cfg: &Config{BufPool: pool}, streams: map[uint32]*MuxStream{}, closed: make(chan struct{}), prng: maskPool.Get().(*maskPRNG)}
+            s.writer = newMuxOutboundWriter(conn, s.prng)
+            payload := make([]byte, 32*1024)
+            b.SetBytes(int64(len(payload)))
+            b.ResetTimer()
+            for i := 0; i < b.N; i++ { if err := s.SendFrame(1, MuxCmdDATA, payload); err != nil { b.Fatal(err) } }
+            b.StopTimer()
+            s.Close()
+          }
+          EOF
+          (cd goway && go test -run '^$' ./... && go test -bench='^BenchmarkSendFrameAB$' -benchmem -benchtime=500ms -count=8 ./...) | tee /tmp/goway-ab/v185.txt
+
+          echo '===== v1.8.4 ====='
           cat /tmp/goway-ab/v184.txt
-          echo '=== v1.8.5-performance ==='
+          echo '===== v1.8.5-performance ====='
           cat /tmp/goway-ab/v185.txt
 
-      - name: Full correctness and race validation
+      - name: Full correctness, race, and 1000-stream stress
         working-directory: goway
         run: |
           go test ./... -count=5 -timeout=10m
@@ -47,6 +101,4 @@ jobs:
         run: GOOS=windows GOARCH=amd64 go build -o /tmp/goway-v185-performance.exe .
 
       - name: Final status
-        run: |
-          echo 'v1.8.5-performance validation completed successfully.'
-          echo 'A/B benchmark files were generated on the same runner.'
+        run: echo 'v1.8.5-performance validation completed successfully.'
