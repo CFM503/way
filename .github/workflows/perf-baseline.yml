@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - tmp-v184-performance-baseline
+  pull_request:
+    branches:
+      - main
 
 jobs:
   benchmark:
