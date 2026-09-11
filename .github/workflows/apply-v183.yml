@@ -40,11 +40,20 @@ jobs:
           pat=r'func \(s \*MuxServerStream\) PushDataFrame\(frame muxDataFrame\) bool \{.*?\n\}\n\nfunc \(s \*MuxServerStream\) PushData\(data \[\]byte\) bool'
           m=re.search(pat,s,re.S)
           if not m: raise SystemExit('server PushDataFrame not found')
-          new='''func (s *MuxServerStream) PushDataFrame(frame muxDataFrame) bool {\n\tdataLen := int64(len(frame.data))\n\tfor {\n\t\ts.bufMu.Lock()\n\t\tselect {\n\t\tcase <-s.closed:\n\t\t\ts.bufMu.Unlock()\n\t\t\treturn false\n\t\tdefault:\n\t\t}\n\t\tif s.queuedBytes+dataLen <= muxServerStreamBufferLimit {\n\t\t\tselect {\n\t\t\tcase s.writeChan <- frame:\n\t\t\t\ts.queuedBytes += dataLen\n\t\t\t\ts.bufMu.Unlock()\n\t\t\t\treturn true\n\t\t\tdefault:\n\t\t\t}\n\t\t}\n\t\ts.bufMu.Unlock()\n\t\tdeadline := time.NewTimer(muxPushStallTimeout)\n\t\tselect {\n\t\tcase <-s.closed:\n\t\t\tif !deadline.Stop() { <-deadline.C }\n\t\t\treturn false\n\t\tcase <-s.hasSpace:\n\t\t\tif !deadline.Stop() { <-deadline.C }\n\t\t\tcontinue\n\t\tcase <-deadline.C:\n\t\t\tlogWarn("[SERVER-MUX] Stream %d receive backpressure timeout, resetting stream", s.id)\n\t\t\ts.Close()\n\t\t\t_ = s.session.SendFrame(s.id, MuxCmdRST, nil)\n\t\t\treturn false\n\t\t}\n\t}\n}\n\nfunc (s *MuxServerStream) PushData(data []byte) bool'''
+          new='''func (s *MuxServerStream) PushDataFrame(frame muxDataFrame) bool {\n\tdataLen := int64(len(frame.data))\n\tfor {\n\t\ts.bufMu.Lock()\n\t\tselect {\n\t\tcase <-s.closed:\n\t\t\ts.bufMu.Unlock()\n\t\t\treturn false\n\t\tdefault:\n\t\t}\n\t\tif s.queuedBytes+dataLen <= muxServerStreamBufferLimit {\n\t\t\tselect {\n\t\t\tcase s.writeChan <- frame:\n\t\t\t\ts.queuedBytes += dataLen\n\t\t\t\ts.bufMu.Unlock()\n\t\t\t\treturn true\n\t\t\tdefault:\n\t\t\t}\n\t\t}\n\t\ts.bufMu.Unlock()\n\t\tdeadline := time.NewTimer(muxPushStallTimeout)\n\t\tselect {\n\t\tcase <-s.closed:\n\t\t\tif !deadline.Stop() { <-deadline.C }\n\t\t\treturn false\n\t\tcase <-s.hasSpace:\n\t\t\tif !deadline.Stop() { <-deadline.Stop(); }\n\t\t\tcontinue\n\t\tcase <-deadline.C:\n\t\t\tlogWarn("[SERVER-MUX] Stream %d receive backpressure timeout, resetting stream", s.id)\n\t\t\ts.Close()\n\t\t\t_ = s.session.SendFrame(s.id, MuxCmdRST, nil)\n\t\t\treturn false\n\t\t}\n\t}\n}\n\nfunc (s *MuxServerStream) PushData(data []byte) bool'''
+          # Correct timer stop expression in generated source.
+          new=new.replace('if !deadline.Stop() { <-deadline.Stop(); }','if !deadline.Stop() { <-deadline.C }')
           s=s[:m.start()]+new+s[m.end():]
           p.write_text(s)
+
+          t=Path('goway/goway_test.go'); ts=t.read_text()
+          old='''\tfor i := 0; i < 16; i++ {\n\t\tif !st.PushData(chunk) {\n\t\t\tt.Fatalf("Failed to push chunk %d within limit", i)\n\t\t}\n\t}\n\tif st.QueuedBytes() != 16*1024*1024 {\n\t\tt.Fatalf("Expected 16MB queued, got %d", st.QueuedBytes())\n\t}'''
+          new='''\tfor i := 0; i < 8; i++ {\n\t\tif !st.PushData(chunk) {\n\t\t\tt.Fatalf("Failed to push chunk %d within limit", i)\n\t\t}\n\t}\n\tif st.QueuedBytes() != 8*1024*1024 {\n\t\tt.Fatalf("Expected 8MB queued, got %d", st.QueuedBytes())\n\t}'''
+          if ts.count(old)!=1: raise SystemExit('ByteLimit test block not found exactly once')
+          ts=ts.replace(old,new,1)
+          t.write_text(ts)
           PY
-          gofmt -w goway/goway.go
+          gofmt -w goway/goway.go goway/goway_test.go
           cd goway
           go test -timeout 120s ./...
           go test -race -timeout 180s ./...
@@ -55,6 +64,6 @@ jobs:
           rm -f .github/workflows/apply-v183.yml
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add goway/goway.go .github/workflows/apply-v183.yml
+          git add goway/goway.go goway/goway_test.go .github/workflows/apply-v183.yml
           git commit -m 'Release v1.8.3: reduce MUX timer and buffer overhead'
           git push origin "HEAD:${BRANCH}"
