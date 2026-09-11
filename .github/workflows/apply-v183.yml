@@ -47,11 +47,13 @@ jobs:
           p.write_text(s)
           PY
           gofmt -w goway/goway.go
+          cd goway
           go test ./...
           go test -race ./...
           go vet ./...
-          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /tmp/goway-windows-amd64.exe ./goway
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /tmp/goway-linux-amd64 ./goway
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /tmp/goway-windows-amd64.exe .
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /tmp/goway-linux-amd64 .
+          cd ..
           rm -f .github/workflows/apply-v183.yml
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
