@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	Version        = "1.8.3"
+	Version        = "1.8.4"
 	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -742,6 +742,7 @@ var (
 	logRingBuf  [10]string
 	logRingPos  int
 	logRingLen  int
+	logRingMu   sync.Mutex
 )
 
 func parseLogLevel(levelStr string) LogLevel {
@@ -804,6 +805,8 @@ func logError(format string, v ...interface{}) {
 }
 
 func addLogFileEntry(entry string) {
+	logRingMu.Lock()
+	defer logRingMu.Unlock()
 	if logFilePath == "" {
 		return
 	}
@@ -813,16 +816,17 @@ func addLogFileEntry(entry string) {
 	if logRingLen < len(logRingBuf) {
 		logRingLen++
 	}
-	// Write immediately so logs survive hard kills
 	var lines []string
 	start := (logRingPos - logRingLen + len(logRingBuf)) % len(logRingBuf)
 	for i := 0; i < logRingLen; i++ {
 		lines = append(lines, logRingBuf[(start+i)%len(logRingBuf)])
 	}
-	os.WriteFile(logFilePath, []byte(strings.Join(lines, "\n")+"\n"), 0644)
+	_ = os.WriteFile(logFilePath, []byte(strings.Join(lines, "\n")+"\n"), 0644)
 }
 
 func saveLogFile() {
+	logRingMu.Lock()
+	defer logRingMu.Unlock()
 	if logFilePath == "" || logRingLen == 0 {
 		return
 	}
@@ -1302,18 +1306,22 @@ func readUntilCRLFCRLF(br *bufio.Reader) ([]byte, error) {
 	buf.Grow(MaxHeaderSize)
 	for {
 		line, err := br.ReadSlice('\n')
+		if err == bufio.ErrBufferFull {
+			return nil, errors.New("header too large")
+		}
 		if err != nil {
 			return nil, err
+		}
+		if len(line) > MaxHeaderSize-buf.Len() {
+			return nil, errors.New("header too large")
 		}
 		buf.Write(line)
 		b := buf.Bytes()
 		n := len(b)
-		if n >= 4 &&
-			b[n-4] == '\r' && b[n-3] == '\n' &&
-			b[n-2] == '\r' && b[n-1] == '\n' {
+		if n >= 4 && b[n-4] == '\r' && b[n-3] == '\n' && b[n-2] == '\r' && b[n-1] == '\n' {
 			return b, nil
 		}
-		if n > MaxHeaderSize {
+		if n >= MaxHeaderSize {
 			return nil, errors.New("header too large")
 		}
 	}
@@ -2834,10 +2842,12 @@ func (s *MuxClientSession) Close() {
 			st.Reset()
 		}
 
+		s.writeMu.Lock()
 		if s.prng != nil {
 			maskPool.Put(s.prng)
 			s.prng = nil
 		}
+		s.writeMu.Unlock()
 	})
 }
 
@@ -2865,6 +2875,15 @@ func (s *MuxClientSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	select {
+	case <-s.closed:
+		return errors.New("mux session closed")
+	default:
+	}
+	prng := s.prng
+	if prng == nil {
+		return errors.New("mux session mask generator unavailable")
+	}
 
 	frameLen := MuxHeaderLen + payloadLen
 	bPtr := s.cfg.BufPool.Get().(*[]byte)
@@ -2887,7 +2906,7 @@ func (s *MuxClientSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 		s.cfg.Crypto.TransformInPlace(buf[frameStart : frameStart+frameLen])
 	}
 
-	return writeWSFramePreallocatedFast(s.wsConn, buf, frameStart, frameLen, 0x2, s.prng)
+	return writeWSFramePreallocatedFast(s.wsConn, buf, frameStart, frameLen, 0x2, prng)
 }
 
 func (s *MuxClientSession) readLoop() {
@@ -3258,6 +3277,7 @@ type MuxServerStream struct {
 	id          uint32
 	session     *MuxServerSession
 	writeChan   chan muxDataFrame
+	targetMu    sync.Mutex
 	targetConn  net.Conn
 	closed      chan struct{}
 	closeOnce   sync.Once
@@ -3371,12 +3391,43 @@ func (s *MuxServerStream) QueuedBytes() int64 {
 	return s.queuedBytes
 }
 
+func (s *MuxServerStream) setTargetConn(conn net.Conn) bool {
+	s.targetMu.Lock()
+	defer s.targetMu.Unlock()
+	select {
+	case <-s.closed:
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return false
+	default:
+	}
+	if s.targetConn != nil {
+		_ = s.targetConn.Close()
+	}
+	s.targetConn = conn
+	return true
+}
+
+func (s *MuxServerStream) closeTargetConn() {
+	s.targetMu.Lock()
+	defer s.targetMu.Unlock()
+	if s.targetConn != nil {
+		_ = s.targetConn.Close()
+		s.targetConn = nil
+	}
+}
+
+func (s *MuxServerStream) targetConnSnapshot() net.Conn {
+	s.targetMu.Lock()
+	defer s.targetMu.Unlock()
+	return s.targetConn
+}
+
 func (s *MuxServerStream) Close() {
 	s.closeOnce.Do(func() {
 		close(s.closed)
-		if s.targetConn != nil {
-			s.targetConn.Close()
-		}
+		s.closeTargetConn()
 		s.bufMu.Lock()
 		s.queuedBytes = 0
 		s.bufMu.Unlock()
@@ -3593,7 +3644,9 @@ func (s *MuxServerSession) handleNewStream(st *MuxServerStream, targetStr string
 	}
 
 	optimizeSocket(targetConn, s.cfg)
-	st.targetConn = targetConn
+	if !st.setTargetConn(targetConn) {
+		return
+	}
 
 	if len(initialData) > 0 {
 		if _, err := targetConn.Write(initialData); err != nil {

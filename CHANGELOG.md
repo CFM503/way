@@ -4,6 +4,18 @@ All notable changes to the **Way Proxy** project (Goway & Pyway) are documented 
 
 ---
 
+## [v1.8.4] - 2026-09-11
+
+### Goway 深度并发与生命周期审计
+
+- 修复 MuxClientSession PRNG 与 sync.Pool 的关闭生命周期竞争；SendFrame 在 writeMu 内重新检查状态并固定 PRNG，Close 等待物理写临界区退出后再归还。
+- 为 MuxServerStream.targetConn 增加独立 targetMu，保护设置、快照、关闭和清空，不进入数据转发热路径。
+- 强化 readUntilCRLFCRLF() 硬上限，超长单行和累计头部均立即返回 header too large。
+- 为日志 ring buffer 与保存路径增加并发保护。
+- 强化并发回归：慢/快流、RST/EOF、targetConn、1000 Stream、PRNG、日志。
+- 审计确认现有 writeMu 会串行化物理 WebSocket Write；本版本不强行引入高风险 bounded queue 重构，保持协议与架构兼容。
+
+
 ## [v1.7.8] - 2026-09-04
 
 ### Goway 核心修复与性能结构优化
