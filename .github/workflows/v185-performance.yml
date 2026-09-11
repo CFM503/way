@@ -55,7 +55,7 @@ jobs:
           make_bench
           cat >> goway/v185_ab_bench_test.go <<'EOF'
           func BenchmarkSendFrameAB(b *testing.B) {
-            pool := &sync.Pool{New: func() interface{} { x := make([]byte, 16*1024+14); return &x }}
+            pool := &sync.Pool{New: func() interface{} { x := make([]byte, 32*1024); return &x }}
             s := &MuxClientSession{wsConn: benchConn{}, cfg: &Config{BufPool: pool}, streams: map[uint32]*MuxStream{}, closed: make(chan struct{}), prng: maskPool.Get().(*maskPRNG)}
             payload := make([]byte, 16*1024)
             b.SetBytes(int64(len(payload)))
@@ -71,7 +71,7 @@ jobs:
           make_bench
           cat >> goway/v185_ab_bench_test.go <<'EOF'
           func BenchmarkSendFrameAB(b *testing.B) {
-            pool := &sync.Pool{New: func() interface{} { x := make([]byte, 16*1024+14); return &x }}
+            pool := &sync.Pool{New: func() interface{} { x := make([]byte, 32*1024); return &x }}
             conn := benchConn{}
             s := &MuxClientSession{wsConn: conn, cfg: &Config{BufPool: pool}, streams: map[uint32]*MuxStream{}, closed: make(chan struct{}), prng: maskPool.Get().(*maskPRNG)}
             s.writer = newMuxOutboundWriter(conn, s.prng)
