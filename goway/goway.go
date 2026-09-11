@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	Version        = "1.8.2"
+	Version        = "1.8.3"
 	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -1936,7 +1936,7 @@ func main() {
 	muxFlag := flag.Bool("mux", true, "Enable 0-RTT Connection Multiplexing (default true)")
 	noMuxFlag := flag.Bool("no-mux", false, "Disable 0-RTT Connection Multiplexing (fallback to 1:1 pool)")
 	muxSessionsFlag := flag.Int("mux-sessions", 4, "Number of parallel physical Mux sessions (default 4, max 64)")
-	wFlag := flag.Int("W", 512, "App Buffer Size in KB (default 64KB, recommend 512-4096 for high-throughput streaming)")
+	wFlag := flag.Int("W", 128, "App Buffer Size in KB (default 128KB, recommend 256-1024 for high-throughput streaming)")
 	sockBufFlag := flag.Int("socket-buffer", 0, "Kernel Socket Buffer in KB (default 0 = OS auto-tuning)")
 	noDelayFlag := flag.Bool("no-tcp-nodelay", false, "Disable TCP_NODELAY (disable Nagle bypass)")
 	keepAliveFlag := flag.Bool("no-tcp-keepalive", false, "Disable TCP KeepAlive probes")
@@ -2427,13 +2427,13 @@ const (
 
 	// Client-side Mux stream buffer limit.
 	// Kept lower to reduce per-stream memory usage on client instances.
-	muxClientStreamBufferLimit = 16 * 1024 * 1024
+	muxClientStreamBufferLimit = 8 * 1024 * 1024
 
 	// Server-side Mux stream buffer limit.
 	// Kept higher to provide additional buffering headroom for
 	// downstream fan-out / asymmetric traffic patterns.
-	muxServerStreamBufferLimit = 16 * 1024 * 1024
-	muxStreamIngressQueue      = 512
+	muxServerStreamBufferLimit = 8 * 1024 * 1024
+	muxStreamIngressQueue      = 128
 	muxPushStallTimeout        = 15 * time.Second
 )
 
@@ -2513,8 +2513,6 @@ func (s *MuxStream) deliveryLoop() {
 
 func (s *MuxStream) PushDataFrame(frame muxDataFrame) bool {
 	dataLen := int64(len(frame.data))
-	deadline := time.NewTimer(muxPushStallTimeout)
-	defer deadline.Stop()
 	for {
 		s.bufMu.Lock()
 		select {
@@ -2536,10 +2534,17 @@ func (s *MuxStream) PushDataFrame(frame muxDataFrame) bool {
 			}
 		}
 		s.bufMu.Unlock()
+		deadline := time.NewTimer(muxPushStallTimeout)
 		select {
 		case <-s.closed:
+			if !deadline.Stop() {
+				<-deadline.C
+			}
 			return false
 		case <-s.hasSpace:
+			if !deadline.Stop() {
+				<-deadline.C
+			}
 			continue
 		case <-deadline.C:
 			logWarn("[MUX] Stream %d receive backpressure timeout, resetting stream", s.id)
@@ -2659,7 +2664,7 @@ func (s *MuxStream) Write(p []byte) (n int, err error) {
 		return 0, errors.New("stream closed")
 	default:
 	}
-	const maxChunk = 60 * 1024
+	const maxChunk = 65528
 	total := len(p)
 	for len(p) > 0 {
 		chunk := len(p)
@@ -3299,8 +3304,6 @@ func (s *MuxServerStream) deliveryLoop() {
 
 func (s *MuxServerStream) PushDataFrame(frame muxDataFrame) bool {
 	dataLen := int64(len(frame.data))
-	deadline := time.NewTimer(muxPushStallTimeout)
-	defer deadline.Stop()
 	for {
 		s.bufMu.Lock()
 		select {
@@ -3319,10 +3322,17 @@ func (s *MuxServerStream) PushDataFrame(frame muxDataFrame) bool {
 			}
 		}
 		s.bufMu.Unlock()
+		deadline := time.NewTimer(muxPushStallTimeout)
 		select {
 		case <-s.closed:
+			if !deadline.Stop() {
+				<-deadline.C
+			}
 			return false
 		case <-s.hasSpace:
+			if !deadline.Stop() {
+				<-deadline.C
+			}
 			continue
 		case <-deadline.C:
 			logWarn("[SERVER-MUX] Stream %d receive backpressure timeout, resetting stream", s.id)
