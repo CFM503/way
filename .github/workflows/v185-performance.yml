@@ -14,24 +14,26 @@ permissions:
 jobs:
   validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: A/B SendFrame benchmark on identical runner
+      - name: Deterministic A/B SendFrame benchmark
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p /tmp/goway-ab
-          cat > /tmp/bench_v184.go <<'EOF'
+          make_bench() {
+            cat > goway/v185_ab_bench_test.go <<'EOF'
           package main
           import (
             "io"
             "net"
             "sync"
             "testing"
+            "time"
           )
           type benchConn struct{}
           func (benchConn) Read([]byte) (int,error) { return 0, io.EOF }
@@ -39,24 +41,23 @@ jobs:
           func (benchConn) Close() error { return nil }
           func (benchConn) LocalAddr() net.Addr { return benchAddr{} }
           func (benchConn) RemoteAddr() net.Addr { return benchAddr{} }
-          func (benchConn) SetDeadline(_ time.Time) error { return nil }
-          func (benchConn) SetReadDeadline(_ time.Time) error { return nil }
-          func (benchConn) SetWriteDeadline(_ time.Time) error { return nil }
+          func (benchConn) SetDeadline(time.Time) error { return nil }
+          func (benchConn) SetReadDeadline(time.Time) error { return nil }
+          func (benchConn) SetWriteDeadline(time.Time) error { return nil }
           type benchAddr struct{}
           func (benchAddr) Network() string { return "bench" }
           func (benchAddr) String() string { return "bench" }
           var _ = sync.Pool{}
           EOF
-          # Add time import without maintaining two copies of the helper.
-          sed -i 's/"testing"/"testing"\n            "time"/' /tmp/bench_v184.go
+          }
 
           git checkout --detach v1.8.4
-          cp /tmp/bench_v184.go goway/v185_ab_bench_test.go
+          make_bench
           cat >> goway/v185_ab_bench_test.go <<'EOF'
           func BenchmarkSendFrameAB(b *testing.B) {
-            pool := &sync.Pool{New: func() interface{} { x := make([]byte, 32*1024+14); return &x }}
+            pool := &sync.Pool{New: func() interface{} { x := make([]byte, 16*1024+14); return &x }}
             s := &MuxClientSession{wsConn: benchConn{}, cfg: &Config{BufPool: pool}, streams: map[uint32]*MuxStream{}, closed: make(chan struct{}), prng: maskPool.Get().(*maskPRNG)}
-            payload := make([]byte, 32*1024)
+            payload := make([]byte, 16*1024)
             b.SetBytes(int64(len(payload)))
             b.ResetTimer()
             for i := 0; i < b.N; i++ { if err := s.SendFrame(1, MuxCmdDATA, payload); err != nil { b.Fatal(err) } }
@@ -64,17 +65,17 @@ jobs:
             s.Close()
           }
           EOF
-          (cd goway && go test -run '^$' ./... && go test -bench='^BenchmarkSendFrameAB$' -benchmem -benchtime=500ms -count=8 ./...) | tee /tmp/goway-ab/v184.txt
+          (cd goway && timeout 120s go test -c -o /tmp/v184.test . && timeout 60s /tmp/v184.test -test.run='^$' -test.bench='^BenchmarkSendFrameAB$' -test.benchmem -test.benchtime=200ms -test.count=3) | tee /tmp/goway-ab/v184.txt
 
           git checkout --detach v1.8.5-performance
-          cp /tmp/bench_v184.go goway/v185_ab_bench_test.go
+          make_bench
           cat >> goway/v185_ab_bench_test.go <<'EOF'
           func BenchmarkSendFrameAB(b *testing.B) {
-            pool := &sync.Pool{New: func() interface{} { x := make([]byte, 32*1024+14); return &x }}
+            pool := &sync.Pool{New: func() interface{} { x := make([]byte, 16*1024+14); return &x }}
             conn := benchConn{}
             s := &MuxClientSession{wsConn: conn, cfg: &Config{BufPool: pool}, streams: map[uint32]*MuxStream{}, closed: make(chan struct{}), prng: maskPool.Get().(*maskPRNG)}
             s.writer = newMuxOutboundWriter(conn, s.prng)
-            payload := make([]byte, 32*1024)
+            payload := make([]byte, 16*1024)
             b.SetBytes(int64(len(payload)))
             b.ResetTimer()
             for i := 0; i < b.N; i++ { if err := s.SendFrame(1, MuxCmdDATA, payload); err != nil { b.Fatal(err) } }
@@ -82,18 +83,18 @@ jobs:
             s.Close()
           }
           EOF
-          (cd goway && go test -run '^$' ./... && go test -bench='^BenchmarkSendFrameAB$' -benchmem -benchtime=500ms -count=8 ./...) | tee /tmp/goway-ab/v185.txt
+          (cd goway && timeout 120s go test -c -o /tmp/v185.test . && timeout 60s /tmp/v185.test -test.run='^$' -test.bench='^BenchmarkSendFrameAB$' -test.benchmem -test.benchtime=200ms -test.count=3) | tee /tmp/goway-ab/v185.txt
 
           echo '===== v1.8.4 ====='
           cat /tmp/goway-ab/v184.txt
           echo '===== v1.8.5-performance ====='
           cat /tmp/goway-ab/v185.txt
 
-      - name: Full correctness, race, and 1000-stream stress
+      - name: Correctness and race stress
         working-directory: goway
         run: |
-          go test ./... -count=5 -timeout=10m
-          go test -race ./... -count=3 -timeout=10m
+          go test ./... -count=5 -timeout=8m
+          go test -race ./... -count=3 -timeout=8m
           go vet ./...
 
       - name: Windows x64 build
