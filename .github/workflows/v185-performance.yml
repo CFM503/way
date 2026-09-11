@@ -1,33 +1,52 @@
-name: v1.8.5 performance fix
+name: v1.8.5 performance validation
 
 on:
   push:
     branches: [v1.8.5-performance]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  fix:
+  validate:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Apply refactor
-        run: python3 scripts/v185_fix.py
-      - name: Format and test
+
+      - name: A/B benchmark v1.8.4 vs v1.8.5-performance
+        shell: bash
         run: |
-          gofmt -w goway/goway.go
+          set -euo pipefail
+          mkdir -p /tmp/goway-ab
+          git checkout --detach v1.8.4
           cd goway
-          go test ./... -count=3 -timeout=9m
-          go test -race ./... -count=2 -timeout=9m
-          go vet ./...
-          GOOS=windows GOARCH=amd64 go build -o /tmp/goway-v185-performance.exe .
-      - name: Commit fixed branch
+          go test -run '^$' ./...
+          go test -bench='BenchmarkMuxDataTransferPooled' -benchmem -count=10 ./... | tee /tmp/goway-ab/v184.txt
+          cd ..
+          git checkout --detach v1.8.5-performance
+          cd goway
+          go test -run '^$' ./...
+          go test -bench='BenchmarkMuxDataTransferPooled' -benchmem -count=10 ./... | tee /tmp/goway-ab/v185.txt
+          echo '=== v1.8.4 ==='
+          cat /tmp/goway-ab/v184.txt
+          echo '=== v1.8.5-performance ==='
+          cat /tmp/goway-ab/v185.txt
+
+      - name: Full correctness and race validation
+        working-directory: goway
         run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add goway/goway.go goway/goway_v184_test.go goway/v185_performance_prototype_test.go scripts/v185_fix.py
-          git commit -m 'perf: integrate bounded MUX writer for v1.8.5-performance [skip ci]'
-          git push origin HEAD:v1.8.5-performance
+          go test ./... -count=5 -timeout=10m
+          go test -race ./... -count=3 -timeout=10m
+          go vet ./...
+
+      - name: Windows x64 build
+        working-directory: goway
+        run: GOOS=windows GOARCH=amd64 go build -o /tmp/goway-v185-performance.exe .
+
+      - name: Final status
+        run: |
+          echo 'v1.8.5-performance validation completed successfully.'
+          echo 'A/B benchmark files were generated on the same runner.'
