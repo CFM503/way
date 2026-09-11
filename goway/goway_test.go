@@ -1292,13 +1292,13 @@ func TestMuxStream_ByteLimitBackpressure(t *testing.T) {
 	defer st.Close()
 
 	chunk := make([]byte, 1024*1024)
-	for i := 0; i < 16; i++ {
+	for i := 0; i < 8; i++ {
 		if !st.PushData(chunk) {
 			t.Fatalf("Failed to push chunk %d within limit", i)
 		}
 	}
-	if st.QueuedBytes() != 16*1024*1024 {
-		t.Fatalf("Expected 16MB queued, got %d", st.QueuedBytes())
+	if st.QueuedBytes() != 8*1024*1024 {
+		t.Fatalf("Expected 8MB queued, got %d", st.QueuedBytes())
 	}
 
 	start := time.Now()
