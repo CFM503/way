@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	Version        = "1.8.5-performance"
+	Version        = "1.8.5"
 	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
