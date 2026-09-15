@@ -589,7 +589,7 @@ GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o goway goway.go
 | `-W` | 1024 | 应用缓冲区大小 (KB) |
 | `-socket-buffer` | 8192 | 内核 Socket 缓冲区 (KB) |
 | `-connection-timeout` | 60 | 连接超时 (秒) |
-| `-max-conn` | 1000 | 最大并发连接数 |
+| `-max-conn` | 1500 | 最大并发连接数 |
 | `-dns` | 空 | 远程 DNS 服务器 IP |
 | `-fakehost` | 空 | 伪装的主机名 |
 | `-verify-ssl` | false | 启用 SSL 验证 |
