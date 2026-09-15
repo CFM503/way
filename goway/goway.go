@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	Version        = "1.8.4"
+	Version        = "1.8.5"
 	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -1953,7 +1953,7 @@ func main() {
 	noBlockLocalFlag := flag.Bool("no-block-local", false, "Allow local/LAN loopback traffic in Client mode")
 	verifySSLFlag := flag.Bool("verify-ssl", false, "Enable strict SSL certificate verification for wss:// upstream")
 	allowOpenFlag := flag.Bool("allow-open", false, "Allow server mode without authentication key (open proxy risk)")
-	maxConnFlag := flag.Int("max-conn", 1000, "Max Concurrent Connections (default 1000)")
+	maxConnFlag := flag.Int("max-conn", 1500, "Max Concurrent Connections (default 1500)")
 	connTimeoutFlag := flag.Int("connection-timeout", 60, "Connection/idle timeout in seconds (default 60s)")
 	logFlag := flag.String("log", "INFO", "Log Level: DEBUG, INFO, WARN, ERROR (default INFO)")
 	logFileFlag := flag.String("log-file", "", "Save last 10 log entries to file on exit (e.g. goway.log)")
@@ -2013,7 +2013,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  -allow-open\n")
 		fmt.Fprintf(os.Stderr, "        Allow server mode without authentication key (open proxy risk)\n")
 		fmt.Fprintf(os.Stderr, "  -max-conn int\n")
-		fmt.Fprintf(os.Stderr, "        Max Concurrent Connections limit (default 1000)\n")
+		fmt.Fprintf(os.Stderr, "        Max Concurrent Connections limit (default 1500)\n")
 		fmt.Fprintf(os.Stderr, "  -connection-timeout int\n")
 		fmt.Fprintf(os.Stderr, "        Idle connection timeout in seconds (default 60)\n\n")
 		fmt.Fprintf(os.Stderr, "Diagnostics & UI:\n")
@@ -2739,18 +2739,113 @@ func (s *MuxStream) Reset() {
 }
 
 // MuxClientSession handles a single WebSocket tunnel carrying multiple MuxStreams.
+type muxOutboundFrame struct {
+	bPtr       *[]byte
+	pool       *sync.Pool
+	payloadOff int
+	payloadLen int
+	opcode     byte
+	ping       bool
+}
+
+type muxOutboundWriter struct {
+	conn    net.Conn
+	prng    *maskPRNG
+	q       chan muxOutboundFrame
+	closed  chan struct{}
+	done    chan struct{}
+	closeMu sync.Once
+}
+
+const muxOutboundQueueDepth = 8
+
+func newMuxOutboundWriter(conn net.Conn, prng *maskPRNG) *muxOutboundWriter {
+	w := &muxOutboundWriter{conn: conn, prng: prng, q: make(chan muxOutboundFrame, muxOutboundQueueDepth), closed: make(chan struct{}), done: make(chan struct{})}
+	go w.loop()
+	return w
+}
+
+func (w *muxOutboundWriter) releaseFrame(f muxOutboundFrame) {
+	if f.bPtr != nil && f.pool != nil {
+		f.pool.Put(f.bPtr)
+	}
+}
+
+func (w *muxOutboundWriter) writeFrame(f muxOutboundFrame) error {
+	if f.ping {
+		return writeWSFrame(w.conn, nil, 0x9, true)
+	}
+	if f.bPtr == nil || f.pool == nil {
+		return errors.New("invalid mux outbound frame")
+	}
+	return writeWSFramePreallocatedFast(w.conn, *f.bPtr, f.payloadOff, f.payloadLen, f.opcode, w.prng)
+}
+
+func (w *muxOutboundWriter) loop() {
+	defer close(w.done)
+	for {
+		select {
+		case <-w.closed:
+			for {
+				select {
+				case f := <-w.q:
+					w.releaseFrame(f)
+				default:
+					return
+				}
+			}
+		case f := <-w.q:
+			if err := w.writeFrame(f); err != nil {
+				w.releaseFrame(f)
+				_ = w.conn.Close()
+				for {
+					select {
+					case queued := <-w.q:
+						w.releaseFrame(queued)
+					default:
+						return
+					}
+				}
+			}
+			w.releaseFrame(f)
+		}
+	}
+}
+
+func (w *muxOutboundWriter) enqueue(f muxOutboundFrame) bool {
+	select {
+	case <-w.closed:
+		w.releaseFrame(f)
+		return false
+	case <-w.done:
+		w.releaseFrame(f)
+		return false
+	case w.q <- f:
+		return true
+	}
+}
+
+func (w *muxOutboundWriter) enqueuePing() bool {
+	return w.enqueue(muxOutboundFrame{ping: true})
+}
+
+func (w *muxOutboundWriter) close() {
+	w.closeMu.Do(func() { close(w.closed) })
+	<-w.done
+}
+
 type MuxClientSession struct {
 	wsConn        net.Conn
 	br            *bufio.Reader
 	wsTCPConn     *net.TCPConn
 	cfg           *Config
-	writeMu       sync.Mutex
 	streams       map[uint32]*MuxStream
 	streamsMu     sync.RWMutex
 	nextStreamID  uint32
 	closed        chan struct{}
 	closeOnce     sync.Once
 	prng          *maskPRNG
+	writer        *muxOutboundWriter
 	activeStreams atomic.Int64
 }
 
@@ -2776,15 +2871,9 @@ func (s *MuxClientSession) decrementActiveStreams() {
 }
 
 func newMuxClientSession(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, cfg *Config) *MuxClientSession {
-	s := &MuxClientSession{
-		wsConn:    wsConn,
-		br:        br,
-		wsTCPConn: wsTCPConn,
-		cfg:       cfg,
-		streams:   make(map[uint32]*MuxStream),
-		closed:    make(chan struct{}),
-		prng:      maskPool.Get().(*maskPRNG),
-	}
+	prng := maskPool.Get().(*maskPRNG)
+	s := &MuxClientSession{wsConn: wsConn, br: br, wsTCPConn: wsTCPConn, cfg: cfg, streams: make(map[uint32]*MuxStream), closed: make(chan struct{}), prng: prng}
+	s.writer = newMuxOutboundWriter(wsConn, prng)
 	go s.readLoop()
 	go s.heartbeatLoop()
 	return s
@@ -2798,18 +2887,10 @@ func (s *MuxClientSession) heartbeatLoop() {
 		case <-s.closed:
 			return
 		case <-ticker.C:
-			if s.ActiveStreams() > 0 {
+			if s.ActiveStreams() > 0 || s.writer == nil {
 				continue
 			}
-			s.writeMu.Lock()
-			select {
-			case <-s.closed:
-				s.writeMu.Unlock()
-				return
-			default:
-				_ = writeWSFrame(s.wsConn, nil, 0x9, true)
-			}
-			s.writeMu.Unlock()
+			_ = s.writer.enqueuePing()
 		}
 	}
 }
@@ -2827,9 +2908,11 @@ func (s *MuxClientSession) Close() {
 	s.closeOnce.Do(func() {
 		close(s.closed)
 		if s.wsConn != nil {
-			s.wsConn.Close()
+			_ = s.wsConn.Close()
 		}
-
+		if s.writer != nil {
+			s.writer.close()
+		}
 		s.streamsMu.Lock()
 		activeStreams := make([]*MuxStream, 0, len(s.streams))
 		for _, st := range s.streams {
@@ -2837,17 +2920,13 @@ func (s *MuxClientSession) Close() {
 		}
 		s.streams = make(map[uint32]*MuxStream)
 		s.streamsMu.Unlock()
-
 		for _, st := range activeStreams {
 			st.Reset()
 		}
-
-		s.writeMu.Lock()
 		if s.prng != nil {
 			maskPool.Put(s.prng)
 			s.prng = nil
 		}
-		s.writeMu.Unlock()
 	})
 }
 
@@ -2863,37 +2942,20 @@ func (s *MuxClientSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 		return errors.New("mux session closed")
 	default:
 	}
-
-	if s.wsConn == nil || s.cfg == nil || s.cfg.BufPool == nil {
+	if s.wsConn == nil || s.cfg == nil || s.cfg.BufPool == nil || s.writer == nil {
 		return nil
 	}
-
 	payloadLen := len(payload)
 	if payloadLen > 65535 {
 		return fmt.Errorf("mux frame payload %d exceeds maximum uint16 length (65535)", payloadLen)
 	}
-
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	select {
-	case <-s.closed:
-		return errors.New("mux session closed")
-	default:
-	}
-	prng := s.prng
-	if prng == nil {
-		return errors.New("mux session mask generator unavailable")
-	}
-
 	frameLen := MuxHeaderLen + payloadLen
 	bPtr := s.cfg.BufPool.Get().(*[]byte)
-	defer s.cfg.BufPool.Put(bPtr)
 	buf := *bPtr
-
 	if frameLen+14 > len(buf) {
+		s.cfg.BufPool.Put(bPtr)
 		return errors.New("mux frame exceeds buffer size")
 	}
-
 	frameStart := 14
 	binary.BigEndian.PutUint32(buf[frameStart:frameStart+4], streamID)
 	buf[frameStart+4] = cmd
@@ -2901,12 +2963,14 @@ func (s *MuxClientSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 	if payloadLen > 0 {
 		copy(buf[frameStart+7:frameStart+7+payloadLen], payload)
 	}
-
 	if s.cfg.Crypto != nil {
 		s.cfg.Crypto.TransformInPlace(buf[frameStart : frameStart+frameLen])
 	}
-
-	return writeWSFramePreallocatedFast(s.wsConn, buf, frameStart, frameLen, 0x2, prng)
+	frame := muxOutboundFrame{bPtr: bPtr, pool: s.cfg.BufPool, payloadOff: frameStart, payloadLen: frameLen, opcode: 0x2}
+	if !s.writer.enqueue(frame) {
+		return errors.New("mux session writer closed")
+	}
+	return nil
 }
 
 func (s *MuxClientSession) readLoop() {
