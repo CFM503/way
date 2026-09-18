@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	Version        = "1.8.5"
+	Version        = "1.8.6"
 	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -612,6 +612,7 @@ type Config struct {
 	TUI            bool
 	Mux            bool
 	MuxSessions    int
+	Obfs           bool
 
 	// Internal derived
 	Crypto         *Crypto
@@ -1944,6 +1945,7 @@ func main() {
 	muxFlag := flag.Bool("mux", true, "Enable 0-RTT Connection Multiplexing (default true)")
 	noMuxFlag := flag.Bool("no-mux", false, "Disable 0-RTT Connection Multiplexing (fallback to 1:1 pool)")
 	muxSessionsFlag := flag.Int("mux-sessions", 4, "Number of parallel physical Mux sessions (default 4, max 64)")
+	obfsFlag := flag.Bool("obfs", false, "Pad MUX DATA frames with random lengths to resist packet-size fingerprinting")
 	wFlag := flag.Int("W", 128, "App Buffer Size in KB (default 128KB, recommend 256-1024 for high-throughput streaming)")
 	sockBufFlag := flag.Int("socket-buffer", 0, "Kernel Socket Buffer in KB (default 0 = OS auto-tuning)")
 	noDelayFlag := flag.Bool("no-tcp-nodelay", false, "Disable TCP_NODELAY (disable Nagle bypass)")
@@ -2107,6 +2109,7 @@ func main() {
 		TUI:            tuiEnabled,
 		Mux:            *muxFlag && !*noMuxFlag,
 		MuxSessions:    *muxSessionsFlag,
+		Obfs:           *obfsFlag,
 	}
 
 	if *dnsFlag != "" {
@@ -2746,21 +2749,71 @@ type muxOutboundFrame struct {
 	payloadLen int
 	opcode     byte
 	ping       bool
+	// MUX routing identity for fair scheduling. streamID selects the
+	// per-stream queue; cmd selects the priority lane (everything except
+	// MuxCmdDATA is latency-sensitive control traffic).
+	streamID uint32
+	cmd      byte
 }
 
+// muxStreamQueue is one stream's FIFO inside the fair writer, with a
+// deficit-round-robin byte credit.
+type muxStreamQueue struct {
+	frames  []muxOutboundFrame
+	deficit int
+}
+
+// muxOutboundWriter serializes frames from all streams of one MUX session
+// onto a single WebSocket connection with per-stream fairness.
+//
+// The previous design drained a single FIFO channel: one bulk stream could
+// bury interactive streams behind megabytes of queued data (a stalled video
+// that only recovers on refresh). This design keeps one FIFO per stream
+// plus a priority lane, scheduled as:
+//
+//  1. priority lane first: ping + SYN/FIN/RST control frames;
+//  2. deficit round robin across streams (64KB quantum each) for DATA.
+//
+// enqueue() blocks when the total queued backlog reaches
+// muxOutboundQueueDepth, preserving the old backpressure contract.
+// Locks are never held across network IO.
 type muxOutboundWriter struct {
-	conn    net.Conn
-	prng    *maskPRNG
-	q       chan muxOutboundFrame
-	closed  chan struct{}
-	done    chan struct{}
-	closeMu sync.Once
+	conn     net.Conn
+	prng     *maskPRNG
+	mu       sync.Mutex
+	cond     *sync.Cond
+	streams  map[uint32]*muxStreamQueue
+	rotation []uint32
+	pos      int
+	priority []muxOutboundFrame
+	total    int
+	closed   bool
+	done     chan struct{}
+	closeMu  sync.Once
 }
 
-const muxOutboundQueueDepth = 8
+const (
+	// Total queued frames across all streams + priority lane. Raised from
+	// the old FIFO depth of 8: fairness now protects interactive streams,
+	// so bulk streams may use deeper backlog (~4MB worst case at 64KB).
+	muxOutboundQueueDepth = 64
+	// Per-stream byte credit added each deficit round.
+	muxDRRQuantum = 64 * 1024
+	// Cap accumulated credit so a long-idle stream cannot hog the link.
+	muxDRRMaxDeficit = 256 * 1024
+	// Max random padding appended to MUX DATA frames when -obfs is on.
+	// Sized near MTU so padded lengths spread across the full range.
+	obfsPadMax = 1400
+)
 
 func newMuxOutboundWriter(conn net.Conn, prng *maskPRNG) *muxOutboundWriter {
-	w := &muxOutboundWriter{conn: conn, prng: prng, q: make(chan muxOutboundFrame, muxOutboundQueueDepth), closed: make(chan struct{}), done: make(chan struct{})}
+	w := &muxOutboundWriter{
+		conn:    conn,
+		prng:    prng,
+		streams: make(map[uint32]*muxStreamQueue),
+		done:    make(chan struct{}),
+	}
+	w.cond = sync.NewCond(&w.mu)
 	go w.loop()
 	return w
 }
@@ -2769,6 +2822,15 @@ func (w *muxOutboundWriter) releaseFrame(f muxOutboundFrame) {
 	if f.bPtr != nil && f.pool != nil {
 		f.pool.Put(f.bPtr)
 	}
+}
+
+// frameWireLen is the on-wire MUX cost of a queued frame (header included),
+// used for deficit accounting.
+func frameWireLen(f muxOutboundFrame) int {
+	if f.payloadLen > 0 {
+		return f.payloadLen
+	}
+	return MuxHeaderLen
 }
 
 func (w *muxOutboundWriter) writeFrame(f muxOutboundFrame) error {
@@ -2781,56 +2843,187 @@ func (w *muxOutboundWriter) writeFrame(f muxOutboundFrame) error {
 	return writeWSFramePreallocatedFast(w.conn, *f.bPtr, f.payloadOff, f.payloadLen, f.opcode, w.prng)
 }
 
-func (w *muxOutboundWriter) loop() {
-	defer close(w.done)
-	for {
-		select {
-		case <-w.closed:
-			for {
-				select {
-				case f := <-w.q:
-					w.releaseFrame(f)
-				default:
-					return
-				}
-			}
-		case f := <-w.q:
-			if err := w.writeFrame(f); err != nil {
-				w.releaseFrame(f)
-				_ = w.conn.Close()
-				for {
-					select {
-					case queued := <-w.q:
-						w.releaseFrame(queued)
-					default:
-						return
-					}
-				}
-			}
+// dropAllLocked releases every queued frame and resets scheduling state.
+// Caller must hold w.mu.
+func (w *muxOutboundWriter) dropAllLocked() {
+	for _, f := range w.priority {
+		w.releaseFrame(f)
+	}
+	w.priority = nil
+	for _, q := range w.streams {
+		for _, f := range q.frames {
 			w.releaseFrame(f)
 		}
 	}
+	w.streams = make(map[uint32]*muxStreamQueue)
+	w.rotation = nil
+	w.pos = 0
+	w.total = 0
+}
+
+// removeLocked deletes one stream's queue. Caller must hold w.mu; it
+// returns the doomed frames for release AFTER unlock to keep the critical
+// section free of foreign calls.
+func (w *muxOutboundWriter) removeLocked(id uint32) []muxOutboundFrame {
+	q := w.streams[id]
+	if q == nil {
+		return nil
+	}
+	doomed := q.frames
+	delete(w.streams, id)
+	for i, sid := range w.rotation {
+		if sid == id {
+			w.rotation = append(w.rotation[:i], w.rotation[i+1:]...)
+			if w.pos > i {
+				w.pos--
+			}
+			break
+		}
+	}
+	if w.pos >= len(w.rotation) {
+		w.pos = 0
+	}
+	return doomed
+}
+
+func (w *muxOutboundWriter) loop() {
+	defer close(w.done)
+	for {
+		f, ok := w.next()
+		if !ok {
+			return
+		}
+		if err := w.writeFrame(f); err != nil {
+			w.mu.Lock()
+			w.closed = true
+			w.dropAllLocked()
+			w.cond.Broadcast()
+			w.mu.Unlock()
+			_ = w.conn.Close()
+			return
+		}
+		w.releaseFrame(f)
+	}
+}
+
+// next pops the next frame to send: priority lane first, then deficit
+// round robin. Never holds the lock across network IO.
+func (w *muxOutboundWriter) next() (muxOutboundFrame, bool) {
+	var empty muxOutboundFrame
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for {
+		if len(w.priority) > 0 {
+			f := w.priority[0]
+			w.priority[0] = muxOutboundFrame{}
+			w.priority = w.priority[1:]
+			w.total--
+			w.cond.Signal()
+			return f, true
+		}
+		if f, ok := w.nextDataLocked(); ok {
+			w.total--
+			w.cond.Signal()
+			return f, true
+		}
+		if w.closed {
+			return empty, false
+		}
+		w.cond.Wait()
+	}
+}
+
+// nextDataLocked serves one frame by deficit round robin. Caller must hold w.mu.
+func (w *muxOutboundWriter) nextDataLocked() (muxOutboundFrame, bool) {
+	var empty muxOutboundFrame
+	if len(w.rotation) == 0 {
+		return empty, false
+	}
+	start := w.pos % len(w.rotation)
+	for k := 0; k < len(w.rotation); k++ {
+		idx := (start + k) % len(w.rotation)
+		id := w.rotation[idx]
+		q := w.streams[id]
+		if q == nil || len(q.frames) == 0 {
+			continue
+		}
+		q.deficit += muxDRRQuantum
+		if q.deficit > muxDRRMaxDeficit {
+			q.deficit = muxDRRMaxDeficit
+		}
+		head := q.frames[0]
+		if frameWireLen(head) > q.deficit {
+			continue
+		}
+		q.frames[0] = muxOutboundFrame{}
+		q.frames = q.frames[1:]
+		q.deficit -= frameWireLen(head)
+		if len(q.frames) == 0 {
+			delete(w.streams, id)
+			w.rotation = append(w.rotation[:idx], w.rotation[idx+1:]...)
+		}
+		// Advance PAST the served stream so the next round starts with
+		// its successor (strict rotation; idx would stick to one bulk
+		// stream otherwise).
+		w.pos = idx + 1
+		return head, true
+	}
+	return empty, false
 }
 
 func (w *muxOutboundWriter) enqueue(f muxOutboundFrame) bool {
-	select {
-	case <-w.closed:
-		w.releaseFrame(f)
-		return false
-	case <-w.done:
-		w.releaseFrame(f)
-		return false
-	case w.q <- f:
-		return true
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for w.total >= muxOutboundQueueDepth && !w.closed {
+		w.cond.Wait()
 	}
+	if w.closed {
+		w.releaseFrame(f)
+		return false
+	}
+	if f.ping || (f.cmd != 0 && f.cmd != MuxCmdDATA) {
+		w.priority = append(w.priority, f)
+	} else {
+		q := w.streams[f.streamID]
+		if q == nil {
+			q = &muxStreamQueue{}
+			w.streams[f.streamID] = q
+			w.rotation = append(w.rotation, f.streamID)
+		}
+		q.frames = append(q.frames, f)
+	}
+	w.total++
+	w.cond.Signal()
+	return true
 }
 
 func (w *muxOutboundWriter) enqueuePing() bool {
 	return w.enqueue(muxOutboundFrame{ping: true})
 }
 
+// dropStream discards a dead stream's queued frames so they neither block
+// the rotation nor leak pool buffers.
+func (w *muxOutboundWriter) dropStream(id uint32) {
+	w.mu.Lock()
+	doomed := w.removeLocked(id)
+	for range doomed {
+		w.total--
+	}
+	w.cond.Broadcast()
+	w.mu.Unlock()
+	for _, f := range doomed {
+		w.releaseFrame(f)
+	}
+}
+
 func (w *muxOutboundWriter) close() {
-	w.closeMu.Do(func() { close(w.closed) })
+	w.closeMu.Do(func() {
+		w.mu.Lock()
+		w.closed = true
+		w.dropAllLocked()
+		w.cond.Broadcast()
+		w.mu.Unlock()
+	})
 	<-w.done
 }
 
@@ -2934,6 +3127,9 @@ func (s *MuxClientSession) RemoveStream(streamID uint32) {
 	s.streamsMu.Lock()
 	delete(s.streams, streamID)
 	s.streamsMu.Unlock()
+	if s.writer != nil {
+		s.writer.dropStream(streamID)
+	}
 }
 
 func (s *MuxClientSession) SendFrame(streamID uint32, cmd byte, payload []byte) error {
@@ -2966,7 +3162,18 @@ func (s *MuxClientSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 	if s.cfg.Crypto != nil {
 		s.cfg.Crypto.TransformInPlace(buf[frameStart : frameStart+frameLen])
 	}
-	frame := muxOutboundFrame{bPtr: bPtr, pool: s.cfg.BufPool, payloadOff: frameStart, payloadLen: frameLen, opcode: 0x2}
+	padLen := 0
+	if cmd == MuxCmdDATA && s.cfg.Obfs {
+		if room := len(buf) - 14 - frameLen; room > 0 {
+			if room > obfsPadMax {
+				room = obfsPadMax
+			}
+			padLen = mrand.Intn(room + 1)
+			// Random fill: zero padding would itself be fingerprintable.
+			mrand.Read(buf[frameStart+frameLen : frameStart+frameLen+padLen])
+		}
+	}
+	frame := muxOutboundFrame{bPtr: bPtr, pool: s.cfg.BufPool, payloadOff: frameStart, payloadLen: frameLen + padLen, opcode: 0x2, streamID: streamID, cmd: cmd}
 	if !s.writer.enqueue(frame) {
 		return errors.New("mux session writer closed")
 	}
@@ -3563,7 +3770,21 @@ func (s *MuxServerSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 		s.cfg.Crypto.TransformInPlace(buf[frameStart : frameStart+frameLen])
 	}
 
-	return writeWSFramePreallocated(s.wsConn, buf, frameStart, frameLen, 0x2, false)
+	// Unilateral obfuscation, server side: same random-pad semantics as the
+	// client path; receivers slice by the declared MUX length.
+	writeLen := frameLen
+	if cmd == MuxCmdDATA && s.cfg.Obfs {
+		if room := len(buf) - 14 - frameLen; room > 0 {
+			if room > obfsPadMax {
+				room = obfsPadMax
+			}
+			padLen := mrand.Intn(room + 1)
+			mrand.Read(buf[frameStart+frameLen : frameStart+frameLen+padLen])
+			writeLen = frameLen + padLen
+		}
+	}
+
+	return writeWSFramePreallocated(s.wsConn, buf, frameStart, writeLen, 0x2, false)
 }
 
 func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, cfg *Config) {

@@ -1989,3 +1989,183 @@ func TestMuxStream_BufferOwnershipAndCloseRace(t *testing.T) {
 		pipeR.Close()
 	}
 }
+// TestMuxOutboundWriterFairness proves per-stream fairness of the MUX
+// outbound writer: a bulk stream must not bury an interactive stream
+// (the pre-DRR FIFO failure mode), and control frames must jump the queue.
+func TestMuxOutboundWriterFairness(t *testing.T) {
+	mkframe := func(id uint32, cmd byte, size int) muxOutboundFrame {
+		buf := make([]byte, 14+MuxHeaderLen+size)
+		binary.BigEndian.PutUint32(buf[14:18], id)
+		buf[18] = cmd
+		binary.BigEndian.PutUint16(buf[19:21], uint16(size))
+		return muxOutboundFrame{bPtr: &buf, pool: &sync.Pool{}, payloadOff: 14, payloadLen: MuxHeaderLen + size, opcode: 0x2, streamID: id, cmd: cmd}
+	}
+	readMux := func(br *bufio.Reader, conn net.Conn) (uint32, byte) {
+		t.Helper()
+		data, err := readWSFrame(br, conn)
+		if err != nil {
+			t.Fatalf("read frame: %v", err)
+		}
+		if len(data) < MuxHeaderLen {
+			t.Fatalf("short mux frame: %d", len(data))
+		}
+		return binary.BigEndian.Uint32(data[:4]), data[4]
+	}
+	t.Run("InteractiveJumpsAheadOfBulk", func(t *testing.T) {
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		prng := maskPool.Get().(*maskPRNG)
+		defer maskPool.Put(prng)
+		w := newMuxOutboundWriter(client, prng)
+		defer w.close()
+		br := bufio.NewReader(server)
+		// Bulk stream 1 floods first; the writer blocks on the first pipe
+		// write, so all enqueues below land before any read happens.
+		for i := 0; i < 4; i++ {
+			if !w.enqueue(mkframe(1, MuxCmdDATA, 32768)) {
+				t.Fatalf("bulk enqueue %d rejected", i)
+			}
+		}
+		if !w.enqueue(mkframe(2, MuxCmdDATA, 100)) {
+			t.Fatal("interactive enqueue rejected")
+		}
+		var order []uint32
+		for i := 0; i < 5; i++ {
+			id, _ := readMux(br, server)
+			order = append(order, id)
+		}
+		// Expected: bulk#1 (in flight first), then interactive (stream 2's
+		// DRR turn), then the bulk remainder. FIFO would put stream 2 last.
+		if len(order) != 5 || order[0] != 1 || order[1] != 2 {
+			t.Fatalf("unfair order: %v, want [1 2 1 1 1]", order)
+		}
+		for _, id := range order[2:] {
+			if id != 1 {
+				t.Fatalf("unfair order: %v, want [1 2 1 1 1]", order)
+			}
+		}
+	})
+	t.Run("ControlJumpsQueue", func(t *testing.T) {
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		prng := maskPool.Get().(*maskPRNG)
+		defer maskPool.Put(prng)
+		w := newMuxOutboundWriter(client, prng)
+		defer w.close()
+		br := bufio.NewReader(server)
+		if !w.enqueue(mkframe(1, MuxCmdDATA, 32768)) {
+			t.Fatal("bulk enqueue rejected")
+		}
+		// Drain the in-flight bulk frame first: this pins the writer to a
+		// known state (idle, empty queues) so the assertions below are
+		// deterministic regardless of goroutine scheduling.
+		if id, _ := readMux(br, server); id != 1 {
+			t.Fatalf("first frame not bulk: %d", id)
+		}
+		if !w.enqueue(mkframe(1, MuxCmdDATA, 32768)) {
+			t.Fatal("bulk enqueue rejected")
+		}
+		if !w.enqueue(mkframe(2, MuxCmdFIN, 0)) {
+			t.Fatal("FIN enqueue rejected")
+		}
+		var cmds []byte
+		var ids []uint32
+		for i := 0; i < 2; i++ {
+			id, cmd := readMux(br, server)
+			ids = append(ids, id)
+			cmds = append(cmds, cmd)
+		}
+		// Expected: FIN via the priority lane, then bulk#2.
+		// Without the priority lane the FIN would come last.
+		if len(cmds) != 2 || cmds[0] != MuxCmdFIN || ids[0] != 2 {
+			t.Fatalf("FIN did not jump queue: ids=%v cmds=%v", ids, cmds)
+		}
+	})
+}
+// TestMuxObfsPadding proves unilateral padding: with -obfs on, DATA
+// frames carry random trailing pad inside the WS payload while the MUX
+// header still declares the true length (old receivers slice by it and
+// ignore the tail); with obfs off the wire format is byte-exact.
+func TestMuxObfsPadding(t *testing.T) {
+	mkpool := func() *sync.Pool {
+		return &sync.Pool{New: func() interface{} {
+			b := make([]byte, 65536+14+MuxHeaderLen)
+			return &b
+		}}
+	}
+	dial := func(obfs bool) (*MuxClientSession, net.Conn, *bufio.Reader) {
+		t.Helper()
+		client, server := net.Pipe()
+		prng := maskPool.Get().(*maskPRNG)
+		t.Cleanup(func() { maskPool.Put(prng) })
+		cfg := &Config{BufPool: mkpool(), ConnTimeout: 60, Obfs: obfs}
+		s := &MuxClientSession{wsConn: client, cfg: cfg}
+		s.writer = newMuxOutboundWriter(client, prng)
+		t.Cleanup(func() { s.writer.close() })
+		return s, server, bufio.NewReader(server)
+	}
+	readMux := func(br *bufio.Reader, conn net.Conn) []byte {
+		t.Helper()
+		data, err := readWSFrame(br, conn)
+		if err != nil {
+			t.Fatalf("read frame: %v", err)
+		}
+		return data
+	}
+	t.Run("OffIsExact", func(t *testing.T) {
+		s, server, br := dial(false)
+		defer server.Close()
+		payload := bytes.Repeat([]byte{0xAB}, 100)
+		if err := s.SendFrame(7, MuxCmdDATA, payload); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+		data := readMux(br, server)
+		if len(data) != MuxHeaderLen+100 {
+			t.Fatalf("unpaused frame len = %d, want %d", len(data), MuxHeaderLen+100)
+		}
+	})
+	t.Run("OnPadsRandomly", func(t *testing.T) {
+		s, server, br := dial(true)
+		defer server.Close()
+		payload := bytes.Repeat([]byte{0xCD}, 100)
+		seenPad := false
+		for i := 0; i < 8; i++ {
+			if err := s.SendFrame(9, MuxCmdDATA, payload); err != nil {
+				t.Fatalf("send: %v", err)
+			}
+			data := readMux(br, server)
+			if len(data) < MuxHeaderLen+100 || len(data) > MuxHeaderLen+100+obfsPadMax {
+				t.Fatalf("padded frame len = %d, want [%d, %d]", len(data), MuxHeaderLen+100, MuxHeaderLen+100+obfsPadMax)
+			}
+			// MUX header still declares the true length; prefix intact.
+			if binary.BigEndian.Uint32(data[:4]) != 9 || data[4] != MuxCmdDATA {
+				t.Fatalf("mux header corrupted: %v", data[:MuxHeaderLen])
+			}
+			if binary.BigEndian.Uint16(data[5:7]) != 100 {
+				t.Fatalf("mux length corrupted: %v", data[:MuxHeaderLen])
+			}
+			if !bytes.Equal(data[MuxHeaderLen:MuxHeaderLen+100], payload) {
+				t.Fatalf("mux payload corrupted")
+			}
+			if len(data) > MuxHeaderLen+100 {
+				seenPad = true
+			}
+		}
+		if !seenPad {
+			t.Fatal("8 padded frames all came out unpadded (p ~= 0)")
+		}
+	})
+	t.Run("ControlUnpadded", func(t *testing.T) {
+		s, server, br := dial(true)
+		defer server.Close()
+		if err := s.SendFrame(3, MuxCmdFIN, nil); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+		data := readMux(br, server)
+		if len(data) != MuxHeaderLen {
+			t.Fatalf("FIN frame len = %d, want %d (control must stay exact)", len(data), MuxHeaderLen)
+		}
+	})
+}

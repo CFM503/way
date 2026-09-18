@@ -4,6 +4,14 @@ All notable changes to the **Way Proxy** project (Goway & Pyway) are documented 
 
 ---
 
+## [v1.8.6] - 2026-09-18
+
+### Goway 公平调度与流量混淆
+
+- **MUX 写端公平 DRR 调度**: `muxOutboundWriter` 改为 per-stream 队列 + 优先级 lane（ping/SYN/FIN/RST 优先）+ DATA 按 deficit round robin（64KB quantum，赤字上限 256KB）；队列上限 8→64（保持背压）；`RemoveStream` 丢弃该流已排队帧；锁不跨网络 IO。解决 bulk 流埋掉交互流的 video-stall 模式。
+- **单边 `-obfs` 填充**: 新 flag `-obfs`（`Config.Obfs`）；MUX DATA 帧在 WS payload 内追加随机 `[0,1400]` 填充，MUX 声明长度不变，老端按声明长度切片直接忽略，单边部署安全；客户端 + 服务端 `SendFrame` 双侧生效；填充为随机字节（零填充本身可被指纹）。
+- **测试**: 新增 `TestMuxOutboundWriterFairness`、`TestMuxObfsPadding`；`go.mod` 仅将 quic-go 提升为直接依赖（版本不变）。
+
 ## [v1.8.4] - 2026-09-11
 
 ### Goway 深度并发与生命周期审计
