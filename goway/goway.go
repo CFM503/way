@@ -40,7 +40,7 @@ import (
 )
 
 const (
-	Version        = "1.8.8"
+	Version        = "1.8.10"
 	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -198,6 +198,14 @@ var (
 	tuiRingPos int // index of next write slot
 
 	tuiRefreshCh = make(chan struct{}, 1)
+
+	// stdoutIsTTY gates terminal control sequences (line-clear etc.): they
+	// clean up live dashboards on a console but pollute piped/file logs.
+	// Pure stdlib (ModeCharDevice), computed once — no extra dependency.
+	stdoutIsTTY = func() bool {
+		fi, err := os.Stdout.Stat()
+		return err == nil && (fi.Mode()&os.ModeCharDevice) != 0
+	}()
 )
 
 func initWindowsConsole() {
@@ -767,6 +775,9 @@ func logDebug(format string, v ...interface{}) {
 		if tuiEnabled {
 			addTuiLog(time.Now().Format("15:04:05") + " " + AnsiCyan + "[DEBUG] " + fmt.Sprintf(format, v...) + AnsiReset)
 		} else {
+			if stdoutIsTTY {
+			fmt.Print("\r\033[K")
+		}
 			log.Printf(AnsiCyan+"[DEBUG] "+format+AnsiReset, v...)
 		}
 	}
@@ -777,6 +788,9 @@ func logInfo(format string, v ...interface{}) {
 		if tuiEnabled {
 			addTuiLog(time.Now().Format("15:04:05") + " " + AnsiGreen + "[INFO] " + fmt.Sprintf(format, v...) + AnsiReset)
 		} else {
+			if stdoutIsTTY {
+			fmt.Print("\r\033[K")
+		}
 			log.Printf(AnsiGreen+"[INFO] "+format+AnsiReset, v...)
 		}
 	}
@@ -788,6 +802,9 @@ func logWarn(format string, v ...interface{}) {
 		if tuiEnabled {
 			addTuiLog(time.Now().Format("15:04:05") + " " + AnsiYellow + "[WARN] " + msg + AnsiReset)
 		} else {
+			if stdoutIsTTY {
+			fmt.Print("\r\033[K")
+		}
 			log.Printf(AnsiYellow+"[WARN] "+format+AnsiReset, v...)
 		}
 		addLogFileEntry("[WARN] " + msg)
@@ -800,6 +817,9 @@ func logError(format string, v ...interface{}) {
 		if tuiEnabled {
 			addTuiLog(time.Now().Format("15:04:05") + " " + AnsiRed + "[ERROR] " + msg + AnsiReset)
 		} else {
+			if stdoutIsTTY {
+			fmt.Print("\r\033[K")
+		}
 			log.Printf(AnsiRed+"[ERROR] "+format+AnsiReset, v...)
 		}
 		addLogFileEntry("[ERROR] " + msg)
@@ -2436,8 +2456,19 @@ func main() {
 			select {
 			case <-shutdown:
 				// Normal shutdown
+				break
 			default:
-				logDebug("Accept error: %v", err)
+			}
+			if ne, ok := err.(net.Error); ok && (ne.Temporary() || ne.Timeout()) {
+				logWarn("Accept temporary error: %v (retrying...)", err)
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			select {
+			case <-shutdown:
+				break
+			default:
+				logError("Accept unrecoverable error: %v", err)
 			}
 			break
 		}
@@ -2449,7 +2480,12 @@ func main() {
 		}
 
 		go func(c net.Conn) {
-			defer releaseConn()
+			defer func() {
+				if r := recover(); r != nil {
+					logError("Connection handler recovered from panic: %v", r)
+				}
+				releaseConn()
+			}()
 			handleConnection(c, &cfg)
 		}(conn)
 	}
@@ -2869,9 +2905,11 @@ const (
 	// so bulk streams may use deeper backlog (~4MB worst case at 64KB).
 	muxOutboundQueueDepth = 64
 	// Per-stream byte credit added each deficit round.
-	muxDRRQuantum = 64 * 1024
+	// Set to 128KB so that even maximum-size MUX frames with -obfs padding (~67KB)
+	// can be dispatched in a single round without deficit underflow stall.
+	muxDRRQuantum = 128 * 1024
 	// Cap accumulated credit so a long-idle stream cannot hog the link.
-	muxDRRMaxDeficit = 256 * 1024
+	muxDRRMaxDeficit = 512 * 1024
 	// Max random padding appended to MUX DATA frames when -obfs is on.
 	// Sized near MTU so padded lengths spread across the full range.
 	obfsPadMax = 1400
@@ -2985,23 +3023,24 @@ func (w *muxOutboundWriter) next() (muxOutboundFrame, bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	for {
-		if len(w.priority) > 0 {
-			f := w.priority[0]
-			// Self-ordering: a control frame yields while its own stream
-			// still has queued DATA — else the peer closes early and drops
-			// the tail (proven by FinNeverOvertakesOwnData). Ping/system
-			// frames and controls for streams with empty queues jump at
-			// once; the deferred control is reconsidered every round, so
-			// it still precedes other streams' later bulk.
+		// Scan priority queue to find the first unblocked control frame.
+		// Only stream-CLOSING controls (FIN/RST) yield while their own
+		// stream still has pending DATA frames — else the peer closes
+		// early and drops the tail. SYN never yields: it creates the
+		// peer-side stream, so yielding it makes the peer drop its own
+		// DATA as unknown-stream (caught live on the RushWay side: full
+		// flows vanishing under burst with zero error logs).
+		// Frames for other streams (or pings) are never head-of-line blocked.
+		for i := 0; i < len(w.priority); i++ {
+			f := w.priority[i]
 			blocked := false
-			if !f.ping && f.streamID != 0 {
+			if !f.ping && f.streamID != 0 && (f.cmd == MuxCmdFIN || f.cmd == MuxCmdRST) {
 				if q := w.streams[f.streamID]; q != nil && len(q.frames) > 0 {
 					blocked = true
 				}
 			}
 			if !blocked {
-				w.priority[0] = muxOutboundFrame{}
-				w.priority = w.priority[1:]
+				w.priority = append(w.priority[:i], w.priority[i+1:]...)
 				w.total--
 				w.cond.Signal()
 				return f, true
@@ -3025,36 +3064,42 @@ func (w *muxOutboundWriter) nextDataLocked() (muxOutboundFrame, bool) {
 	if len(w.rotation) == 0 {
 		return empty, false
 	}
-	start := w.pos % len(w.rotation)
-	for k := 0; k < len(w.rotation); k++ {
-		idx := (start + k) % len(w.rotation)
-		id := w.rotation[idx]
-		q := w.streams[id]
-		if q == nil || len(q.frames) == 0 {
-			continue
+	for {
+		hasFrames := false
+		start := w.pos % len(w.rotation)
+		for k := 0; k < len(w.rotation); k++ {
+			idx := (start + k) % len(w.rotation)
+			id := w.rotation[idx]
+			q := w.streams[id]
+			if q == nil || len(q.frames) == 0 {
+				continue
+			}
+			hasFrames = true
+			q.deficit += muxDRRQuantum
+			if q.deficit > muxDRRMaxDeficit {
+				q.deficit = muxDRRMaxDeficit
+			}
+			head := q.frames[0]
+			if frameWireLen(head) > q.deficit {
+				continue
+			}
+			q.frames[0] = muxOutboundFrame{}
+			q.frames = q.frames[1:]
+			q.deficit -= frameWireLen(head)
+			if len(q.frames) == 0 {
+				delete(w.streams, id)
+				w.rotation = append(w.rotation[:idx], w.rotation[idx+1:]...)
+			}
+			// Advance PAST the served stream so the next round starts with
+			// its successor (strict rotation; idx would stick to one bulk
+			// stream otherwise).
+			w.pos = idx + 1
+			return head, true
 		}
-		q.deficit += muxDRRQuantum
-		if q.deficit > muxDRRMaxDeficit {
-			q.deficit = muxDRRMaxDeficit
+		if !hasFrames {
+			return empty, false
 		}
-		head := q.frames[0]
-		if frameWireLen(head) > q.deficit {
-			continue
-		}
-		q.frames[0] = muxOutboundFrame{}
-		q.frames = q.frames[1:]
-		q.deficit -= frameWireLen(head)
-		if len(q.frames) == 0 {
-			delete(w.streams, id)
-			w.rotation = append(w.rotation[:idx], w.rotation[idx+1:]...)
-		}
-		// Advance PAST the served stream so the next round starts with
-		// its successor (strict rotation; idx would stick to one bulk
-		// stream otherwise).
-		w.pos = idx + 1
-		return head, true
 	}
-	return empty, false
 }
 
 func (w *muxOutboundWriter) enqueue(f muxOutboundFrame) bool {
@@ -3507,6 +3552,9 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 	}
 
 	streamID := atomic.AddUint32(&session.nextStreamID, 1)
+	if streamID == 0 {
+		streamID = atomic.AddUint32(&session.nextStreamID, 1)
+	}
 	stream := newMuxStream(streamID, session)
 	stream.onClose = func() {
 		session.decrementActiveStreams()
@@ -3990,6 +4038,9 @@ func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 
 func (s *MuxServerSession) handleNewStream(st *MuxServerStream, targetStr string, initialData []byte) {
 	defer func() {
+		if r := recover(); r != nil {
+			logError("[SERVER-MUX] Stream %d handler recovered from panic: %v", st.id, r)
+		}
 		st.Close()
 		s.streamsMu.Lock()
 		delete(s.streams, st.id)
@@ -4082,6 +4133,9 @@ func (s *MuxServerSession) handleNewStream(st *MuxServerStream, targetStr string
 
 func handleConnection(conn net.Conn, cfg *Config) {
 	defer conn.Close()
+	if cfg.ConnTimeout > 0 {
+		_ = conn.SetDeadline(time.Now().Add(time.Duration(cfg.ConnTimeout) * time.Second))
+	}
 
 	if cfg.Upstream == "" {
 		handleServer(conn, cfg)
@@ -4143,6 +4197,12 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 		logError("handleServer read auth data err: %v", err)
 		return
 	}
+
+	// Handshake done: drop the accept-time absolute deadline set in
+	// handleConnection (it would otherwise kill this session on its first
+	// write past ConnTimeout — SetReadDeadline refreshes never touch the
+	// write half). Relay loops manage their own rolling read deadlines.
+	_ = wsConn.SetDeadline(time.Time{})
 
 	if cfg.Crypto != nil {
 		cfg.Crypto.TransformInPlace(authData)
@@ -4826,6 +4886,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 				return
 			}
 
+			_ = localConn.SetDeadline(time.Time{})
 			handleClientUDP(localConn, cfg)
 			return
 		}
@@ -5020,6 +5081,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 	}
 
 	targetAddr := net.JoinHostPort(targetHost, targetPort)
+	_ = localConn.SetDeadline(time.Time{})
 
 	// If QUIC upstream is configured, relay via QUIC
 	if cfg.IsQUICUpstream && cfg.QUICPool != nil {
