@@ -2083,6 +2083,37 @@ func TestMuxOutboundWriterFairness(t *testing.T) {
 			t.Fatalf("FIN did not jump queue: ids=%v cmds=%v", ids, cmds)
 		}
 	})
+	t.Run("FinNeverOvertakesOwnData", func(t *testing.T) {
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		prng := maskPool.Get().(*maskPRNG)
+		defer maskPool.Put(prng)
+		w := newMuxOutboundWriter(client, prng, nil)
+		defer w.close()
+		br := bufio.NewReader(server)
+		// Same stream: DATA, DATA, FIN all queued while the writer is
+		// blocked on the first pipe write. A FIN that jumps its own
+		// stream's DATA would make the peer close early and drop the
+		// tail — the FIN must come last.
+		if !w.enqueue(mkframe(1, MuxCmdDATA, 1000)) {
+			t.Fatal("DATA enqueue rejected")
+		}
+		if !w.enqueue(mkframe(1, MuxCmdDATA, 1000)) {
+			t.Fatal("DATA enqueue rejected")
+		}
+		if !w.enqueue(mkframe(1, MuxCmdFIN, 0)) {
+			t.Fatal("FIN enqueue rejected")
+		}
+		var cmds []byte
+		for i := 0; i < 3; i++ {
+			_, cmd := readMux(br, server)
+			cmds = append(cmds, cmd)
+		}
+		if len(cmds) != 3 || cmds[0] != MuxCmdDATA || cmds[1] != MuxCmdDATA || cmds[2] != MuxCmdFIN {
+			t.Fatalf("FIN overtook its own DATA: cmds=%v, want [DATA DATA FIN]", cmds)
+		}
+	})
 }
 // TestMuxObfsPadding proves unilateral padding: with -obfs on, DATA
 // frames carry random trailing pad inside the WS payload while the MUX
