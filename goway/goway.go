@@ -40,7 +40,7 @@ import (
 )
 
 const (
-	Version        = "1.8.7"
+	Version        = "1.8.8"
 	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -2987,11 +2987,25 @@ func (w *muxOutboundWriter) next() (muxOutboundFrame, bool) {
 	for {
 		if len(w.priority) > 0 {
 			f := w.priority[0]
-			w.priority[0] = muxOutboundFrame{}
-			w.priority = w.priority[1:]
-			w.total--
-			w.cond.Signal()
-			return f, true
+			// Self-ordering: a control frame yields while its own stream
+			// still has queued DATA — else the peer closes early and drops
+			// the tail (proven by FinNeverOvertakesOwnData). Ping/system
+			// frames and controls for streams with empty queues jump at
+			// once; the deferred control is reconsidered every round, so
+			// it still precedes other streams' later bulk.
+			blocked := false
+			if !f.ping && f.streamID != 0 {
+				if q := w.streams[f.streamID]; q != nil && len(q.frames) > 0 {
+					blocked = true
+				}
+			}
+			if !blocked {
+				w.priority[0] = muxOutboundFrame{}
+				w.priority = w.priority[1:]
+				w.total--
+				w.cond.Signal()
+				return f, true
+			}
 		}
 		if f, ok := w.nextDataLocked(); ok {
 			w.total--

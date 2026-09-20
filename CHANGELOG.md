@@ -4,6 +4,16 @@ All notable changes to the **Way Proxy** project (Goway & Pyway) are documented 
 
 ---
 
+## [v1.8.8] - 2026-09-20
+
+### Goway 同流保序修复（DRR 优先 lane 数据丢失）
+
+- **Bug（RushWay 联调抓获）**: DRR 优先 lane 让 FIN/RST 无条件插队——当它与同流的排队 DATA 同时在列时，FIN 先发、对端提前关流、尾部 DATA 被丢。RushWay 侧复现为 HTTP 响应 1596B 发出但客户端收不到（`curl 000`）；回环 Go→Go 因单帧写节拍+速度侥幸躲过，属潜伏 bug。
+- **证明**: 新增 `FinNeverOvertakesOwnData`（同流 DATA×2 + FIN 同批入列，net.Pipe 阻塞写器）——修复前输出 `[FIN, DATA, DATA]`，确诊。
+- **修复**: 优先 lane 改为流感知自保序——队首 control 若其流还有排队 DATA 则本轮让路（仍排在其它流 bulk 之前），无 DATA/新流/SYN/ping 照常插队。跨流公平（`ControlJumpsQueue`、`InteractiveJumpsAheadOfBulk`）不受影响。
+- **验证**: 全量 `go test` 绿；Go↔Go、Go-obfs↔RushWay-obfs 双向回环 200。
+- **测试文件裁决**: `goway_test.go` **保留**——它是唯一综合回归集（40+ 测试，含本轮公平/等价/UDP 用例）；已删的是 v1.8.4 旧文件（v1.8.7），当前无无用测试文件。
+
 ## [v1.8.7] - 2026-09-18
 
 ### Goway UDP 批量、变换融合与 QUIC 修剪
