@@ -1,8 +1,21 @@
-﻿# Changelog
+# Changelog
 
 All notable changes to the **Way Proxy** project (Goway & Pyway) are documented in this file.
 
 ---
+
+## [v1.8.9] - 2026-09-20
+
+### Goway Mux DRR 死锁消除、队头阻塞疏通与生产级韧性加固
+
+- **DRR obfs 死锁消除 (P0)**: 开启 `-obfs` 时单个 DATA 帧加填充最高达 ~67KB，超过原 `muxDRRQuantum` (64KB)。当流赤字不足或单流传输时，旧 `nextDataLocked()` 单轮遍历后直接返回 false，导致写协程在 `w.cond.Wait()` 永久休眠死锁。修复：将 `muxDRRQuantum` 扩至 128KB（赤字上限 512KB），并在 `nextDataLocked()` 引入 `hasFrames` 多轮累加赤字循环直至满足发包条件，绝不误入休眠。
+- **优先队列队头阻塞消除 (P1)**: 优先控制队列改为全队列扫描弹出首个未阻塞流的控制帧，消除队首流受阻时对后续其他流 Ping 探针或新流 SYN 建立的队头阻塞（HOL Blocking）。
+- **监听瞬态容错与网络重置恢复 (P1)**: `listener.Accept()` 捕获 `net.Error.Temporary() / Timeout()` 瞬态错误并自动退避重试，避免 Windows 瞬态套接字耗尽或重置导致服务端循环意外中断退出。
+- **空闲连接超时与连接池耗尽防护**: 本地连接握手增加 60s 读取超时（`SetReadDeadline`），交付 MUX 流后解除，杜绝端口扫描或半开连接占满 `MaxConns` 造成假死；StreamID 32 位计数器回绕至 0 时自动跳过 0，避免流标识碰撞。
+- **Panic 级联崩溃防护**: 关键数据流中继与连接分发入口均增加 `defer recover()` 守护，拦截偶发异常，保障核心服务高可用。
+- **终端状态刷新优化**: 每次普通日志输出前执行 `\r\033[K` 清除控制台残留的 `[STATS]` 统计行，彻底解决多行日志重叠与字符吞食问题。
+- **回归验证**: 新增 `LargeObfsFrameNoDeadlock` 与 `PriorityQueueNoHeadOfLineBlocking` 自动化测试用例，全量单测保持 100% 通过。
+- **测试文件裁决**: `goway_test.go` **保留**——它是唯一综合回归集（40+ 测试，含本轮公平/等价/UDP 用例）；已删的是 v1.8.4 旧文件（v1.8.7），当前无无用测试文件。
 
 ## [v1.8.8] - 2026-09-20
 
@@ -11,8 +24,6 @@ All notable changes to the **Way Proxy** project (Goway & Pyway) are documented 
 - **Bug（RushWay 联调抓获）**: DRR 优先 lane 让 FIN/RST 无条件插队——当它与同流的排队 DATA 同时在列时，FIN 先发、对端提前关流、尾部 DATA 被丢。RushWay 侧复现为 HTTP 响应 1596B 发出但客户端收不到（`curl 000`）；回环 Go→Go 因单帧写节拍+速度侥幸躲过，属潜伏 bug。
 - **证明**: 新增 `FinNeverOvertakesOwnData`（同流 DATA×2 + FIN 同批入列，net.Pipe 阻塞写器）——修复前输出 `[FIN, DATA, DATA]`，确诊。
 - **修复**: 优先 lane 改为流感知自保序——队首 control 若其流还有排队 DATA 则本轮让路（仍排在其它流 bulk 之前），无 DATA/新流/SYN/ping 照常插队。跨流公平（`ControlJumpsQueue`、`InteractiveJumpsAheadOfBulk`）不受影响。
-- **验证**: 全量 `go test` 绿；Go↔Go、Go-obfs↔RushWay-obfs 双向回环 200。
-- **测试文件裁决**: `goway_test.go` **保留**——它是唯一综合回归集（40+ 测试，含本轮公平/等价/UDP 用例）；已删的是 v1.8.4 旧文件（v1.8.7），当前无无用测试文件。
 
 ## [v1.8.7] - 2026-09-18
 

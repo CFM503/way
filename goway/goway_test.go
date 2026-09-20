@@ -2114,6 +2114,74 @@ func TestMuxOutboundWriterFairness(t *testing.T) {
 			t.Fatalf("FIN overtook its own DATA: cmds=%v, want [DATA DATA FIN]", cmds)
 		}
 	})
+	t.Run("LargeObfsFrameNoDeadlock", func(t *testing.T) {
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		prng := maskPool.Get().(*maskPRNG)
+		defer maskPool.Put(prng)
+		w := newMuxOutboundWriter(client, prng, nil)
+		defer w.close()
+		br := bufio.NewReader(server)
+
+		// Frame larger than 64KB (simulating maxChunk 65528 + padding 1200)
+		largeSize := 65530
+		pad := 1200
+		totalPayload := MuxHeaderLen + largeSize + pad
+		buf := make([]byte, 14+totalPayload)
+		binary.BigEndian.PutUint32(buf[14:18], 1)
+		buf[18] = MuxCmdDATA
+		binary.BigEndian.PutUint16(buf[19:21], uint16(largeSize))
+		frame := muxOutboundFrame{bPtr: &buf, pool: &sync.Pool{}, payloadOff: 14, payloadLen: totalPayload, opcode: 0x2, streamID: 1, cmd: MuxCmdDATA}
+
+		if !w.enqueue(frame) {
+			t.Fatal("large obfs frame enqueue rejected")
+		}
+
+		done := make(chan struct{})
+		go func() {
+			id, cmd := readMux(br, server)
+			if id != 1 || cmd != MuxCmdDATA {
+				t.Errorf("read wrong frame: id=%d cmd=%d", id, cmd)
+			}
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			// Success
+		case <-time.After(2 * time.Second):
+			t.Fatal("Deadlock: writer stalled on large obfs frame")
+		}
+	})
+	t.Run("PriorityQueueNoHeadOfLineBlocking", func(t *testing.T) {
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		prng := maskPool.Get().(*maskPRNG)
+		defer maskPool.Put(prng)
+		w := newMuxOutboundWriter(client, prng, nil)
+		defer w.close()
+		br := bufio.NewReader(server)
+
+		// Stream 1 has DATA and FIN (FIN is blocked by stream 1's data)
+		// Stream 2 has SYN (SYN should NOT be blocked by stream 1's FIN!)
+		w.enqueue(mkframe(1, MuxCmdDATA, 2000))
+		w.enqueue(mkframe(1, MuxCmdFIN, 0))
+		w.enqueue(mkframe(2, MuxCmdSYN, 100))
+
+		var cmds []byte
+		var ids []uint32
+		for i := 0; i < 3; i++ {
+			id, cmd := readMux(br, server)
+			ids = append(ids, id)
+			cmds = append(cmds, cmd)
+		}
+		// Stream 2 SYN must jump ahead of Stream 1 FIN
+		if cmds[0] == MuxCmdFIN && ids[0] == 1 {
+			t.Fatalf("Stream 1 FIN blocked priority lane: ids=%v cmds=%v", ids, cmds)
+		}
+	})
 }
 // TestMuxObfsPadding proves unilateral padding: with -obfs on, DATA
 // frames carry random trailing pad inside the WS payload while the MUX
