@@ -2017,7 +2017,7 @@ func TestMuxOutboundWriterFairness(t *testing.T) {
 		defer server.Close()
 		prng := maskPool.Get().(*maskPRNG)
 		defer maskPool.Put(prng)
-		w := newMuxOutboundWriter(client, prng)
+		w := newMuxOutboundWriter(client, prng, nil)
 		defer w.close()
 		br := bufio.NewReader(server)
 		// Bulk stream 1 floods first; the writer blocks on the first pipe
@@ -2052,7 +2052,7 @@ func TestMuxOutboundWriterFairness(t *testing.T) {
 		defer server.Close()
 		prng := maskPool.Get().(*maskPRNG)
 		defer maskPool.Put(prng)
-		w := newMuxOutboundWriter(client, prng)
+		w := newMuxOutboundWriter(client, prng, nil)
 		defer w.close()
 		br := bufio.NewReader(server)
 		if !w.enqueue(mkframe(1, MuxCmdDATA, 32768)) {
@@ -2102,7 +2102,7 @@ func TestMuxObfsPadding(t *testing.T) {
 		t.Cleanup(func() { maskPool.Put(prng) })
 		cfg := &Config{BufPool: mkpool(), ConnTimeout: 60, Obfs: obfs}
 		s := &MuxClientSession{wsConn: client, cfg: cfg}
-		s.writer = newMuxOutboundWriter(client, prng)
+		s.writer = newMuxOutboundWriter(client, prng, nil)
 		t.Cleanup(func() { s.writer.close() })
 		return s, server, bufio.NewReader(server)
 	}
@@ -2168,4 +2168,242 @@ func TestMuxObfsPadding(t *testing.T) {
 			t.Fatalf("FIN frame len = %d, want %d (control must stay exact)", len(data), MuxHeaderLen)
 		}
 	})
+}
+
+func invertMuxWSFrame(t *testing.T, wire []byte, crypto *Crypto) []byte {
+	t.Helper()
+	if len(wire) < 2 || wire[0]&0x0F != 0x2 {
+		t.Fatalf("bad WS opcode/len: %d bytes", len(wire))
+	}
+	var wsLen, hdrLen int
+	switch wire[1] & 0x7F {
+	case 126:
+		wsLen = int(binary.BigEndian.Uint16(wire[2:4]))
+		hdrLen = 4
+	case 127:
+		wsLen = int(binary.BigEndian.Uint64(wire[2:10]))
+		hdrLen = 10
+	default:
+		wsLen = int(wire[1] & 0x7F)
+		hdrLen = 2
+	}
+	mk := wire[hdrLen : hdrLen+4]
+	region := append([]byte(nil), wire[hdrLen+4:hdrLen+4+wsLen]...)
+	for i := range region {
+		region[i] ^= mk[i&3]
+	}
+	if crypto != nil {
+		crypto.TransformInPlace(region)
+	}
+	return region
+}
+
+func TestMuxFusedEncodeEquivalence(t *testing.T) {
+	for _, key := range []string{"", "fuse-key"} {
+		var crypto *Crypto
+		if key != "" {
+			crypto = NewCrypto(key)
+		}
+		for _, sz := range []int{0, 7, 100, 125, 126, 1000, 7000, 65535} {
+			raw := make([]byte, sz)
+			mrand.New(mrand.NewSource(int64(sz) + 1)).Read(raw)
+			// Reference two-pass: cipher at "enqueue", mask-only write.
+			ref := make([]byte, sz+32)
+			copy(ref[14:], raw)
+			if crypto != nil {
+				crypto.TransformInPlace(ref[14 : 14+sz])
+			}
+			prng := maskPool.Get().(*maskPRNG)
+			var refOut bytes.Buffer
+			if err := writeWSFramePreallocatedFast(&refOut, ref, 14, sz, 0x2, prng); err != nil {
+				t.Fatal(err)
+			}
+			maskPool.Put(prng)
+			// Fused single pass over a pristine copy.
+			fused := make([]byte, sz+32)
+			copy(fused[14:], raw)
+			prng2 := maskPool.Get().(*maskPRNG)
+			var fusedOut bytes.Buffer
+			if err := writeMuxFrameFused(&fusedOut, fused, 14, sz, 0x2, prng2, crypto); err != nil {
+				t.Fatal(err)
+			}
+			maskPool.Put(prng2)
+			if refOut.Len() != fusedOut.Len() {
+				t.Fatalf("key=%q sz=%d len mismatch: ref=%d fused=%d", key, sz, refOut.Len(), fusedOut.Len())
+			}
+			if got := invertMuxWSFrame(t, refOut.Bytes(), crypto); !bytes.Equal(got, raw) {
+				t.Fatalf("key=%q sz=%d reference round-trip mismatch", key, sz)
+			}
+			if got := invertMuxWSFrame(t, fusedOut.Bytes(), crypto); !bytes.Equal(got, raw) {
+				t.Fatalf("key=%q sz=%d fused round-trip mismatch", key, sz)
+			}
+		}
+	}
+}
+
+func BenchmarkMUXEncodeTwoPass(b *testing.B) {
+	crypto := NewCrypto("bench-key")
+	raw := make([]byte, 65535)
+	mrand.New(mrand.NewSource(1)).Read(raw)
+	prng := maskPool.Get().(*maskPRNG)
+	defer maskPool.Put(prng)
+	buf := make([]byte, len(raw)+32)
+	b.SetBytes(int64(len(raw)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		copy(buf[14:], raw)
+		crypto.TransformInPlace(buf[14 : 14+len(raw)])
+		_ = writeWSFramePreallocatedFast(io.Discard, buf, 14, len(raw), 0x2, prng)
+	}
+}
+
+func BenchmarkMUXEncodeFused(b *testing.B) {
+	crypto := NewCrypto("bench-key")
+	raw := make([]byte, 65535)
+	mrand.New(mrand.NewSource(1)).Read(raw)
+	prng := maskPool.Get().(*maskPRNG)
+	defer maskPool.Put(prng)
+	buf := make([]byte, len(raw)+32)
+	b.SetBytes(int64(len(raw)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		copy(buf[14:], raw)
+		_ = writeMuxFrameFused(io.Discard, buf, 14, len(raw), 0x2, prng, crypto)
+	}
+}
+
+func TestUDPBatchReadLoopback(t *testing.T) {
+	srv, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	cli, err := net.DialUDP("udp", nil, srv.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	const K = 64
+	for i := 0; i < K; i++ {
+		msg := []byte{byte(i), byte(i >> 8), 0xAB, 0xCD}
+		if _, err := cli.Write(msg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	batch := newUDPBatch(srv)
+	got := 0
+	deadline := time.Now().Add(5 * time.Second)
+	_ = deadline
+	for got < K {
+		if err := srv.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		n, err := batch.read()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < n; i++ {
+			pkt := batch.msgs[i].Buffers[0][:batch.msgs[i].N]
+			want := []byte{byte(got), byte(got >> 8), 0xAB, 0xCD}
+			if !bytes.Equal(pkt, want) {
+				t.Fatalf("datagram %d mismatch: got %v want %v", got, pkt, want)
+			}
+			got++
+		}
+	}
+}
+
+func BenchmarkUDPReadSingle(b *testing.B) {
+	srv, _ := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	defer srv.Close()
+	cli, _ := net.DialUDP("udp", nil, srv.LocalAddr().(*net.UDPAddr))
+	defer cli.Close()
+	msg := make([]byte, 512)
+	buf := make([]byte, 65535)
+	work := make([]byte, 65535)
+	_ = srv.SetReadDeadline(time.Now().Add(60 * time.Second)) // loud fail, never hang
+	const N = 5000
+	b.SetBytes(int64(N * len(msg)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for j := 0; j < N; j++ {
+				_, _ = cli.Write(msg)
+			}
+		}()
+		for j := 0; j < N; j++ {
+			n, _, err := srv.ReadFromUDP(buf)
+			if err != nil {
+				b.Fatal(err)
+			}
+			copy(work, buf[:n]) // per-datagram relay work lets backlog build
+		}
+		<-done
+	}
+}
+
+func BenchmarkUDPReadBatch(b *testing.B) {
+	srv, _ := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	defer srv.Close()
+	cli, _ := net.DialUDP("udp", nil, srv.LocalAddr().(*net.UDPAddr))
+	defer cli.Close()
+	msg := make([]byte, 512)
+	batch := newUDPBatch(srv)
+	work := make([]byte, 65535)
+	_ = srv.SetReadDeadline(time.Now().Add(60 * time.Second)) // loud fail, never hang
+	const N = 5000
+	b.SetBytes(int64(N * len(msg)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for j := 0; j < N; j++ {
+				_, _ = cli.Write(msg)
+			}
+		}()
+		got := 0
+		for got < N {
+			n, err := batch.read()
+			if err != nil {
+				b.Fatal(err)
+			}
+			for k := 0; k < n; k++ {
+				pkt := batch.msgs[k].Buffers[0][:batch.msgs[k].N]
+				copy(work, pkt) // same per-datagram relay work
+			}
+			got += n
+		}
+		<-done
+	}
+}
+
+// LUT-mask challenger for the #4 verdict: 4x256-entry per-frame tables,
+// out[i:i+4] = T0[b0]|T1[b1]|T2[b2]|T3[b3]. Table build cost included.
+func BenchmarkMaskWordLUT(b *testing.B) {
+	raw := make([]byte, 65535)
+	mrand.New(mrand.NewSource(2)).Read(raw)
+	var t0, t1, t2, t3 [256]uint32
+	buf := make([]byte, len(raw))
+	b.SetBytes(int64(len(raw)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		mk := [4]byte{byte(i), byte(i >> 8), byte(i >> 13), byte(i >> 21)}
+		for v := 0; v < 256; v++ {
+			t0[v] = uint32(v) ^ uint32(mk[0])
+			t1[v] = (uint32(v) ^ uint32(mk[1])) << 8
+			t2[v] = (uint32(v) ^ uint32(mk[2])) << 16
+			t3[v] = (uint32(v) ^ uint32(mk[3])) << 24
+		}
+		copy(buf, raw)
+		j := 0
+		for ; j+4 <= len(buf); j += 4 {
+			binary.NativeEndian.PutUint32(buf[j:], t0[buf[j]]|t1[buf[j+1]]|t2[buf[j+2]]|t3[buf[j+3]])
+		}
+		for ; j < len(buf); j++ {
+			buf[j] ^= mk[j&3]
+		}
+	}
 }

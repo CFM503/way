@@ -36,10 +36,11 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"golang.org/x/net/ipv4"
 )
 
 const (
-	Version        = "1.8.6"
+	Version        = "1.8.7"
 	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -1177,6 +1178,75 @@ func writeWSFramePreallocatedFast(w io.Writer, buf []byte, payloadOffset int, pa
 	}
 	for ; i < payloadLen; i++ {
 		payload[i] ^= mk[i&3]
+	}
+
+	_, err := w.Write(buf[frameStart : frameStart+hdrLen+4+payloadLen])
+	return err
+}
+
+// writeMuxFrameFused wraps a pre-encoded MUX region in its WS frame while
+// applying the cipher keystream and the WS mask in a SINGLE pass
+// (word ^ keystream ^ mask64). It replaces the old two-pass sequence
+// (Crypto.TransformInPlace at enqueue + mask-only write here) on the client
+// MUX hot path, halving bulk memory traffic. Offset semantics are identical
+// to the two-pass version (region-relative, matching TransformInPlace), so
+// wire bytes after receiver-side invert are bit-identical; the obfs tail,
+// if any, is inside the region and ignored by declared-length slicing.
+// crypto == nil degrades to the mask-only fast path.
+func writeMuxFrameFused(w io.Writer, buf []byte, payloadOffset int, payloadLen int, opcode byte, prng *maskPRNG, crypto *Crypto) error {
+	hdrLen := 2
+	if payloadLen >= 65536 {
+		hdrLen = 10
+	} else if payloadLen >= 126 {
+		hdrLen = 4
+	}
+
+	frameStart := payloadOffset - 4 - hdrLen
+	if frameStart < 0 {
+		return errors.New("buffer pre-padding is insufficient")
+	}
+
+	buf[frameStart] = 0b10000000 | opcode
+
+	if payloadLen < 126 {
+		buf[frameStart+1] = byte(payloadLen) | 128
+	} else if payloadLen < 65536 {
+		buf[frameStart+1] = 126 | 128
+		binary.BigEndian.PutUint16(buf[frameStart+2:frameStart+4], uint16(payloadLen))
+	} else {
+		buf[frameStart+1] = 127 | 128
+		binary.BigEndian.PutUint64(buf[frameStart+2:frameStart+10], uint64(payloadLen))
+	}
+
+	mkOffset := frameStart + hdrLen
+	mk := buf[mkOffset : mkOffset+4]
+	readMask(mk, prng) // fast xorshift64 — no syscall
+
+	region := buf[payloadOffset : payloadOffset+payloadLen]
+	if crypto == nil {
+		maskWord := binary.NativeEndian.Uint32(mk)
+		i := 0
+		for ; i+4 <= payloadLen; i += 4 {
+			binary.NativeEndian.PutUint32(region[i:],
+				binary.NativeEndian.Uint32(region[i:])^maskWord)
+		}
+		for ; i < payloadLen; i++ {
+			region[i] ^= mk[i&3]
+		}
+	} else {
+		ek := crypto.expandedKey
+		maskWord := binary.NativeEndian.Uint32(mk)
+		mask64 := uint64(maskWord) | (uint64(maskWord) << 32)
+		i := 0
+		for ; i+8 <= payloadLen; i += 8 {
+			off := i & (cryptoChunkSize - 1)
+			binary.NativeEndian.PutUint64(region[i:],
+				binary.NativeEndian.Uint64(region[i:])^
+					binary.NativeEndian.Uint64(ek[off:])^mask64)
+		}
+		for ; i < payloadLen; i++ {
+			region[i] ^= ek[i&(cryptoChunkSize-1)] ^ mk[i&3]
+		}
 	}
 
 	_, err := w.Write(buf[frameStart : frameStart+hdrLen+4+payloadLen])
@@ -2780,6 +2850,7 @@ type muxStreamQueue struct {
 type muxOutboundWriter struct {
 	conn     net.Conn
 	prng     *maskPRNG
+	crypto   *Crypto
 	mu       sync.Mutex
 	cond     *sync.Cond
 	streams  map[uint32]*muxStreamQueue
@@ -2806,10 +2877,11 @@ const (
 	obfsPadMax = 1400
 )
 
-func newMuxOutboundWriter(conn net.Conn, prng *maskPRNG) *muxOutboundWriter {
+func newMuxOutboundWriter(conn net.Conn, prng *maskPRNG, crypto *Crypto) *muxOutboundWriter {
 	w := &muxOutboundWriter{
 		conn:    conn,
 		prng:    prng,
+		crypto:  crypto,
 		streams: make(map[uint32]*muxStreamQueue),
 		done:    make(chan struct{}),
 	}
@@ -2840,7 +2912,7 @@ func (w *muxOutboundWriter) writeFrame(f muxOutboundFrame) error {
 	if f.bPtr == nil || f.pool == nil {
 		return errors.New("invalid mux outbound frame")
 	}
-	return writeWSFramePreallocatedFast(w.conn, *f.bPtr, f.payloadOff, f.payloadLen, f.opcode, w.prng)
+	return writeMuxFrameFused(w.conn, *f.bPtr, f.payloadOff, f.payloadLen, f.opcode, w.prng, w.crypto)
 }
 
 // dropAllLocked releases every queued frame and resets scheduling state.
@@ -3066,7 +3138,7 @@ func (s *MuxClientSession) decrementActiveStreams() {
 func newMuxClientSession(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, cfg *Config) *MuxClientSession {
 	prng := maskPool.Get().(*maskPRNG)
 	s := &MuxClientSession{wsConn: wsConn, br: br, wsTCPConn: wsTCPConn, cfg: cfg, streams: make(map[uint32]*MuxStream), closed: make(chan struct{}), prng: prng}
-	s.writer = newMuxOutboundWriter(wsConn, prng)
+	s.writer = newMuxOutboundWriter(wsConn, prng, cfg.Crypto)
 	go s.readLoop()
 	go s.heartbeatLoop()
 	return s
@@ -3159,9 +3231,8 @@ func (s *MuxClientSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 	if payloadLen > 0 {
 		copy(buf[frameStart+7:frameStart+7+payloadLen], payload)
 	}
-	if s.cfg.Crypto != nil {
-		s.cfg.Crypto.TransformInPlace(buf[frameStart : frameStart+frameLen])
-	}
+	// NB: cipher is applied at write time by writeMuxFrameFused (single
+	// cipher+mask pass); do NOT TransformInPlace here.
 	padLen := 0
 	if cmd == MuxCmdDATA && s.cfg.Obfs {
 		if room := len(buf) - 14 - frameLen; room > 0 {
@@ -4198,6 +4269,74 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 	<-errCh
 }
 
+// --- UDP batch reads (recvmmsg) ---
+//
+// All four UDP relay loops used to call ReadFromUDP once per datagram —
+// one syscall per DNS-sized packet. udpBatch drains up to udpBatchCount
+// datagrams per recvmmsg syscall via x/net/ipv4 ReadBatch and processes
+// them with the exact same per-datagram logic. Where the platform lacks
+// recvmmsg (e.g. Windows) the first ReadBatch error pins a fallback to
+// plain ReadFromUDP, so behavior is identical everywhere, only slower.
+// Batch buffers are 64KB (no truncation vs. today's 64KB read bufs);
+// 8 x 64KB = 512KB per UDP associate session, released on return.
+
+const udpBatchCount = 8
+const udpBatchBufSize = 65535
+
+type udpBatch struct {
+	pc       *ipv4.PacketConn
+	conn     *net.UDPConn
+	msgs     []ipv4.Message
+	addrs    []net.UDPAddr
+	fallback bool
+}
+
+func newUDPBatch(conn *net.UDPConn) *udpBatch {
+	b := &udpBatch{
+		conn:  conn,
+		pc:    ipv4.NewPacketConn(conn),
+		msgs:  make([]ipv4.Message, udpBatchCount),
+		addrs: make([]net.UDPAddr, udpBatchCount),
+	}
+	for i := range b.msgs {
+		b.msgs[i].Buffers = [][]byte{make([]byte, udpBatchBufSize)}
+		b.msgs[i].Addr = &b.addrs[i]
+	}
+	return b
+}
+
+// read returns the number of freshly received datagrams (≥1). Message i is
+// b.msgs[i].Buffers[0][:b.msgs[i].N] from b.msgs[i].Addr (*net.UDPAddr).
+// Any error is fatal to the caller, exactly like ReadFromUDP today.
+func (b *udpBatch) read() (int, error) {
+	if !b.fallback {
+		if n, err := b.pc.ReadBatch(b.msgs, 0); err == nil {
+			return n, nil
+		}
+		b.fallback = true
+	}
+	n, addr, err := b.conn.ReadFromUDP(b.msgs[0].Buffers[0])
+	if err != nil {
+		return 0, err
+	}
+	b.msgs[0].N = n
+	b.msgs[0].Addr = addr
+	return 1, nil
+}
+
+// cloneUDPAddr deep-copies an address for storage beyond the current batch
+// (batch Addr slots are reused on the next read).
+func cloneUDPAddr(a *net.UDPAddr) *net.UDPAddr {
+	if a == nil {
+		return nil
+	}
+	cp := *a
+	if a.IP != nil {
+		cp.IP = append(net.IP(nil), a.IP...)
+	}
+	return &cp
+}
+
 func handleServerUDP(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, cfg *Config) {
 	logInfo("[SERVER] UDP Tunnel requested")
 	var ok []byte
@@ -4307,45 +4446,50 @@ func handleServerUDP(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 		bPtr := cfg.BufPool.Get().(*[]byte)
 		defer cfg.BufPool.Put(bPtr)
 		rawBuf := *bPtr
-		readBuf := make([]byte, 65535)
+		batch := newUDPBatch(udpConn)
 		for {
-			n, raddr, errRead := udpConn.ReadFromUDP(readBuf)
+			count, errRead := batch.read()
 			if errRead != nil {
 				err = errRead
 				return
 			}
-			frameData := rawBuf[14:]
-			frameData[0] = 0
-			frameData[1] = 0
-			frameData[2] = 0
-			var hdrLen int
-			ip4 := raddr.IP.To4()
-			if ip4 != nil {
-				frameData[3] = 0x01
-				copy(frameData[4:8], ip4)
-				binary.BigEndian.PutUint16(frameData[8:10], uint16(raddr.Port))
-				hdrLen = 10
-			} else {
-				frameData[3] = 0x04
-				copy(frameData[4:20], raddr.IP.To16())
-				binary.BigEndian.PutUint16(frameData[20:22], uint16(raddr.Port))
-				hdrLen = 22
-			}
-			totalLen := hdrLen + n
-			if totalLen > len(rawBuf)-14 {
-				continue
-			}
-			copy(frameData[hdrLen:], readBuf[:n])
+			for i := 0; i < count; i++ {
+				n := batch.msgs[i].N
+				raddr := batch.msgs[i].Addr.(*net.UDPAddr)
+				pkt := batch.msgs[i].Buffers[0][:n]
+				frameData := rawBuf[14:]
+				frameData[0] = 0
+				frameData[1] = 0
+				frameData[2] = 0
+				var hdrLen int
+				ip4 := raddr.IP.To4()
+				if ip4 != nil {
+					frameData[3] = 0x01
+					copy(frameData[4:8], ip4)
+					binary.BigEndian.PutUint16(frameData[8:10], uint16(raddr.Port))
+					hdrLen = 10
+				} else {
+					frameData[3] = 0x04
+					copy(frameData[4:20], raddr.IP.To16())
+					binary.BigEndian.PutUint16(frameData[20:22], uint16(raddr.Port))
+					hdrLen = 22
+				}
+				totalLen := hdrLen + n
+				if totalLen > len(rawBuf)-14 {
+					continue
+				}
+				copy(frameData[hdrLen:], pkt)
 
-			if cfg.Crypto != nil {
-				cfg.Crypto.TransformInPlace(frameData[:totalLen])
-			}
+				if cfg.Crypto != nil {
+					cfg.Crypto.TransformInPlace(frameData[:totalLen])
+				}
 
-			if errWrite := writeWSFramePreallocated(wsConn, rawBuf, 14, totalLen, 0x2, false); errWrite != nil {
-				err = errWrite
-				return
+				if errWrite := writeWSFramePreallocated(wsConn, rawBuf, 14, totalLen, 0x2, false); errWrite != nil {
+					err = errWrite
+					return
+				}
+				stats.AddBytes(0, int64(n))
 			}
-			stats.AddBytes(0, int64(n))
 		}
 	}()
 
@@ -4520,21 +4664,27 @@ func handleClientUDP(localConn net.Conn, cfg *Config) {
 		buf := *bPtr
 		prng := maskPool.Get().(*maskPRNG)
 		defer maskPool.Put(prng)
+		batch := newUDPBatch(udpListener)
 		for {
-			n, srcAddr, errRead := udpListener.ReadFromUDP(buf[14:])
+			count, errRead := batch.read()
 			if errRead != nil {
 				err = errRead
 				return
 			}
-			clientUDPAddr.Store(srcAddr)
-			if cfg.Crypto != nil {
-				cfg.Crypto.TransformInPlace(buf[14 : 14+n])
+			for i := 0; i < count; i++ {
+				n := batch.msgs[i].N
+				pkt := batch.msgs[i].Buffers[0][:n]
+				clientUDPAddr.Store(cloneUDPAddr(batch.msgs[i].Addr.(*net.UDPAddr)))
+				copy(buf[14:], pkt)
+				if cfg.Crypto != nil {
+					cfg.Crypto.TransformInPlace(buf[14 : 14+n])
+				}
+				if errWrite := writeWSFramePreallocatedFast(wsConn, buf, 14, n, 0x2, prng); errWrite != nil {
+					err = errWrite
+					return
+				}
+				stats.AddBytes(int64(n), 0)
 			}
-			if errWrite := writeWSFramePreallocatedFast(wsConn, buf, 14, n, 0x2, prng); errWrite != nil {
-				err = errWrite
-				return
-			}
-			stats.AddBytes(int64(n), 0)
 		}
 	}()
 
@@ -5104,13 +5254,21 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 
 func defaultQUICConfig() *quic.Config {
 	return &quic.Config{
-		MaxIdleTimeout:                 60 * time.Second,
+		// Trimmed (v1.8.7): idle 60s -> 30s so dead mobile conns are
+		// reclaimed faster; explicit per-conn stream caps bound a
+		// malicious peer's stream table; DATAGRAM support disabled —
+		// no Send/ReceiveDatagram call exists anywhere, so negotiating
+		// it only costs handshake bytes. KeepAlive stays 15s: longer
+		// risks NAT-binding loss on strict networks.
+		MaxIdleTimeout:                 30 * time.Second,
 		KeepAlivePeriod:                15 * time.Second,
+		MaxIncomingStreams:             512,
+		MaxIncomingUniStreams:          128,
 		InitialStreamReceiveWindow:     2 * 1024 * 1024,
 		MaxStreamReceiveWindow:         8 * 1024 * 1024,
 		InitialConnectionReceiveWindow: 4 * 1024 * 1024,
 		MaxConnectionReceiveWindow:     16 * 1024 * 1024,
-		EnableDatagrams:                true,
+		EnableDatagrams:                false,
 	}
 }
 
@@ -5363,40 +5521,46 @@ func handleQUICServerUDP(stream quic.Stream, br *bufio.Reader, cfg *Config) {
 	go func() {
 		rawBuf := make([]byte, 65535)
 		var lenBuf [2]byte
+		batch := newUDPBatch(udpConn)
 		for {
-			n, raddr, errRead := udpConn.ReadFromUDP(rawBuf[10:])
+			count, errRead := batch.read()
 			if errRead != nil {
 				errCh <- errRead
 				return
 			}
-			rawBuf[0] = 0
-			rawBuf[1] = 0
-			rawBuf[2] = 0
-			var hdrLen int
-			ip4 := raddr.IP.To4()
-			if ip4 != nil {
-				rawBuf[3] = 0x01
-				copy(rawBuf[4:8], ip4)
-				binary.BigEndian.PutUint16(rawBuf[8:10], uint16(raddr.Port))
-				hdrLen = 10
-			} else {
-				copy(rawBuf[22:22+n], rawBuf[10:10+n])
-				rawBuf[3] = 0x04
-				copy(rawBuf[4:20], raddr.IP.To16())
-				binary.BigEndian.PutUint16(rawBuf[20:22], uint16(raddr.Port))
-				hdrLen = 22
+			for i := 0; i < count; i++ {
+				n := batch.msgs[i].N
+				raddr := batch.msgs[i].Addr.(*net.UDPAddr)
+				copy(rawBuf[10:], batch.msgs[i].Buffers[0][:n])
+				rawBuf[0] = 0
+				rawBuf[1] = 0
+				rawBuf[2] = 0
+				var hdrLen int
+				ip4 := raddr.IP.To4()
+				if ip4 != nil {
+					rawBuf[3] = 0x01
+					copy(rawBuf[4:8], ip4)
+					binary.BigEndian.PutUint16(rawBuf[8:10], uint16(raddr.Port))
+					hdrLen = 10
+				} else {
+					copy(rawBuf[22:22+n], rawBuf[10:10+n])
+					rawBuf[3] = 0x04
+					copy(rawBuf[4:20], raddr.IP.To16())
+					binary.BigEndian.PutUint16(rawBuf[20:22], uint16(raddr.Port))
+					hdrLen = 22
+				}
+				totalLen := hdrLen + n
+				binary.BigEndian.PutUint16(lenBuf[:], uint16(totalLen))
+				if _, errWrite := stream.Write(lenBuf[:]); errWrite != nil {
+					errCh <- errWrite
+					return
+				}
+				if _, errWrite := stream.Write(rawBuf[:totalLen]); errWrite != nil {
+					errCh <- errWrite
+					return
+				}
+				stats.AddBytes(0, int64(n))
 			}
-			totalLen := hdrLen + n
-			binary.BigEndian.PutUint16(lenBuf[:], uint16(totalLen))
-			if _, errWrite := stream.Write(lenBuf[:]); errWrite != nil {
-				errCh <- errWrite
-				return
-			}
-			if _, errWrite := stream.Write(rawBuf[:totalLen]); errWrite != nil {
-				errCh <- errWrite
-				return
-			}
-			stats.AddBytes(0, int64(n))
 		}
 	}()
 
@@ -5696,23 +5860,29 @@ func handleClientUDPQUIC(localConn net.Conn, boundAddr *net.UDPAddr, udpListener
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
 		var lenBuf [2]byte
+		batch := newUDPBatch(udpListener)
 		for {
-			n, srcAddr, errRead := udpListener.ReadFromUDP(buf)
+			count, errRead := batch.read()
 			if errRead != nil {
 				errCh <- errRead
 				return
 			}
-			clientUDPAddr.Store(srcAddr)
-			binary.BigEndian.PutUint16(lenBuf[:], uint16(n))
-			if _, errWrite := stream.Write(lenBuf[:]); errWrite != nil {
-				errCh <- errWrite
-				return
+			for i := 0; i < count; i++ {
+				n := batch.msgs[i].N
+				pkt := batch.msgs[i].Buffers[0][:n]
+				clientUDPAddr.Store(cloneUDPAddr(batch.msgs[i].Addr.(*net.UDPAddr)))
+				copy(buf, pkt)
+				binary.BigEndian.PutUint16(lenBuf[:], uint16(n))
+				if _, errWrite := stream.Write(lenBuf[:]); errWrite != nil {
+					errCh <- errWrite
+					return
+				}
+				if _, errWrite := stream.Write(buf[:n]); errWrite != nil {
+					errCh <- errWrite
+					return
+				}
+				stats.AddBytes(int64(n), 0)
 			}
-			if _, errWrite := stream.Write(buf[:n]); errWrite != nil {
-				errCh <- errWrite
-				return
-			}
-			stats.AddBytes(int64(n), 0)
 		}
 	}()
 
