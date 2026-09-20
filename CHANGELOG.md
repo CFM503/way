@@ -4,6 +4,14 @@ All notable changes to the **Way Proxy** project (Goway & Pyway) are documented 
 
 ---
 
+## [v1.8.10] - 2026-09-20
+
+### Goway SYN 保序修正、服务端长连接修复与日志终端适配
+
+- **SYN 永不让行 (P0)**: v1.8.8 自保序规则误伤 SYN——排在自己流 DATA 后的 SYN 会让路，导致对端把先到的 DATA 当未知流静默丢弃（整流消失、零日志；RushWay 侧联调抓获）。现仅 FIN/RST 让行，SYN/系统帧永远插队。新增 `SynNeverYieldsToOwnData` 为证（修复前必现 `[DATA, SYN]` 错序）。
+- **服务端长连接写限修复 (P0)**: `handleConnection` 的绝对 deadline 在服务端路径从不清掉（已验证 Go 语义：`SetReadDeadline` 刷新不碰写限，过期后写必 `i/o timeout`），服务端会话将在 accept+ConnTimeout 后的第一次写死亡（默认 60s，压测小 timeout 下数秒即现）。现握手完成后清除，行为回退到 v1.8.8（中继期各走滚动读限）。慢消费者长尾另记 backlog，与本次无关。
+- **日志清行符 TTY 门控**: `\r\033[K` 只在终端输出，管道/文件不再吃转义垃圾（纯 stdlib `ModeCharDevice` 检测，零依赖）。
+
 ## [v1.8.9] - 2026-09-20
 
 ### Goway Mux DRR 死锁消除、队头阻塞疏通与生产级韧性加固

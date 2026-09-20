@@ -2114,6 +2114,33 @@ func TestMuxOutboundWriterFairness(t *testing.T) {
 			t.Fatalf("FIN overtook its own DATA: cmds=%v, want [DATA DATA FIN]", cmds)
 		}
 	})
+	t.Run("SynNeverYieldsToOwnData", func(t *testing.T) {
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		prng := maskPool.Get().(*maskPRNG)
+		defer maskPool.Put(prng)
+		w := newMuxOutboundWriter(client, prng, nil)
+		defer w.close()
+		br := bufio.NewReader(server)
+		// SYN creates the peer-side stream: it must lead even when its
+		// own DATA is already queued, else the peer drops that DATA as
+		// unknown-stream (live-caught: full flows vanishing under burst).
+		if !w.enqueue(mkframe(1, MuxCmdDATA, 1000)) {
+			t.Fatal("DATA enqueue rejected")
+		}
+		if !w.enqueue(mkframe(1, MuxCmdSYN, 17)) {
+			t.Fatal("SYN enqueue rejected")
+		}
+		var cmds []byte
+		for i := 0; i < 2; i++ {
+			_, cmd := readMux(br, server)
+			cmds = append(cmds, cmd)
+		}
+		if len(cmds) != 2 || cmds[0] != MuxCmdSYN || cmds[1] != MuxCmdDATA {
+			t.Fatalf("SYN yielded to its own DATA: cmds=%v, want [SYN DATA]", cmds)
+		}
+	})
 	t.Run("LargeObfsFrameNoDeadlock", func(t *testing.T) {
 		client, server := net.Pipe()
 		defer client.Close()

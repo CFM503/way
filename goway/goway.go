@@ -40,7 +40,7 @@ import (
 )
 
 const (
-	Version        = "1.8.9"
+	Version        = "1.8.10"
 	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -198,6 +198,14 @@ var (
 	tuiRingPos int // index of next write slot
 
 	tuiRefreshCh = make(chan struct{}, 1)
+
+	// stdoutIsTTY gates terminal control sequences (line-clear etc.): they
+	// clean up live dashboards on a console but pollute piped/file logs.
+	// Pure stdlib (ModeCharDevice), computed once — no extra dependency.
+	stdoutIsTTY = func() bool {
+		fi, err := os.Stdout.Stat()
+		return err == nil && (fi.Mode()&os.ModeCharDevice) != 0
+	}()
 )
 
 func initWindowsConsole() {
@@ -767,7 +775,9 @@ func logDebug(format string, v ...interface{}) {
 		if tuiEnabled {
 			addTuiLog(time.Now().Format("15:04:05") + " " + AnsiCyan + "[DEBUG] " + fmt.Sprintf(format, v...) + AnsiReset)
 		} else {
+			if stdoutIsTTY {
 			fmt.Print("\r\033[K")
+		}
 			log.Printf(AnsiCyan+"[DEBUG] "+format+AnsiReset, v...)
 		}
 	}
@@ -778,7 +788,9 @@ func logInfo(format string, v ...interface{}) {
 		if tuiEnabled {
 			addTuiLog(time.Now().Format("15:04:05") + " " + AnsiGreen + "[INFO] " + fmt.Sprintf(format, v...) + AnsiReset)
 		} else {
+			if stdoutIsTTY {
 			fmt.Print("\r\033[K")
+		}
 			log.Printf(AnsiGreen+"[INFO] "+format+AnsiReset, v...)
 		}
 	}
@@ -790,7 +802,9 @@ func logWarn(format string, v ...interface{}) {
 		if tuiEnabled {
 			addTuiLog(time.Now().Format("15:04:05") + " " + AnsiYellow + "[WARN] " + msg + AnsiReset)
 		} else {
+			if stdoutIsTTY {
 			fmt.Print("\r\033[K")
+		}
 			log.Printf(AnsiYellow+"[WARN] "+format+AnsiReset, v...)
 		}
 		addLogFileEntry("[WARN] " + msg)
@@ -803,7 +817,9 @@ func logError(format string, v ...interface{}) {
 		if tuiEnabled {
 			addTuiLog(time.Now().Format("15:04:05") + " " + AnsiRed + "[ERROR] " + msg + AnsiReset)
 		} else {
+			if stdoutIsTTY {
 			fmt.Print("\r\033[K")
+		}
 			log.Printf(AnsiRed+"[ERROR] "+format+AnsiReset, v...)
 		}
 		addLogFileEntry("[ERROR] " + msg)
@@ -3008,12 +3024,17 @@ func (w *muxOutboundWriter) next() (muxOutboundFrame, bool) {
 	defer w.mu.Unlock()
 	for {
 		// Scan priority queue to find the first unblocked control frame.
-		// A control frame yields only if its own stream still has pending DATA frames.
+		// Only stream-CLOSING controls (FIN/RST) yield while their own
+		// stream still has pending DATA frames — else the peer closes
+		// early and drops the tail. SYN never yields: it creates the
+		// peer-side stream, so yielding it makes the peer drop its own
+		// DATA as unknown-stream (caught live on the RushWay side: full
+		// flows vanishing under burst with zero error logs).
 		// Frames for other streams (or pings) are never head-of-line blocked.
 		for i := 0; i < len(w.priority); i++ {
 			f := w.priority[i]
 			blocked := false
-			if !f.ping && f.streamID != 0 {
+			if !f.ping && f.streamID != 0 && (f.cmd == MuxCmdFIN || f.cmd == MuxCmdRST) {
 				if q := w.streams[f.streamID]; q != nil && len(q.frames) > 0 {
 					blocked = true
 				}
@@ -4176,6 +4197,12 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 		logError("handleServer read auth data err: %v", err)
 		return
 	}
+
+	// Handshake done: drop the accept-time absolute deadline set in
+	// handleConnection (it would otherwise kill this session on its first
+	// write past ConnTimeout — SetReadDeadline refreshes never touch the
+	// write half). Relay loops manage their own rolling read deadlines.
+	_ = wsConn.SetDeadline(time.Time{})
 
 	if cfg.Crypto != nil {
 		cfg.Crypto.TransformInPlace(authData)
