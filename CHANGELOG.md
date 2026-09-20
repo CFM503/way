@@ -4,6 +4,15 @@ All notable changes to the **Way Proxy** project (Goway & Pyway) are documented 
 
 ---
 
+## [v1.8.7] - 2026-09-18
+
+### Goway UDP 批量、变换融合与 QUIC 修剪
+
+- **#2 UDP 批量接收（recvmmsg）**: 新增 `udpBatch`（`x/net/ipv4 ReadBatch`，8 包/批，64KB 缓冲无截断），4 条 UDP 中继循环（server/client × WS/QUIC）的 `ReadFromUDP` 全量切换；无 recvmmsg 的平台（Windows）首次自动降级为单包读，行为一致；`cloneUDPAddr` 深拷贝消除批量槽复用竞态。测量（WSL2 Debian，回环，20000 包积压纯 drain）：单包 ~360MB/s → 批量 ~527MB/s（**~1.45×**，满批 maxBatch=8）；无积压时与单包持平。`x/net` 升为直接依赖（已缓存 v0.28.0，离线可构建）。
+- **#4 发送路径 cipher+mask 单遍融合**：客户端 MUX DRR 写路径取消入队时 `TransformInPlace`，改为写时 `writeMuxFrameFused` 单遍 `word ^ keystream ^ mask64`（偏移语义与两遍版逐字节一致，`TestMuxFusedEncodeEquivalence` 覆盖 0~65535 字节 × 有/无 key）。测量（64KB 帧）：两遍 ~1730MB/s → 单遍 ~3000MB/s（**~1.7×**）。LUT 挑战者（4×256 表，建表成本计入）仅 ~1770MB/s——**LUT 判负，不装船**。
+- **#5 QUIC 修剪**：`MaxIdleTimeout` 60s→30s（死连接更快回收）；补 `MaxIncomingStreams 512` / `MaxIncomingUniStreams 128` 显示上限；`EnableDatagrams` 关（全仓无一处收发 datagram，只耗握手字节）；KeepAlive 保持 15s（防严格 NAT 绑定丢失）。
+- **测试清理**：删除 `goway_v184_test.go`（v1.8.4 时代回归文件，其覆盖已被主测试文件包含）；新增 `TestUDPBatchReadLoopback`、`TestMuxFusedEncodeEquivalence` + 5 组 benchmark。
+
 ## [v1.8.6] - 2026-09-18
 
 ### Goway 公平调度与流量混淆
