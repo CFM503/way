@@ -1989,6 +1989,7 @@ func TestMuxStream_BufferOwnershipAndCloseRace(t *testing.T) {
 		pipeR.Close()
 	}
 }
+
 // TestMuxOutboundWriterFairness proves per-stream fairness of the MUX
 // outbound writer: a bulk stream must not bury an interactive stream
 // (the pre-DRR FIFO failure mode), and control frames must jump the queue.
@@ -2017,7 +2018,7 @@ func TestMuxOutboundWriterFairness(t *testing.T) {
 		defer server.Close()
 		prng := maskPool.Get().(*maskPRNG)
 		defer maskPool.Put(prng)
-		w := newMuxOutboundWriter(client, prng, nil)
+		w := newMuxOutboundWriter(client, prng, nil, true)
 		defer w.close()
 		br := bufio.NewReader(server)
 		// Bulk stream 1 floods first; the writer blocks on the first pipe
@@ -2052,7 +2053,7 @@ func TestMuxOutboundWriterFairness(t *testing.T) {
 		defer server.Close()
 		prng := maskPool.Get().(*maskPRNG)
 		defer maskPool.Put(prng)
-		w := newMuxOutboundWriter(client, prng, nil)
+		w := newMuxOutboundWriter(client, prng, nil, true)
 		defer w.close()
 		br := bufio.NewReader(server)
 		if !w.enqueue(mkframe(1, MuxCmdDATA, 32768)) {
@@ -2089,7 +2090,7 @@ func TestMuxOutboundWriterFairness(t *testing.T) {
 		defer server.Close()
 		prng := maskPool.Get().(*maskPRNG)
 		defer maskPool.Put(prng)
-		w := newMuxOutboundWriter(client, prng, nil)
+		w := newMuxOutboundWriter(client, prng, nil, true)
 		defer w.close()
 		br := bufio.NewReader(server)
 		// Same stream: DATA, DATA, FIN all queued while the writer is
@@ -2120,17 +2121,23 @@ func TestMuxOutboundWriterFairness(t *testing.T) {
 		defer server.Close()
 		prng := maskPool.Get().(*maskPRNG)
 		defer maskPool.Put(prng)
-		w := newMuxOutboundWriter(client, prng, nil)
+		w := newMuxOutboundWriter(client, prng, nil, true)
 		defer w.close()
 		br := bufio.NewReader(server)
 		// SYN creates the peer-side stream: it must lead even when its
 		// own DATA is already queued, else the peer drops that DATA as
 		// unknown-stream (live-caught: full flows vanishing under burst).
-		if !w.enqueue(mkframe(1, MuxCmdDATA, 1000)) {
-			t.Fatal("DATA enqueue rejected")
-		}
+		//
+		// Determinism: SYN is enqueued FIRST, so every interleave yields
+		// [SYN, DATA] — the loop either hasn't run yet (both queued, SYN
+		// jumps via the priority lane) or already emitted SYN alone (then
+		// blocks on the pipe write until the first read). Enqueueing DATA
+		// first would race the loop's first scheduling decision instead.
 		if !w.enqueue(mkframe(1, MuxCmdSYN, 17)) {
 			t.Fatal("SYN enqueue rejected")
+		}
+		if !w.enqueue(mkframe(1, MuxCmdDATA, 1000)) {
+			t.Fatal("DATA enqueue rejected")
 		}
 		var cmds []byte
 		for i := 0; i < 2; i++ {
@@ -2147,7 +2154,7 @@ func TestMuxOutboundWriterFairness(t *testing.T) {
 		defer server.Close()
 		prng := maskPool.Get().(*maskPRNG)
 		defer maskPool.Put(prng)
-		w := newMuxOutboundWriter(client, prng, nil)
+		w := newMuxOutboundWriter(client, prng, nil, true)
 		defer w.close()
 		br := bufio.NewReader(server)
 
@@ -2187,7 +2194,7 @@ func TestMuxOutboundWriterFairness(t *testing.T) {
 		defer server.Close()
 		prng := maskPool.Get().(*maskPRNG)
 		defer maskPool.Put(prng)
-		w := newMuxOutboundWriter(client, prng, nil)
+		w := newMuxOutboundWriter(client, prng, nil, true)
 		defer w.close()
 		br := bufio.NewReader(server)
 
@@ -2210,6 +2217,7 @@ func TestMuxOutboundWriterFairness(t *testing.T) {
 		}
 	})
 }
+
 // TestMuxObfsPadding proves unilateral padding: with -obfs on, DATA
 // frames carry random trailing pad inside the WS payload while the MUX
 // header still declares the true length (old receivers slice by it and
@@ -2228,7 +2236,7 @@ func TestMuxObfsPadding(t *testing.T) {
 		t.Cleanup(func() { maskPool.Put(prng) })
 		cfg := &Config{BufPool: mkpool(), ConnTimeout: 60, Obfs: obfs}
 		s := &MuxClientSession{wsConn: client, cfg: cfg}
-		s.writer = newMuxOutboundWriter(client, prng, nil)
+		s.writer = newMuxOutboundWriter(client, prng, nil, true)
 		t.Cleanup(func() { s.writer.close() })
 		return s, server, bufio.NewReader(server)
 	}
@@ -2362,6 +2370,74 @@ func TestMuxFusedEncodeEquivalence(t *testing.T) {
 			}
 			if got := invertMuxWSFrame(t, fusedOut.Bytes(), crypto); !bytes.Equal(got, raw) {
 				t.Fatalf("key=%q sz=%d fused round-trip mismatch", key, sz)
+			}
+		}
+	}
+}
+
+// TestMuxFrameUnmaskedEqualsTwoPass proves the server egress single-pass
+// unmasked encode is wire-identical to the legacy two-pass path
+// (TransformInPlace on the MUX region + writeWSFramePreallocated unmasked).
+// Offset semantics are region-relative, matching TransformInPlace.
+func TestMuxFrameUnmaskedEqualsTwoPass(t *testing.T) {
+	invertUnmasked := func(wire []byte, crypto *Crypto) []byte {
+		if len(wire) < 2 || wire[0]&0x0F != 0x2 {
+			t.Fatalf("bad unmasked WS opcode/len: %d bytes", len(wire))
+		}
+		if wire[1]&128 != 0 {
+			t.Fatalf("server frame must be unmasked: byte1=%#x", wire[1])
+		}
+		var wsLen, hdrLen int
+		switch wire[1] & 0x7F {
+		case 126:
+			wsLen = int(binary.BigEndian.Uint16(wire[2:4]))
+			hdrLen = 4
+		case 127:
+			wsLen = int(binary.BigEndian.Uint64(wire[2:10]))
+			hdrLen = 10
+		default:
+			wsLen = int(wire[1] & 0x7F)
+			hdrLen = 2
+		}
+		region := append([]byte(nil), wire[hdrLen:hdrLen+wsLen]...)
+		if crypto != nil {
+			crypto.TransformInPlace(region)
+		}
+		return region
+	}
+	for _, key := range []string{"", "unmask-key"} {
+		var crypto *Crypto
+		if key != "" {
+			crypto = NewCrypto(key)
+		}
+		for _, sz := range []int{0, 7, 100, 125, 126, 1000, 7000, 65535, 70000} {
+			raw := make([]byte, sz)
+			mrand.New(mrand.NewSource(int64(sz) + 3)).Read(raw)
+			// Reference two-pass: cipher at "enqueue", unmasked header write.
+			ref := make([]byte, sz+32)
+			copy(ref[14:], raw)
+			if crypto != nil {
+				crypto.TransformInPlace(ref[14 : 14+sz])
+			}
+			var refOut bytes.Buffer
+			if err := writeWSFramePreallocated(&refOut, ref, 14, sz, 0x2, false); err != nil {
+				t.Fatal(err)
+			}
+			// Single-pass unmasked fused encode over a pristine copy.
+			unm := make([]byte, sz+32)
+			copy(unm[14:], raw)
+			var unmOut bytes.Buffer
+			if err := writeMuxFrameUnmasked(&unmOut, unm, 14, sz, 0x2, crypto); err != nil {
+				t.Fatal(err)
+			}
+			if refOut.Len() != unmOut.Len() {
+				t.Fatalf("key=%q sz=%d len mismatch: ref=%d unmasked=%d", key, sz, refOut.Len(), unmOut.Len())
+			}
+			if !bytes.Equal(refOut.Bytes(), unmOut.Bytes()) {
+				t.Fatalf("key=%q sz=%d wire mismatch between two-pass and unmasked single-pass", key, sz)
+			}
+			if got := invertUnmasked(unmOut.Bytes(), crypto); !bytes.Equal(got, raw) {
+				t.Fatalf("key=%q sz=%d unmasked round-trip mismatch", key, sz)
 			}
 		}
 	}
