@@ -4,6 +4,19 @@ All notable changes to the **Way Proxy** project (Goway & Pyway) are documented 
 
 ---
 
+## [v1.8.11] - 2026-09-22
+
+### Goway 服务端 MUX 专用写协程与 unmasked 单遍编码（RushWay 联动 Phase 2）
+
+- **服务端出口去串行 (P1)**: `MuxServerSession.SendFrame` 不再在整个 BufPool 取缓冲 + `TransformInPlace` + socket 写期间持有 `writeMu`。帧入队到 per-session `muxOutboundWriter`（与客户端相同的 DRR + 优先级 lane 调度器），cipher 在专职写协程单遍完成；锁不跨网络 IO。
+- **`writeMuxFrameUnmasked`**: 服务端→客户端帧永不 mask——单遍组装 unmasked WS 头并对预编码 MUX 区域做 region-relative XOR（语义与 `TransformInPlace` 逐字节一致）。obfs 尾部仍在声明长度区域内，按声明长度切片忽略。
+- **`muxOutboundWriter.masked`**: 构造函数改为 `newMuxOutboundWriter(conn, prng, crypto, masked bool)`；客户端/测试 `masked=true`（既有 fused mask 路径），服务端 `masked=false`。Ping 帧 mask 位跟随 writer。
+- **`MuxServerSession.writer`**: `handleServerMux` 构造 `newMuxOutboundWriter(wsConn, nil, cfg.Crypto, false)`；`Close` 在关连接后 `writer.close()` 排空并归还池缓冲。无 writer 的裸测试夹具回退 `sendFrameInline`（旧直写路径）。
+- **线格式不变**: unmasked 服务端 WS、MUX 7 字节头、XOR 覆盖 header+payload（+obfs 尾）；与 v1.8.10 及 RushWay 字节兼容。
+- **回归**: 新增 `TestMuxFrameUnmaskedEqualsTwoPass`（两遍 vs 单遍 unmasked 全长度 × 有/无 key 逐字节等价 + 往返）；`newMuxOutboundWriter` 全部调用点升为 4 参。`go vet` 干净；`go test -count=1 -timeout 240s` 全绿（约 60s）。
+- **基准（Windows 回环 n=3 中位，仅供参考）**: 相对 v1.8.10 baseline 同机 A/B 胜负格互换、落在噪声带内；本版本以结构正确性与测试证据为准，不宣称吞吐提升。
+- **说明**: 早先同日交接中曾提前写入“已完成”记录，以本条及 `goway/AI_HANDOFF.md` 为准。
+
 ## [v1.8.10] - 2026-09-20
 
 ### Goway SYN 保序修正、服务端长连接修复与日志终端适配
@@ -151,3 +164,7 @@ All notable changes to the **Way Proxy** project (Goway & Pyway) are documented 
 - **0-RTT 多路复用 (Mux 架构)**: 单一主干长连接并发多虚拟 Stream 通道。
 - **Linux 内核级零拷贝与优化**: `TCP_QUICKACK` 消除 40ms 延迟，支持 `SO_REUSEPORT` 多核负载均衡。
 - **低内存高并发设计**: 应用缓冲区默认优化为 64KB，提升 CPU L1/L2 缓存命中率。
+
+## [Unreleased]
+
+_(no open entries — Phase 2 server writer shipped in v1.8.11)_

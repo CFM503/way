@@ -40,7 +40,7 @@ import (
 )
 
 const (
-	Version        = "1.8.10"
+	Version        = "1.8.11"
 	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -776,8 +776,8 @@ func logDebug(format string, v ...interface{}) {
 			addTuiLog(time.Now().Format("15:04:05") + " " + AnsiCyan + "[DEBUG] " + fmt.Sprintf(format, v...) + AnsiReset)
 		} else {
 			if stdoutIsTTY {
-			fmt.Print("\r\033[K")
-		}
+				fmt.Print("\r\033[K")
+			}
 			log.Printf(AnsiCyan+"[DEBUG] "+format+AnsiReset, v...)
 		}
 	}
@@ -789,8 +789,8 @@ func logInfo(format string, v ...interface{}) {
 			addTuiLog(time.Now().Format("15:04:05") + " " + AnsiGreen + "[INFO] " + fmt.Sprintf(format, v...) + AnsiReset)
 		} else {
 			if stdoutIsTTY {
-			fmt.Print("\r\033[K")
-		}
+				fmt.Print("\r\033[K")
+			}
 			log.Printf(AnsiGreen+"[INFO] "+format+AnsiReset, v...)
 		}
 	}
@@ -803,8 +803,8 @@ func logWarn(format string, v ...interface{}) {
 			addTuiLog(time.Now().Format("15:04:05") + " " + AnsiYellow + "[WARN] " + msg + AnsiReset)
 		} else {
 			if stdoutIsTTY {
-			fmt.Print("\r\033[K")
-		}
+				fmt.Print("\r\033[K")
+			}
 			log.Printf(AnsiYellow+"[WARN] "+format+AnsiReset, v...)
 		}
 		addLogFileEntry("[WARN] " + msg)
@@ -818,8 +818,8 @@ func logError(format string, v ...interface{}) {
 			addTuiLog(time.Now().Format("15:04:05") + " " + AnsiRed + "[ERROR] " + msg + AnsiReset)
 		} else {
 			if stdoutIsTTY {
-			fmt.Print("\r\033[K")
-		}
+				fmt.Print("\r\033[K")
+			}
 			log.Printf(AnsiRed+"[ERROR] "+format+AnsiReset, v...)
 		}
 		addLogFileEntry("[ERROR] " + msg)
@@ -1270,6 +1270,58 @@ func writeMuxFrameFused(w io.Writer, buf []byte, payloadOffset int, payloadLen i
 	}
 
 	_, err := w.Write(buf[frameStart : frameStart+hdrLen+4+payloadLen])
+	return err
+}
+
+// writeMuxFrameUnmasked wraps a pre-encoded MUX region in an UNMASKED WS
+// frame while applying the cipher keystream in a single pass — the server
+// egress counterpart of writeMuxFrameFused. Server→client frames are never
+// masked, so there is no mask key; XOR is region-relative and matches
+// Crypto.TransformInPlace (offset resets per call region). The obfs tail,
+// if any, sits inside the declared-length region and is ignored by
+// receivers that slice by the MUX header length. crypto == nil is a pure
+// header assembly pass.
+func writeMuxFrameUnmasked(w io.Writer, buf []byte, payloadOffset int, payloadLen int, opcode byte, crypto *Crypto) error {
+	hdrLen := 2
+	if payloadLen >= 65536 {
+		hdrLen = 10
+	} else if payloadLen >= 126 {
+		hdrLen = 4
+	}
+
+	frameStart := payloadOffset - hdrLen
+	if frameStart < 0 {
+		return errors.New("buffer pre-padding is insufficient")
+	}
+
+	buf[frameStart] = 0b10000000 | opcode
+
+	if payloadLen < 126 {
+		buf[frameStart+1] = byte(payloadLen)
+	} else if payloadLen < 65536 {
+		buf[frameStart+1] = 126
+		binary.BigEndian.PutUint16(buf[frameStart+2:frameStart+4], uint16(payloadLen))
+	} else {
+		buf[frameStart+1] = 127
+		binary.BigEndian.PutUint64(buf[frameStart+2:frameStart+10], uint64(payloadLen))
+	}
+
+	region := buf[payloadOffset : payloadOffset+payloadLen]
+	if crypto != nil {
+		ek := crypto.expandedKey
+		i := 0
+		for ; i+8 <= payloadLen; i += 8 {
+			off := i & (cryptoChunkSize - 1)
+			binary.NativeEndian.PutUint64(region[i:],
+				binary.NativeEndian.Uint64(region[i:])^
+					binary.NativeEndian.Uint64(ek[off:]))
+		}
+		for ; i < payloadLen; i++ {
+			region[i] ^= ek[i&(cryptoChunkSize-1)]
+		}
+	}
+
+	_, err := w.Write(buf[frameStart : frameStart+hdrLen+payloadLen])
 	return err
 }
 
@@ -2887,6 +2939,7 @@ type muxOutboundWriter struct {
 	conn     net.Conn
 	prng     *maskPRNG
 	crypto   *Crypto
+	masked   bool
 	mu       sync.Mutex
 	cond     *sync.Cond
 	streams  map[uint32]*muxStreamQueue
@@ -2915,11 +2968,12 @@ const (
 	obfsPadMax = 1400
 )
 
-func newMuxOutboundWriter(conn net.Conn, prng *maskPRNG, crypto *Crypto) *muxOutboundWriter {
+func newMuxOutboundWriter(conn net.Conn, prng *maskPRNG, crypto *Crypto, masked bool) *muxOutboundWriter {
 	w := &muxOutboundWriter{
 		conn:    conn,
 		prng:    prng,
 		crypto:  crypto,
+		masked:  masked,
 		streams: make(map[uint32]*muxStreamQueue),
 		done:    make(chan struct{}),
 	}
@@ -2945,12 +2999,15 @@ func frameWireLen(f muxOutboundFrame) int {
 
 func (w *muxOutboundWriter) writeFrame(f muxOutboundFrame) error {
 	if f.ping {
-		return writeWSFrame(w.conn, nil, 0x9, true)
+		return writeWSFrame(w.conn, nil, 0x9, w.masked)
 	}
 	if f.bPtr == nil || f.pool == nil {
 		return errors.New("invalid mux outbound frame")
 	}
-	return writeMuxFrameFused(w.conn, *f.bPtr, f.payloadOff, f.payloadLen, f.opcode, w.prng, w.crypto)
+	if w.masked {
+		return writeMuxFrameFused(w.conn, *f.bPtr, f.payloadOff, f.payloadLen, f.opcode, w.prng, w.crypto)
+	}
+	return writeMuxFrameUnmasked(w.conn, *f.bPtr, f.payloadOff, f.payloadLen, f.opcode, w.crypto)
 }
 
 // dropAllLocked releases every queued frame and resets scheduling state.
@@ -3197,7 +3254,7 @@ func (s *MuxClientSession) decrementActiveStreams() {
 func newMuxClientSession(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, cfg *Config) *MuxClientSession {
 	prng := maskPool.Get().(*maskPRNG)
 	s := &MuxClientSession{wsConn: wsConn, br: br, wsTCPConn: wsTCPConn, cfg: cfg, streams: make(map[uint32]*MuxStream), closed: make(chan struct{}), prng: prng}
-	s.writer = newMuxOutboundWriter(wsConn, prng, cfg.Crypto)
+	s.writer = newMuxOutboundWriter(wsConn, prng, cfg.Crypto, true)
 	go s.readLoop()
 	go s.heartbeatLoop()
 	return s
@@ -3665,12 +3722,14 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 }
 
 // MuxServerSession handles a single WebSocket tunnel on the server side.
+// Egress is serialized by a dedicated muxOutboundWriter (same DRR +
+// priority scheduler as the client) — there is no writeMu across IO.
 type MuxServerSession struct {
 	wsConn    net.Conn
 	br        *bufio.Reader
 	wsTCPConn *net.TCPConn
 	cfg       *Config
-	writeMu   sync.Mutex
+	writer    *muxOutboundWriter
 	streams   map[uint32]*MuxServerStream
 	streamsMu sync.RWMutex
 	closed    chan struct{}
@@ -3852,6 +3911,9 @@ func (s *MuxServerSession) Close() {
 	s.closeOnce.Do(func() {
 		close(s.closed)
 		s.wsConn.Close()
+		if s.writer != nil {
+			s.writer.close()
+		}
 
 		s.streamsMu.Lock()
 		activeStreams := make([]*MuxServerStream, 0, len(s.streams))
@@ -3873,14 +3935,57 @@ func (s *MuxServerSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 		return errors.New("mux server session closed")
 	default:
 	}
-
+	if s.writer == nil {
+		return s.sendFrameInline(streamID, cmd, payload)
+	}
 	payloadLen := len(payload)
 	if payloadLen > 65535 {
 		return fmt.Errorf("mux server frame payload %d exceeds maximum uint16 length (65535)", payloadLen)
 	}
+	frameLen := MuxHeaderLen + payloadLen
+	bPtr := s.cfg.BufPool.Get().(*[]byte)
+	buf := *bPtr
+	if frameLen+14 > len(buf) {
+		s.cfg.BufPool.Put(bPtr)
+		return errors.New("mux server frame exceeds buffer")
+	}
+	frameStart := 14
+	binary.BigEndian.PutUint32(buf[frameStart:frameStart+4], streamID)
+	buf[frameStart+4] = cmd
+	binary.BigEndian.PutUint16(buf[frameStart+5:frameStart+7], uint16(payloadLen))
+	if payloadLen > 0 {
+		copy(buf[frameStart+7:frameStart+7+payloadLen], payload)
+	}
+	// NB: cipher is applied at write time by writeMuxFrameUnmasked (single
+	// pass, unmasked server frames); do NOT TransformInPlace here.
+	padLen := 0
+	if cmd == MuxCmdDATA && s.cfg.Obfs {
+		if room := len(buf) - 14 - frameLen; room > 0 {
+			if room > obfsPadMax {
+				room = obfsPadMax
+			}
+			padLen = mrand.Intn(room + 1)
+			mrand.Read(buf[frameStart+frameLen : frameStart+frameLen+padLen])
+		}
+	}
+	frame := muxOutboundFrame{bPtr: bPtr, pool: s.cfg.BufPool, payloadOff: frameStart, payloadLen: frameLen + padLen, opcode: 0x2, streamID: streamID, cmd: cmd}
+	if !s.writer.enqueue(frame) {
+		return errors.New("mux server session writer closed")
+	}
+	return nil
+}
 
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+// sendFrameInline is the legacy direct-write path used only when a bare
+// MuxServerSession fixture has no writer (unit tests that construct the
+// struct literal without handleServerMux). Production always sets writer.
+func (s *MuxServerSession) sendFrameInline(streamID uint32, cmd byte, payload []byte) error {
+	if s.wsConn == nil || s.cfg == nil || s.cfg.BufPool == nil {
+		return errors.New("mux server session not initialized")
+	}
+	payloadLen := len(payload)
+	if payloadLen > 65535 {
+		return fmt.Errorf("mux server frame payload %d exceeds maximum uint16 length (65535)", payloadLen)
+	}
 
 	frameLen := MuxHeaderLen + payloadLen
 	bPtr := s.cfg.BufPool.Get().(*[]byte)
@@ -3942,6 +4047,8 @@ func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 		streams:   make(map[uint32]*MuxServerStream),
 		closed:    make(chan struct{}),
 	}
+	// Server never masks; prng unused by the unmasked write path.
+	session.writer = newMuxOutboundWriter(wsConn, nil, cfg.Crypto, false)
 	defer session.Close()
 
 	logInfo("[SERVER] Mux Session active")
