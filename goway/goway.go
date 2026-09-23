@@ -1,3 +1,14 @@
+// GOWAY standing engineering rule (user mandate, 2026-09-23, permanent):
+// every change to this codebase must be a FORWARD optimization; reverse
+// (regressive) changes are NEVER allowed. Before completing any
+// performance-relevant change, measure same-machine medians against the
+// released baseline v1.8.11 on the shared benchmark harness (throughput
+// c1/c8/c32, CPU, RSS; n>=5, setup+steady) with no metric regressed beyond
+// noise, and record before/after numbers in goway/AI_HANDOFF.md — no
+// numbers, no completion. Every AI taking over this project must read
+// goway/AI_HANDOFF.md first and preserve this rule verbatim. If the bar is
+// not met: tune it, gate it behind an opt-in flag whose default matches
+// baseline behavior, or revert it.
 package main
 
 import (
@@ -40,7 +51,7 @@ import (
 )
 
 const (
-	Version        = "1.8.11"
+	Version        = "1.8.12"
 	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -2588,11 +2599,13 @@ func monitorStats(shutdown <-chan struct{}) {
 // --- Mux (Multiplexing) Subsystem ---
 
 const (
-	MuxCmdSYN    byte = 0x01 // New Stream: [TargetLen uint16][TargetAddr string][InitialData...]
-	MuxCmdDATA   byte = 0x02 // Stream Data: [Data...]
-	MuxCmdFIN    byte = 0x03 // Stream Half-Close / EOF
-	MuxCmdRST    byte = 0x04 // Stream Abrupt Reset / Error
-	MuxHeaderLen      = 7    // 4B StreamID + 1B Cmd + 2B PayloadLen
+	MuxCmdSYN     byte = 0x01 // New Stream: [TargetLen uint16][TargetAddr string][InitialData...]
+	MuxCmdDATA    byte = 0x02 // Stream Data: [Data...]
+	MuxCmdFIN     byte = 0x03 // Stream Half-Close / EOF
+	MuxCmdRST     byte = 0x04 // Stream Abrupt Reset / Error
+	MuxCmdVERSION byte = 0x05 // W3: [Version uint8][WindowKib uint16 BE], stream id 0
+	MuxCmdWINDOW  byte = 0x06 // W3: [CreditBytes uint32 BE]
+	MuxHeaderLen       = 7    // 4B StreamID + 1B Cmd + 2B PayloadLen
 
 	// Client-side Mux stream buffer limit.
 	// Kept lower to reduce per-stream memory usage on client instances.
@@ -2604,7 +2617,125 @@ const (
 	muxServerStreamBufferLimit = 8 * 1024 * 1024
 	muxStreamIngressQueue      = 128
 	muxPushStallTimeout        = 15 * time.Second
+
+	// W3 flow control: version advertised in VERSION frames, initial
+	// per-stream receive window (KiB), and the consumed-byte threshold
+	// that triggers a WINDOW refund. Probe-negotiated: peers predating
+	// these commands skip them silently, keeping v1 behavior.
+	muxProtoVersion     byte = 1
+	muxInitialWindowKib      = 8192
+	muxWindowRefresh         = 1024 * 1024
+	muxWindowMinKib          = 64
 )
+
+// creditGate throttles sends on one stream once the peer's VERSION frame
+// has been observed. Before negotiation it is Unbounded (v1 behavior);
+// Close switches it to pass-through so a dying stream can never park a
+// sender waiting for WINDOWs that will never arrive.
+//
+// Forward-optimization note (2026-09-23): the hot path (Acquire fast
+// attempt, Release) is lock-free — atomics only. enableMu serializes the
+// rare Enable/Close state transitions alone, so steady-state sends never
+// take a mutex (the previous per-chunk Mutex/Unlock pair is gone).
+type creditGate struct {
+	enableMu  sync.Mutex    // serializes Enable/Close transitions only
+	state     atomic.Int32  // gateUnbounded | gateBounded | gateClosed
+	window    atomic.Int64  // stored before state flips to bounded
+	available atomic.Int64  // bounded credit, CAS-consumed
+	credit    chan struct{} // buffered(1): credit-release signal
+	done      chan struct{} // closed by Close: wakes every waiter
+}
+
+const (
+	gateUnbounded int32 = 0
+	gateBounded   int32 = 1
+	gateClosed    int32 = 2
+)
+
+func newCreditGate() *creditGate {
+	return &creditGate{
+		credit: make(chan struct{}, 1),
+		done:   make(chan struct{}),
+	}
+}
+
+// Enable enters bounded mode with the advertised window (idempotent:
+// the first VERSION wins and cannot refill a live window). window and
+// available are stored before the state flip so any Acquire that observes
+// gateBounded also observes a fully initialized window.
+func (g *creditGate) Enable(window int64) {
+	if window < 1 {
+		window = 1
+	}
+	g.enableMu.Lock()
+	if g.state.Load() == gateUnbounded {
+		g.window.Store(window)
+		g.available.Store(window)
+		g.state.Store(gateBounded)
+	}
+	g.enableMu.Unlock()
+}
+
+// Release credits consumed bytes back (capped at the advertised window).
+// Lock-free CAS; the token send wakes one blocked Acquire (buffered(1)
+// preserves a pending token across races, matching the old semantics).
+func (g *creditGate) Release(n int64) {
+	if n <= 0 || g.state.Load() != gateBounded {
+		return
+	}
+	w := g.window.Load()
+	for {
+		avail := g.available.Load()
+		next := avail + n
+		if next > w {
+			next = w
+		}
+		if g.available.CompareAndSwap(avail, next) {
+			break
+		}
+	}
+	select {
+	case g.credit <- struct{}{}:
+	default:
+	}
+}
+
+// Close wakes all waiters; subsequent Acquire calls pass through.
+func (g *creditGate) Close() {
+	g.enableMu.Lock()
+	if g.state.Load() != gateClosed {
+		g.state.Store(gateClosed)
+		close(g.done)
+	}
+	g.enableMu.Unlock()
+}
+
+// Acquire consumes n bytes of credit, blocking while the window is
+// exhausted. Returns false only when the caller's wait channel (stream
+// closed) fires first; unbounded/closed states return true immediately.
+// n is clamped to the window so an oversized frame cannot deadlock.
+// Fast path: one state load + one CAS, no mutex.
+func (g *creditGate) Acquire(n int, wait <-chan struct{}) bool {
+	need := int64(n)
+	for {
+		if g.state.Load() != gateBounded {
+			return true
+		}
+		if w := g.window.Load(); need > w {
+			need = w
+		}
+		avail := g.available.Load()
+		if avail >= need && g.available.CompareAndSwap(avail, avail-need) {
+			return true
+		}
+		select {
+		case <-g.credit:
+		case <-g.done:
+		case <-wait:
+			return false
+		}
+	}
+}
 
 // muxDataFrame encapsulates a payload slice along with ownership of a pooled buffer from sync.Pool.
 type muxDataFrame struct {
@@ -2644,10 +2775,14 @@ type MuxStream struct {
 	onClose     func()
 	readMu      sync.Mutex
 	ingress     chan muxDataFrame
+	// W3 upload credit: bounded once the server's VERSION is observed.
+	sendGate *creditGate
+	// W3 refund accumulator for WINDOW frames (bytes consumed locally).
+	refundPending int64
 }
 
 func newMuxStream(id uint32, session MuxSessionInterface) *MuxStream {
-	st := &MuxStream{id: id, session: session, readChan: make(chan muxDataFrame, 128), closed: make(chan struct{}), hasSpace: make(chan struct{}, 1), ingress: make(chan muxDataFrame, muxStreamIngressQueue)}
+	st := &MuxStream{id: id, session: session, readChan: make(chan muxDataFrame, 128), closed: make(chan struct{}), hasSpace: make(chan struct{}, 1), ingress: make(chan muxDataFrame, muxStreamIngressQueue), sendGate: newCreditGate()}
 	go st.deliveryLoop()
 	return st
 }
@@ -2840,6 +2975,10 @@ func (s *MuxStream) Write(p []byte) (n int, err error) {
 		if chunk > maxChunk {
 			chunk = maxChunk
 		}
+		// W3 upload gate: bounded once the peer's VERSION arrived.
+		if !s.sendGate.Acquire(chunk, s.closed) {
+			return total - len(p), errors.New("stream closed")
+		}
 		if err := s.session.SendFrame(s.id, MuxCmdDATA, p[:chunk]); err != nil {
 			return total - len(p), err
 		}
@@ -2877,6 +3016,7 @@ func (s *MuxStream) cleanup() {
 func (s *MuxStream) Close() error {
 	s.closeOnce.Do(func() {
 		close(s.closed)
+		s.sendGate.Close()
 		s.session.SendFrame(s.id, MuxCmdFIN, nil)
 		s.session.RemoveStream(s.id)
 		s.cleanup()
@@ -2890,6 +3030,7 @@ func (s *MuxStream) Close() error {
 func (s *MuxStream) Reset() {
 	s.closeOnce.Do(func() {
 		close(s.closed)
+		s.sendGate.Close()
 		s.session.SendFrame(s.id, MuxCmdRST, nil)
 		s.session.RemoveStream(s.id)
 		s.cleanup()
@@ -3228,6 +3369,8 @@ type MuxClientSession struct {
 	prng          *maskPRNG
 	writer        *muxOutboundWriter
 	activeStreams atomic.Int64
+	// W3: peer-advertised receive window in bytes (0 = not negotiated).
+	peerWindow atomic.Int64
 }
 
 func (s *MuxClientSession) ActiveStreams() int64 {
@@ -3255,9 +3398,50 @@ func newMuxClientSession(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPCo
 	prng := maskPool.Get().(*maskPRNG)
 	s := &MuxClientSession{wsConn: wsConn, br: br, wsTCPConn: wsTCPConn, cfg: cfg, streams: make(map[uint32]*MuxStream), closed: make(chan struct{}), prng: prng}
 	s.writer = newMuxOutboundWriter(wsConn, prng, cfg.Crypto, true)
+	// W3 version negotiation: advertise our version + initial receive
+	// window right after the session handshake. Old servers skip the
+	// unknown command; new servers answer with their own VERSION.
+	s.SendFrame(0, MuxCmdVERSION, []byte{muxProtoVersion, byte(muxInitialWindowKib >> 8), byte(muxInitialWindowKib & 0xff)})
 	go s.readLoop()
 	go s.heartbeatLoop()
 	return s
+}
+
+// applyPeerVersion records the peer's advertised window (first VERSION
+// wins) and retroactively enables bounded sends on every live stream.
+func (s *MuxClientSession) applyPeerVersion(payload []byte) {
+	if len(payload) != 3 || payload[0] < 1 || s.peerWindow.Load() != 0 {
+		return
+	}
+	kib := int(binary.BigEndian.Uint16(payload[1:3]))
+	if kib < muxWindowMinKib {
+		kib = muxWindowMinKib
+	}
+	window := int64(kib) * 1024
+	s.peerWindow.Store(window)
+	s.streamsMu.RLock()
+	for _, st := range s.streams {
+		st.sendGate.Enable(window)
+	}
+	s.streamsMu.RUnlock()
+	logDebug("[CLIENT-MUX] peer VERSION received; send window enabled (kib=%d)", kib)
+}
+
+// applyWindow refunds upload credit for one stream.
+func (s *MuxClientSession) applyWindow(streamID uint32, payload []byte) {
+	if len(payload) != 4 {
+		return
+	}
+	credit := binary.BigEndian.Uint32(payload)
+	if credit == 0 || uint64(credit) > uint64(muxInitialWindowKib)*1024*64 {
+		return
+	}
+	s.streamsMu.RLock()
+	st, ok := s.streams[streamID]
+	s.streamsMu.RUnlock()
+	if ok {
+		st.sendGate.Release(int64(credit))
+	}
 }
 
 func (s *MuxClientSession) heartbeatLoop() {
@@ -3401,6 +3585,18 @@ func (s *MuxClientSession) readLoop() {
 			continue
 		}
 		payload := data[MuxHeaderLen : MuxHeaderLen+payloadLen]
+
+		// W3 control frames arrive before the stream lookup: VERSION uses
+		// stream id 0 (not in the map) and WINDOW must not be swallowed
+		// by the unknown-stream skip.
+		if cmd == MuxCmdVERSION {
+			s.applyPeerVersion(payload)
+			continue
+		}
+		if cmd == MuxCmdWINDOW {
+			s.applyWindow(streamID, payload)
+			continue
+		}
 
 		s.streamsMu.RLock()
 		st, ok := s.streams[streamID]
@@ -3613,6 +3809,10 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 		streamID = atomic.AddUint32(&session.nextStreamID, 1)
 	}
 	stream := newMuxStream(streamID, session)
+	// W3: start bounded if the server already advertised its window.
+	if w := session.peerWindow.Load(); w > 0 {
+		stream.sendGate.Enable(w)
+	}
 	stream.onClose = func() {
 		session.decrementActiveStreams()
 	}
@@ -3699,6 +3899,8 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 		bPtr := cfg.BufPool.Get().(*[]byte)
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
+		// W3 receive-side refund accumulator (client -> server WINDOW).
+		var refundPending int64
 		for {
 			nr, errRead := stream.Read(buf)
 			if nr > 0 {
@@ -3707,6 +3909,18 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 					return
 				}
 				stats.AddBytes(0, int64(nr))
+				// Only accumulate once the server negotiated.
+				if session.peerWindow.Load() == 0 {
+					refundPending = 0
+				} else {
+					refundPending += int64(nr)
+					if refundPending >= muxWindowRefresh {
+						var wb [4]byte
+						binary.BigEndian.PutUint32(wb[:], uint32(refundPending))
+						refundPending = 0
+						_ = session.SendFrame(streamID, MuxCmdWINDOW, wb[:])
+					}
+				}
 			}
 			if errRead != nil {
 				errCh <- errRead
@@ -3734,6 +3948,8 @@ type MuxServerSession struct {
 	streamsMu sync.RWMutex
 	closed    chan struct{}
 	closeOnce sync.Once
+	// W3: peer-advertised receive window in bytes (0 = not negotiated).
+	peerWindow atomic.Int64
 }
 
 type MuxServerStream struct {
@@ -3748,12 +3964,41 @@ type MuxServerStream struct {
 	queuedBytes int64
 	hasSpace    chan struct{}
 	ingress     chan muxDataFrame
+	// W3 upload credit toward the client: bounded once the client's
+	// VERSION frame is observed.
+	sendGate *creditGate
+	// W3 refund accumulator (bytes written to the target -> WINDOW).
+	refundPending int64
 }
 
 func newMuxServerStream(id uint32, session *MuxServerSession) *MuxServerStream {
-	st := &MuxServerStream{id: id, session: session, writeChan: make(chan muxDataFrame, 256), closed: make(chan struct{}), hasSpace: make(chan struct{}, 1), ingress: make(chan muxDataFrame, muxStreamIngressQueue)}
+	st := &MuxServerStream{id: id, session: session, writeChan: make(chan muxDataFrame, 256), closed: make(chan struct{}), hasSpace: make(chan struct{}, 1), ingress: make(chan muxDataFrame, muxStreamIngressQueue), sendGate: newCreditGate()}
+	if w := session.peerWindow.Load(); w > 0 {
+		st.sendGate.Enable(w)
+	}
 	go st.deliveryLoop()
 	return st
+}
+
+// addConsumed books n bytes written toward the target and emits a WINDOW
+// refund once the refresh threshold is reached. Single-goroutine per
+// stream (handleNewStream hands off to its pump before any concurrency).
+func (s *MuxServerStream) addConsumed(n int) {
+	if n <= 0 {
+		return
+	}
+	if s.session.peerWindow.Load() == 0 {
+		s.refundPending = 0
+		return
+	}
+	s.refundPending += int64(n)
+	if s.refundPending < muxWindowRefresh {
+		return
+	}
+	var wb [4]byte
+	binary.BigEndian.PutUint32(wb[:], uint32(s.refundPending))
+	s.refundPending = 0
+	_ = s.session.SendFrame(s.id, MuxCmdWINDOW, wb[:])
 }
 
 func (s *MuxServerStream) enqueueDataFrame(frame muxDataFrame) bool {
@@ -3890,6 +4135,7 @@ func (s *MuxServerStream) targetConnSnapshot() net.Conn {
 func (s *MuxServerStream) Close() {
 	s.closeOnce.Do(func() {
 		close(s.closed)
+		s.sendGate.Close()
 		s.closeTargetConn()
 		s.bufMu.Lock()
 		s.queuedBytes = 0
@@ -4051,6 +4297,11 @@ func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 	session.writer = newMuxOutboundWriter(wsConn, nil, cfg.Crypto, false)
 	defer session.Close()
 
+	// W3 version negotiation: advertise our version + initial receive
+	// window right after the session handshake. Old clients skip the
+	// unknown command; new clients answer with their own VERSION.
+	_ = session.SendFrame(0, MuxCmdVERSION, []byte{muxProtoVersion, byte(muxInitialWindowKib >> 8), byte(muxInitialWindowKib & 0xff)})
+
 	logInfo("[SERVER] Mux Session active")
 
 	bPtr := cfg.BufPool.Get().(*[]byte)
@@ -4085,6 +4336,41 @@ func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 			continue
 		}
 		payload := data[MuxHeaderLen : MuxHeaderLen+payloadLen]
+
+		// W3 control frames: VERSION records the client's window (first
+		// wins) and enables bounded server->client sends on live streams;
+		// WINDOW credits a specific stream's upload gate.
+		if cmd == MuxCmdVERSION {
+			if len(payload) == 3 && payload[0] >= 1 && session.peerWindow.Load() == 0 {
+				kib := int(binary.BigEndian.Uint16(payload[1:3]))
+				if kib < muxWindowMinKib {
+					kib = muxWindowMinKib
+				}
+				window := int64(kib) * 1024
+				session.peerWindow.Store(window)
+				session.streamsMu.RLock()
+				for _, st := range session.streams {
+					st.sendGate.Enable(window)
+				}
+				session.streamsMu.RUnlock()
+				logDebug("[SERVER-MUX] peer VERSION received; send window enabled (kib=%d)", kib)
+			}
+			continue
+		}
+		if cmd == MuxCmdWINDOW {
+			if len(payload) == 4 {
+				credit := binary.BigEndian.Uint32(payload)
+				if credit > 0 && uint64(credit) <= uint64(muxInitialWindowKib)*1024*64 {
+					session.streamsMu.RLock()
+					st, ok := session.streams[streamID]
+					session.streamsMu.RUnlock()
+					if ok {
+						st.sendGate.Release(int64(credit))
+					}
+				}
+			}
+			continue
+		}
 
 		switch cmd {
 		case MuxCmdSYN:
@@ -4183,6 +4469,7 @@ func (s *MuxServerSession) handleNewStream(st *MuxServerStream, targetStr string
 			return
 		}
 		stats.AddBytes(int64(len(initialData)), 0)
+		st.addConsumed(len(initialData))
 	}
 
 	logDebug("[SERVER-MUX] Stream %d -> %s", st.id, targetStr)
@@ -4200,8 +4487,11 @@ func (s *MuxServerSession) handleNewStream(st *MuxServerStream, targetStr string
 					return
 				}
 				data := frame.data
+				// Receive direction (client -> target): no send-credit
+				// charge here; book consumption for WINDOW refunds instead.
 				_, err := targetConn.Write(data)
 				st.consumedBytes(len(data))
+				st.addConsumed(len(data))
 				frame.release()
 				if err != nil {
 					st.Close()
@@ -4222,6 +4512,11 @@ func (s *MuxServerSession) handleNewStream(st *MuxServerStream, targetStr string
 	for {
 		nr, errRead := targetConn.Read(readBuf)
 		if nr > 0 {
+			// W3 server->client send gate: credit granted by the client's
+			// WINDOW frames; unbounded until its VERSION arrived.
+			if !st.sendGate.Acquire(nr, st.closed) {
+				return
+			}
 			if errWrite := s.SendFrame(st.id, MuxCmdDATA, readBuf[:nr]); errWrite != nil {
 				return
 			}
