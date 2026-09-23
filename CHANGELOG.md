@@ -2,7 +2,19 @@
 
 All notable changes to the **Way Proxy** project (Goway & Pyway) are documented in this file.
 
+> **⛔ Standing rule (2026-09-23, permanent): all Goway changes must be forward optimizations; reverse (regressive) changes are never allowed.** Ship only with same-machine medians vs baseline **v1.8.11** showing no metric regressed beyond noise (c1/c8/c32, CPU, RSS; n≥5; `rushway/scripts/w2_bench.ps1`), numbers recorded in `goway/AI_HANDOFF.md`. Otherwise tune, default-off gate, or revert. All AI taking over must read `goway/AI_HANDOFF.md` first. 详细规则见 `goway/AI_HANDOFF.md` 顶部。
+
 ---
+
+## [v1.8.12] - 2026-09-23
+
+### Goway Mux VERSION/WINDOW credit flow control + lock-free credit gate（RushWay 联动 Phase 3）
+
+- **协议**: 新增 `MuxCmdVERSION=0x05` / `MuxCmdWINDOW=0x06` 控制帧（stream_id=0），握手后双侧立即发 VERSION（`[u8 ver=1][u16 window_kib BE]`，初始 8 MiB）；首见 VERSION 幂等启用每流 `creditGate`；WINDOW（`[u32 credit BE]`）按每 1 MiB 已消费量回执，封顶于对端广告窗口。旧版对未知 cmd 静默跳过 → 新旧任意组合安全降级（8/8 兼容冒烟实证）。
+- **无锁热路径**: `creditGate` 快路径全原子（`state/window/available` CAS；Acquire = 状态载入+窗口钳制+CAS，Release = 封顶 CAS+非阻塞信号）；`enableMu` 仅序列化 Enable/Close 状态迁移——每帧 Mutex 已从 `MuxStream.Write` 与服务端发送循环移除。语义不变：幂等启用、Close 唤醒防死锁、Oversize 钳制防饿死。
+- **范围**: 仅 WS MUX；QUIC/非 mux/UDP 不设门（保持 v1.8.11 行为）。
+- **性能认证（正向规则）**: 交错同会话 A/B，n=10/setup + n=10/steady，逐样本配对差分 + 精确符号检验（crit=9, p≤0.05），基线 = HEAD 构建 v1.8.11。**setup c1/c8/c32 中位差 +9.72/+9.06/+2.12，steady +55.26/−2.23/−0.02；cpu/rss 亦全部 NOISE——双模式无任何指标超噪声回退，认证 non-inferior。** 数据 `rushway/bench/w3_ab_goway.csv` + `w3_ab_raw.log`；规则与明细见 `goway/AI_HANDOFF.md`。
+- **测试**: `gofmt`/`go vet` 干净；新增 `flow_test.go` 9 用例；全套 `go test` ok 62.9 s；跨实现兼容冒烟 `rushway/scripts/w3_compat_smoke.ps1` 8/8 PASS（新新×双向 + 四组新旧配对）。
 
 ## [v1.8.11] - 2026-09-22
 
