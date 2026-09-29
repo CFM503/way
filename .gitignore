@@ -11,3 +11,16 @@ __pycache__/
 
 # Claude
 CLAUDE.MD
+
+# Bench outputs (goway/cmd/bench)
+goway/bench_out*.csv
+goway/bench_*.log
+goway/bench.exe
+goway/cand_*.exe
+goway/bench_*.csv
+goway/cand_*_linux
+goway/bench_linux
+
+# PGO profile collection artifacts (default.pgo itself is tracked)
+goway/*.pprof
+goway/prof_*.csv

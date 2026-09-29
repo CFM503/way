@@ -6,6 +6,20 @@ All notable changes to the **Way Proxy** project (Goway & Pyway) are documented 
 
 ---
 
+## [v1.8.13] - 2026-09-29
+
+### Goway 不改协议七项优化落地（bug修复 / 调参 / QUIC / writev / 并行度 / PGO / 减拷贝）
+
+- **Phase 1 修 bug**: 心跳保活、16 处写超时覆盖、退款阈值修正；loopback A/B 15/15 NOISE（`bench_p1.csv`）。
+- **Phase 2 窗口调参**: ingress 帧数队列 8→768（按 8MiB 窗口设计的帧数队列在 32MiB 窗口下 ingress full 即 RST——本次核心发现，队列 768 + 缓冲 40MiB 消除）；窗口 32MiB/刷新 8MiB 因 RSS 回退（c32 338→982MB, 10/0）按正向规则弃用，维持 8192/1MiB；双环境 15/15 NOISE（`bench_p2_final_loop.csv` / `bench_p2_final_netem.csv`）。
+- **Phase 3 QUIC**: `MaxIncomingStreams` 512→4096 + Initial/Max 四窗×2（`defaultQUICConfig`）；loopback QUIC A/B 15/15 NOISE（`bench_p3_loop.csv`）；netem QUIC 被 **pre-existing 静默 stall** 阻塞（QUIC+WSL2 netem 双向 UDP 无 PTO 无错误，基线同样复现；`diag_quic.sh`/`quicudp_diag.txt` 证据，独立调查项）。
+- **Phase 4 writev**: mux 出口攒批（≤8 帧 / 256KB）单 `net.Buffers.WriteTo` 一次 writev；帧编码改 `encodeMuxFrame*` 原位零拷贝；锁内 check+Wait 原子化防 lost-wakeup；netem 0 REGRESSED、**2 IMPROVED**（c1 cpu -9.6% 1/9、c32 up +21.2% 1/9，`bench_p4_netem.csv`）→ 保留。
+- **Phase 5 并行度**: `-mux-sessions` 默认 4→8、非 mux 连接池 10→16；双环境 15/15 NOISE（0 回归；作务书 +10~30% 的高 BDP 收益在本机 40ms netem 未复现）→ 按作务书保留。
+- **Phase 6 PGO**: loopback+netem × c1/c8/c32 × server/client 共 12 份 pprof 合并为 `default.pgo`（入库，`go build` 自动拾取）；首次 A/B c1 up 9/1 REGRESSED → n=20 确认 14/6 < crit15 **未复现**；netem 15/15 NOISE → 保留。
+- **Phase 7 减拷贝**: 握手大帧直读返回堆（消除 pool+copy，`largeFramePool` 及测试移除）；UDP 隧道→出口 sendmmsg 批写（Linux `WriteBatch` 8 包/批，读前 flush 零附加时延，非 Linux 即发回退；与 recvmmsg 读侧对称）；双环境 15/15 NOISE（`bench_p7_loop.csv` / `bench_p7_netem.csv`；UDP 批写 TCP bench 不覆盖，依对称设计+审查）。
+- **测试修复**: `TestMuxOutboundWriterFairness` 改为暂停构造、全量入队后再启动 loop——Phase 4 批量 drain 不再每帧阻塞于 pipe，原“先入队后出队”时序假设出现竞态（HEAD 单帧阻塞掩盖了该竞态）。
+- **数据与规则**: 全部 A/B 数据 `goway/bench_p*.csv`（本地证据，gitignore）；判定 = 精确符号检验 + 实践门限，明细见 `goway/AI_HANDOFF.md`。
+
 ## [v1.8.12] - 2026-09-23
 
 ### Goway Mux VERSION/WINDOW credit flow control + lock-free credit gate（RushWay 联动 Phase 3）

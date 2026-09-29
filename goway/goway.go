@@ -38,6 +38,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"runtime"
 	"runtime/pprof"
 	"strconv"
 	"strings"
@@ -51,7 +52,7 @@ import (
 )
 
 const (
-	Version        = "1.8.12"
+	Version        = "1.8.13"
 	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -1224,7 +1225,7 @@ func writeWSFramePreallocatedFast(w io.Writer, buf []byte, payloadOffset int, pa
 // wire bytes after receiver-side invert are bit-identical; the obfs tail,
 // if any, is inside the region and ignored by declared-length slicing.
 // crypto == nil degrades to the mask-only fast path.
-func writeMuxFrameFused(w io.Writer, buf []byte, payloadOffset int, payloadLen int, opcode byte, prng *maskPRNG, crypto *Crypto) error {
+func encodeMuxFrameFused(buf []byte, payloadOffset int, payloadLen int, opcode byte, prng *maskPRNG, crypto *Crypto) ([]byte, error) {
 	hdrLen := 2
 	if payloadLen >= 65536 {
 		hdrLen = 10
@@ -1234,7 +1235,7 @@ func writeMuxFrameFused(w io.Writer, buf []byte, payloadOffset int, payloadLen i
 
 	frameStart := payloadOffset - 4 - hdrLen
 	if frameStart < 0 {
-		return errors.New("buffer pre-padding is insufficient")
+		return nil, errors.New("buffer pre-padding is insufficient")
 	}
 
 	buf[frameStart] = 0b10000000 | opcode
@@ -1280,7 +1281,15 @@ func writeMuxFrameFused(w io.Writer, buf []byte, payloadOffset int, payloadLen i
 		}
 	}
 
-	_, err := w.Write(buf[frameStart : frameStart+hdrLen+4+payloadLen])
+	return buf[frameStart : frameStart+hdrLen+4+payloadLen], nil
+}
+
+func writeMuxFrameFused(w io.Writer, buf []byte, payloadOffset int, payloadLen int, opcode byte, prng *maskPRNG, crypto *Crypto) error {
+	slice, err := encodeMuxFrameFused(buf, payloadOffset, payloadLen, opcode, prng, crypto)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(slice)
 	return err
 }
 
@@ -1292,7 +1301,7 @@ func writeMuxFrameFused(w io.Writer, buf []byte, payloadOffset int, payloadLen i
 // if any, sits inside the declared-length region and is ignored by
 // receivers that slice by the MUX header length. crypto == nil is a pure
 // header assembly pass.
-func writeMuxFrameUnmasked(w io.Writer, buf []byte, payloadOffset int, payloadLen int, opcode byte, crypto *Crypto) error {
+func encodeMuxFrameUnmasked(buf []byte, payloadOffset int, payloadLen int, opcode byte, crypto *Crypto) ([]byte, error) {
 	hdrLen := 2
 	if payloadLen >= 65536 {
 		hdrLen = 10
@@ -1302,7 +1311,7 @@ func writeMuxFrameUnmasked(w io.Writer, buf []byte, payloadOffset int, payloadLe
 
 	frameStart := payloadOffset - hdrLen
 	if frameStart < 0 {
-		return errors.New("buffer pre-padding is insufficient")
+		return nil, errors.New("buffer pre-padding is insufficient")
 	}
 
 	buf[frameStart] = 0b10000000 | opcode
@@ -1332,7 +1341,15 @@ func writeMuxFrameUnmasked(w io.Writer, buf []byte, payloadOffset int, payloadLe
 		}
 	}
 
-	_, err := w.Write(buf[frameStart : frameStart+hdrLen+payloadLen])
+	return buf[frameStart : frameStart+hdrLen+payloadLen], nil
+}
+
+func writeMuxFrameUnmasked(w io.Writer, buf []byte, payloadOffset int, payloadLen int, opcode byte, crypto *Crypto) error {
+	slice, err := encodeMuxFrameUnmasked(buf, payloadOffset, payloadLen, opcode, crypto)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(slice)
 	return err
 }
 
@@ -1455,6 +1472,27 @@ func deadlineThrottle(lastSet *time.Time) bool {
 	return false
 }
 
+// writeDeadlineSetter is the SetWriteDeadline subset shared by net.Conn
+// and quic.Stream.
+type writeDeadlineSetter interface {
+	SetWriteDeadline(t time.Time) error
+}
+
+// refreshWriteDeadline pushes conn's write deadline to now+timeout, at
+// most once per 500ms (same rationale as deadlineThrottle: time.Now()
+// ~20ns vs the syscall ~500ns). Without it a peer that stops draining
+// (wedge-app, stalled target) pins the relay goroutine and its buffers
+// forever — the process previously set no write deadline anywhere.
+// timeout <= 0 disables the mechanism.
+func refreshWriteDeadline(conn writeDeadlineSetter, timeout time.Duration, lastSet *time.Time) {
+	if timeout <= 0 {
+		return
+	}
+	if deadlineThrottle(lastSet) {
+		_ = conn.SetWriteDeadline(time.Now().Add(timeout))
+	}
+}
+
 func readUntilCRLFCRLF(br *bufio.Reader) ([]byte, error) {
 	var buf bytes.Buffer
 	buf.Grow(MaxHeaderSize)
@@ -1478,24 +1516,6 @@ func readUntilCRLFCRLF(br *bufio.Reader) ([]byte, error) {
 		if n >= MaxHeaderSize {
 			return nil, errors.New("header too large")
 		}
-	}
-}
-
-// largeFramePool pools buffers for WS frames larger than smallFrameSize.
-// Stored as *[]byte so the pool can hold variable-length slices without
-// the type assertion overhead of interface{} wrapping a plain []byte.
-const maxPooledFrameCap = 64 * 1024 // Cap pool retention at 64KB to avoid holding huge buffers
-
-var largeFramePool = sync.Pool{
-	New: func() interface{} {
-		buf := make([]byte, 32*1024) // 32KB default; grown as needed
-		return &buf
-	},
-}
-
-func putLargeFrame(p *[]byte) {
-	if p != nil && cap(*p) <= maxPooledFrameCap {
-		largeFramePool.Put(p)
 	}
 }
 
@@ -1945,8 +1965,9 @@ var connPool *ConnPool
 // readWSFrameInto reads one WebSocket data frame from r, writing any Ping replies
 // to w. buf is used as scratch space; if the payload fits it is returned as a
 // sub-slice of buf (zero alloc). If not, a heap slice is allocated.
-// For the handshake path (readWSFrame), pass a nil buf — the function falls back
-// to largeFramePool for large frames and returns a heap-owned copy.
+// For the handshake path (readWSFrame), pass a nil buf — small payloads are
+// read on the stack and handed back as a heap copy, large payloads are read
+// straight into the heap slice returned to the caller (no intermediate copy).
 func readWSFrameInto(r io.Reader, w io.Writer, buf []byte) ([]byte, error) {
 	for {
 		var head [2]byte
@@ -2004,11 +2025,11 @@ func readWSFrameInto(r io.Reader, w io.Writer, buf []byte) ([]byte, error) {
 
 		// Buffer selection:
 		//   relay path  (buf != nil): use caller's buf if it fits, else heap-alloc.
-		//   handshake path (buf == nil): use stack for small frames, largeFramePool
-		//   for large ones, then copy to heap before returning.
+		//   handshake path (buf == nil): stack for small frames; large frames are
+		//   read directly into the heap slice handed back to the caller.
 		var payload []byte
 		var stackBuf [smallFrameSize]byte
-		var poolPtr *[]byte
+		var heapOwned []byte
 
 		if buf != nil {
 			// relay path — zero-copy into caller's buffer when possible
@@ -2018,20 +2039,16 @@ func readWSFrameInto(r io.Reader, w io.Writer, buf []byte) ([]byte, error) {
 				payload = make([]byte, payloadLen)
 			}
 		} else {
-			// handshake path — pool-backed temporary buffer
+			// handshake path
 			if payloadLen <= smallFrameSize {
 				payload = stackBuf[:payloadLen]
 			} else {
-				poolPtr = largeFramePool.Get().(*[]byte)
-				if uint64(cap(*poolPtr)) < payloadLen {
-					*poolPtr = make([]byte, payloadLen)
-				}
-				payload = (*poolPtr)[:payloadLen]
+				heapOwned = make([]byte, payloadLen)
+				payload = heapOwned
 			}
 		}
 
 		if _, err := io.ReadFull(r, payload); err != nil {
-			putLargeFrame(poolPtr)
 			return nil, err
 		}
 
@@ -2054,27 +2071,26 @@ func readWSFrameInto(r io.Reader, w io.Writer, buf []byte) ([]byte, error) {
 				// relay path — payload already lives in caller's buffer
 				return payload, nil
 			}
-			// handshake path — must return heap-owned slice
+			if heapOwned != nil {
+				// handshake path, large frame — read straight into the
+				// heap slice we hand back, no copy
+				return heapOwned, nil
+			}
+			// handshake path, stack payload — must return a heap slice
 			heapPayload := make([]byte, payloadLen)
 			copy(heapPayload, payload)
-			putLargeFrame(poolPtr)
 			return heapPayload, nil
 		case 0x8: // Close
-			putLargeFrame(poolPtr)
 			return nil, io.EOF
 		case 0x9: // Ping
 			if w != nil {
 				if err := writeWSFrame(w, payload, 0xA, !masked); err != nil {
-					putLargeFrame(poolPtr)
 					return nil, err
 				}
 			}
-			putLargeFrame(poolPtr)
 		case 0xA: // Pong
-			putLargeFrame(poolPtr)
 			// Discard pong and continue reading
 		default:
-			putLargeFrame(poolPtr)
 			return nil, fmt.Errorf("unexpected websocket opcode: 0x%X", opcode)
 		}
 	}
@@ -2097,7 +2113,7 @@ func main() {
 	fakeHostFlag := flag.String("fakehost", "", "Spoofing Hostname / SNI for Cloudflare CDN or reverse proxies")
 	muxFlag := flag.Bool("mux", true, "Enable 0-RTT Connection Multiplexing (default true)")
 	noMuxFlag := flag.Bool("no-mux", false, "Disable 0-RTT Connection Multiplexing (fallback to 1:1 pool)")
-	muxSessionsFlag := flag.Int("mux-sessions", 4, "Number of parallel physical Mux sessions (default 4, max 64)")
+	muxSessionsFlag := flag.Int("mux-sessions", 8, "Number of parallel physical Mux sessions (default 8, max 64)")
 	obfsFlag := flag.Bool("obfs", false, "Pad MUX DATA frames with random lengths to resist packet-size fingerprinting")
 	wFlag := flag.Int("W", 128, "App Buffer Size in KB (default 128KB, recommend 256-1024 for high-throughput streaming)")
 	sockBufFlag := flag.Int("socket-buffer", 0, "Kernel Socket Buffer in KB (default 0 = OS auto-tuning)")
@@ -2438,7 +2454,7 @@ func main() {
 			if cfg.Mux {
 				cfg.MuxPool = NewMuxClientPool(&cfg, cfg.MuxSessions)
 			} else {
-				connPool = NewConnPool(&cfg, 10) // Pool of 10 pre-established connections for non-Mux mode
+				connPool = NewConnPool(&cfg, 16) // Pool of 16 pre-established connections for non-Mux mode
 			}
 		}
 
@@ -2608,24 +2624,48 @@ const (
 	MuxHeaderLen       = 7    // 4B StreamID + 1B Cmd + 2B PayloadLen
 
 	// Client-side Mux stream buffer limit.
-	// Kept lower to reduce per-stream memory usage on client instances.
-	muxClientStreamBufferLimit = 8 * 1024 * 1024
+	// Invariant: >= muxInitialWindowKib*1024 + muxWindowRefresh, else the
+	// ingress queue fills before credit can drain -> spurious RST under
+	// high-BDP load (guarded by TestStreamBufferLimitCoversWindow).
+	muxClientStreamBufferLimit = 40 * 1024 * 1024
 
 	// Server-side Mux stream buffer limit.
-	// Kept higher to provide additional buffering headroom for
-	// downstream fan-out / asymmetric traffic patterns.
-	muxServerStreamBufferLimit = 8 * 1024 * 1024
-	muxStreamIngressQueue      = 128
-	muxPushStallTimeout        = 15 * time.Second
+	// Same window+refresh invariant as the client side; higher headroom
+	// for downstream fan-out / asymmetric traffic patterns.
+	muxServerStreamBufferLimit = 40 * 1024 * 1024
+	// Frame-count queue depths. PushDataFrame budgets bytes
+	// (buffer limits above, 40MiB), so the frame depths must not bind
+	// first: at maximum frame size (65535B) a 40MiB budget needs 641
+	// frames, hence 768 slots per queue. Anything smaller lets the
+	// non-blocking ingress enqueue reset the stream mid-burst ("ingress
+	// queue full", observed under 40ms netem when the window was raised
+	// without scaling these). Frame depths only bound burst absorption,
+	// never steady-state memory (credit gating does). Invariant guarded
+	// by TestStreamBufferLimitCoversWindow.
+	muxStreamIngressQueue = 768
+	muxStreamAppQueue     = 768 // client readChan / server writeChan depth
+	muxPushStallTimeout   = 15 * time.Second
 
 	// W3 flow control: version advertised in VERSION frames, initial
 	// per-stream receive window (KiB), and the consumed-byte threshold
 	// that triggers a WINDOW refund. Probe-negotiated: peers predating
 	// these commands skip them silently, keeping v1 behavior.
+	// v1.8.13 Phase 2 tried 32768/8MiB here: 40ms-netem throughput improved
+	// (c8/c32 download +10%/+16%) but RSS regressed to concurrency x window
+	// (c32: 338MB -> 982MB, sign 10/0) and the forward-optimization rule
+	// requires reverting on any metric beyond noise. Data: bench_p2_netem.csv.
 	muxProtoVersion     byte = 1
 	muxInitialWindowKib      = 8192
 	muxWindowRefresh         = 1024 * 1024
 	muxWindowMinKib          = 64
+
+	// muxRefundThreshold is the consumed-byte count that triggers a WINDOW
+	// refund, clamped to half the advertised window. Without the clamp, a
+	// future window smaller than muxWindowRefresh could exhaust the peer's
+	// send credit before any refund fires (refundPending never reaches the
+	// threshold -> permanent silent stall). Invariant guarded by
+	// TestRefundThresholdNeverExceedsHalfWindow.
+	muxRefundThreshold = min(muxWindowRefresh, muxInitialWindowKib*1024/2)
 )
 
 // creditGate throttles sends on one stream once the peer's VERSION frame
@@ -2782,7 +2822,7 @@ type MuxStream struct {
 }
 
 func newMuxStream(id uint32, session MuxSessionInterface) *MuxStream {
-	st := &MuxStream{id: id, session: session, readChan: make(chan muxDataFrame, 128), closed: make(chan struct{}), hasSpace: make(chan struct{}, 1), ingress: make(chan muxDataFrame, muxStreamIngressQueue), sendGate: newCreditGate()}
+	st := &MuxStream{id: id, session: session, readChan: make(chan muxDataFrame, muxStreamAppQueue), closed: make(chan struct{}), hasSpace: make(chan struct{}, 1), ingress: make(chan muxDataFrame, muxStreamIngressQueue), sendGate: newCreditGate()}
 	go st.deliveryLoop()
 	return st
 }
@@ -3091,6 +3131,12 @@ type muxOutboundWriter struct {
 	closed   bool
 	done     chan struct{}
 	closeMu  sync.Once
+	// writeTimeout bounds each egress write; 0 disables (test fixtures).
+	// lastWriteSet is only touched by the loop goroutine.
+	writeTimeout time.Duration
+	lastWriteSet time.Time
+	// scratch is the loop goroutine's writev batch buffer (Phase 4).
+	scratch []muxOutboundFrame
 }
 
 const (
@@ -3107,16 +3153,20 @@ const (
 	// Max random padding appended to MUX DATA frames when -obfs is on.
 	// Sized near MTU so padded lengths spread across the full range.
 	obfsPadMax = 1400
+	// Phase 4 writev: coalesce up to 8 frames / 256KB per egress syscall.
+	muxWritevMaxFrames = 8
+	muxWritevMaxBytes  = 256 * 1024
 )
 
-func newMuxOutboundWriter(conn net.Conn, prng *maskPRNG, crypto *Crypto, masked bool) *muxOutboundWriter {
+func newMuxOutboundWriter(conn net.Conn, prng *maskPRNG, crypto *Crypto, masked bool, writeTimeout time.Duration) *muxOutboundWriter {
 	w := &muxOutboundWriter{
-		conn:    conn,
-		prng:    prng,
-		crypto:  crypto,
-		masked:  masked,
-		streams: make(map[uint32]*muxStreamQueue),
-		done:    make(chan struct{}),
+		conn:         conn,
+		prng:         prng,
+		crypto:       crypto,
+		masked:       masked,
+		streams:      make(map[uint32]*muxStreamQueue),
+		done:         make(chan struct{}),
+		writeTimeout: writeTimeout,
 	}
 	w.cond = sync.NewCond(&w.mu)
 	go w.loop()
@@ -3142,13 +3192,24 @@ func (w *muxOutboundWriter) writeFrame(f muxOutboundFrame) error {
 	if f.ping {
 		return writeWSFrame(w.conn, nil, 0x9, w.masked)
 	}
+	slice, err := w.encodeFrame(f)
+	if err != nil {
+		return err
+	}
+	_, err = w.conn.Write(slice)
+	return err
+}
+
+// encodeFrame renders a data frame (header + mask + cipher) in place inside
+// its pooled buffer and returns the wire slice. No copy, no syscall.
+func (w *muxOutboundWriter) encodeFrame(f muxOutboundFrame) ([]byte, error) {
 	if f.bPtr == nil || f.pool == nil {
-		return errors.New("invalid mux outbound frame")
+		return nil, errors.New("invalid mux outbound frame")
 	}
 	if w.masked {
-		return writeMuxFrameFused(w.conn, *f.bPtr, f.payloadOff, f.payloadLen, f.opcode, w.prng, w.crypto)
+		return encodeMuxFrameFused(*f.bPtr, f.payloadOff, f.payloadLen, f.opcode, w.prng, w.crypto)
 	}
-	return writeMuxFrameUnmasked(w.conn, *f.bPtr, f.payloadOff, f.payloadLen, f.opcode, w.crypto)
+	return encodeMuxFrameUnmasked(*f.bPtr, f.payloadOff, f.payloadLen, f.opcode, w.crypto)
 }
 
 // dropAllLocked releases every queued frame and resets scheduling state.
@@ -3201,7 +3262,26 @@ func (w *muxOutboundWriter) loop() {
 		if !ok {
 			return
 		}
-		if err := w.writeFrame(f); err != nil {
+		// Phase 4: coalesce already-queued frames into one writev syscall.
+		// tryNext never blocks, so batching adds no latency for idle links;
+		// DRR fairness and frame order are unchanged (popLocked sequence).
+		batch := append(w.scratch[:0], f)
+		batchBytes := frameWireLen(f) + MuxHeaderLen + 14
+		for len(batch) < muxWritevMaxFrames && batchBytes < muxWritevMaxBytes {
+			f2, ok2 := w.tryNext()
+			if !ok2 {
+				break
+			}
+			batch = append(batch, f2)
+			batchBytes += frameWireLen(f2) + MuxHeaderLen + 14
+		}
+		w.scratch = batch
+		refreshWriteDeadline(w.conn, w.writeTimeout, &w.lastWriteSet)
+		err := w.writeBatch(batch)
+		for i := range batch {
+			w.releaseFrame(batch[i])
+		}
+		if err != nil {
 			w.mu.Lock()
 			w.closed = true
 			w.dropAllLocked()
@@ -3210,8 +3290,42 @@ func (w *muxOutboundWriter) loop() {
 			_ = w.conn.Close()
 			return
 		}
-		w.releaseFrame(f)
 	}
+}
+
+// writeBatch sends one or more already-scheduled frames as a single
+// net.Buffers.WriteTo (one writev syscall for TCP). Ping frames keep their
+// existing encode path and flush the accumulator first.
+func (w *muxOutboundWriter) writeBatch(batch []muxOutboundFrame) error {
+	if len(batch) == 1 {
+		return w.writeFrame(batch[0])
+	}
+	var bufs net.Buffers
+	for i := range batch {
+		f := batch[i]
+		if f.ping {
+			if len(bufs) > 0 {
+				if _, err := bufs.WriteTo(w.conn); err != nil {
+					return err
+				}
+				bufs = net.Buffers{}
+			}
+			if err := w.writeFrame(f); err != nil {
+				return err
+			}
+			continue
+		}
+		slice, err := w.encodeFrame(f)
+		if err != nil {
+			return err
+		}
+		bufs = append(bufs, slice)
+	}
+	if len(bufs) == 0 {
+		return nil
+	}
+	_, err := bufs.WriteTo(w.conn)
+	return err
 }
 
 // next pops the next frame to send: priority lane first, then deficit
@@ -3221,32 +3335,7 @@ func (w *muxOutboundWriter) next() (muxOutboundFrame, bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	for {
-		// Scan priority queue to find the first unblocked control frame.
-		// Only stream-CLOSING controls (FIN/RST) yield while their own
-		// stream still has pending DATA frames — else the peer closes
-		// early and drops the tail. SYN never yields: it creates the
-		// peer-side stream, so yielding it makes the peer drop its own
-		// DATA as unknown-stream (caught live on the RushWay side: full
-		// flows vanishing under burst with zero error logs).
-		// Frames for other streams (or pings) are never head-of-line blocked.
-		for i := 0; i < len(w.priority); i++ {
-			f := w.priority[i]
-			blocked := false
-			if !f.ping && f.streamID != 0 && (f.cmd == MuxCmdFIN || f.cmd == MuxCmdRST) {
-				if q := w.streams[f.streamID]; q != nil && len(q.frames) > 0 {
-					blocked = true
-				}
-			}
-			if !blocked {
-				w.priority = append(w.priority[:i], w.priority[i+1:]...)
-				w.total--
-				w.cond.Signal()
-				return f, true
-			}
-		}
-		if f, ok := w.nextDataLocked(); ok {
-			w.total--
-			w.cond.Signal()
+		if f, ok := w.popLocked(); ok {
 			return f, true
 		}
 		if w.closed {
@@ -3254,6 +3343,47 @@ func (w *muxOutboundWriter) next() (muxOutboundFrame, bool) {
 		}
 		w.cond.Wait()
 	}
+}
+
+// tryNext pops a ready frame without blocking (writev batch drain).
+func (w *muxOutboundWriter) tryNext() (muxOutboundFrame, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.popLocked()
+}
+
+// popLocked serves one ready frame. Caller must hold w.mu.
+func (w *muxOutboundWriter) popLocked() (muxOutboundFrame, bool) {
+	var empty muxOutboundFrame
+	// Scan priority queue to find the first unblocked control frame.
+	// Only stream-CLOSING controls (FIN/RST) yield while their own
+	// stream still has pending DATA frames — else the peer closes
+	// early and drops the tail. SYN never yields: it creates the
+	// peer-side stream, so yielding it makes the peer drop its own
+	// DATA as unknown-stream (caught live on the RushWay side: full
+	// flows vanishing under burst with zero error logs).
+	// Frames for other streams (or pings) are never head-of-line blocked.
+	for i := 0; i < len(w.priority); i++ {
+		f := w.priority[i]
+		blocked := false
+		if !f.ping && f.streamID != 0 && (f.cmd == MuxCmdFIN || f.cmd == MuxCmdRST) {
+			if q := w.streams[f.streamID]; q != nil && len(q.frames) > 0 {
+				blocked = true
+			}
+		}
+		if !blocked {
+			w.priority = append(w.priority[:i], w.priority[i+1:]...)
+			w.total--
+			w.cond.Signal()
+			return f, true
+		}
+	}
+	if f, ok := w.nextDataLocked(); ok {
+		w.total--
+		w.cond.Signal()
+		return f, true
+	}
+	return empty, false
 }
 
 // nextDataLocked serves one frame by deficit round robin. Caller must hold w.mu.
@@ -3397,7 +3527,7 @@ func (s *MuxClientSession) decrementActiveStreams() {
 func newMuxClientSession(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, cfg *Config) *MuxClientSession {
 	prng := maskPool.Get().(*maskPRNG)
 	s := &MuxClientSession{wsConn: wsConn, br: br, wsTCPConn: wsTCPConn, cfg: cfg, streams: make(map[uint32]*MuxStream), closed: make(chan struct{}), prng: prng}
-	s.writer = newMuxOutboundWriter(wsConn, prng, cfg.Crypto, true)
+	s.writer = newMuxOutboundWriter(wsConn, prng, cfg.Crypto, true, time.Duration(cfg.ConnTimeout)*time.Second)
 	// W3 version negotiation: advertise our version + initial receive
 	// window right after the session handshake. Old servers skip the
 	// unknown command; new servers answer with their own VERSION.
@@ -3444,15 +3574,26 @@ func (s *MuxClientSession) applyWindow(streamID uint32, payload []byte) {
 	}
 }
 
+// muxHeartbeatInterval is the client keepalive ping period. Package-level
+// var so tests can shorten it.
+var muxHeartbeatInterval = 25 * time.Second
+
 func (s *MuxClientSession) heartbeatLoop() {
-	ticker := time.NewTicker(25 * time.Second)
+	ticker := time.NewTicker(muxHeartbeatInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-s.closed:
 			return
 		case <-ticker.C:
-			if s.ActiveStreams() > 0 || s.writer == nil {
+			// Ping unconditionally whenever the writer is up. The previous
+			// condition (skip while streams exist) meant an active-but-idle
+			// session — open streams, no traffic — never pinged, both sides'
+			// rolling read deadlines fired at ConnTimeout (60s), and Close
+			// reset EVERY stream (paused video, idle SSH). Any received frame
+			// refreshes the peer's deadline; peers auto-pong (readWSFrameInto
+			// 0x9/0xA handling), so 24B/interval keeps the tunnel alive.
+			if s.writer == nil {
 				continue
 			}
 			_ = s.writer.enqueuePing()
@@ -3901,9 +4042,14 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 		buf := *bPtr
 		// W3 receive-side refund accumulator (client -> server WINDOW).
 		var refundPending int64
+		// The local app may stop draining (M6 wedge): bound the egress
+		// write so this pump cannot pin its buffers forever.
+		var lastWriteSet time.Time
+		writeTimeout := time.Duration(cfg.ConnTimeout) * time.Second
 		for {
 			nr, errRead := stream.Read(buf)
 			if nr > 0 {
+				refreshWriteDeadline(localConn, writeTimeout, &lastWriteSet)
 				if _, errWrite := localConn.Write(buf[:nr]); errWrite != nil {
 					errCh <- errWrite
 					return
@@ -3914,7 +4060,7 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 					refundPending = 0
 				} else {
 					refundPending += int64(nr)
-					if refundPending >= muxWindowRefresh {
+					if refundPending >= muxRefundThreshold {
 						var wb [4]byte
 						binary.BigEndian.PutUint32(wb[:], uint32(refundPending))
 						refundPending = 0
@@ -3972,7 +4118,7 @@ type MuxServerStream struct {
 }
 
 func newMuxServerStream(id uint32, session *MuxServerSession) *MuxServerStream {
-	st := &MuxServerStream{id: id, session: session, writeChan: make(chan muxDataFrame, 256), closed: make(chan struct{}), hasSpace: make(chan struct{}, 1), ingress: make(chan muxDataFrame, muxStreamIngressQueue), sendGate: newCreditGate()}
+	st := &MuxServerStream{id: id, session: session, writeChan: make(chan muxDataFrame, muxStreamAppQueue), closed: make(chan struct{}), hasSpace: make(chan struct{}, 1), ingress: make(chan muxDataFrame, muxStreamIngressQueue), sendGate: newCreditGate()}
 	if w := session.peerWindow.Load(); w > 0 {
 		st.sendGate.Enable(w)
 	}
@@ -3992,7 +4138,7 @@ func (s *MuxServerStream) addConsumed(n int) {
 		return
 	}
 	s.refundPending += int64(n)
-	if s.refundPending < muxWindowRefresh {
+	if s.refundPending < muxRefundThreshold {
 		return
 	}
 	var wb [4]byte
@@ -4294,7 +4440,7 @@ func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 		closed:    make(chan struct{}),
 	}
 	// Server never masks; prng unused by the unmasked write path.
-	session.writer = newMuxOutboundWriter(wsConn, nil, cfg.Crypto, false)
+	session.writer = newMuxOutboundWriter(wsConn, nil, cfg.Crypto, false, time.Duration(cfg.ConnTimeout)*time.Second)
 	defer session.Close()
 
 	// W3 version negotiation: advertise our version + initial receive
@@ -4463,6 +4609,8 @@ func (s *MuxServerSession) handleNewStream(st *MuxServerStream, targetStr string
 	}
 
 	if len(initialData) > 0 {
+		var lastWriteSet time.Time
+		refreshWriteDeadline(targetConn, time.Duration(s.cfg.ConnTimeout)*time.Second, &lastWriteSet)
 		if _, err := targetConn.Write(initialData); err != nil {
 			logDebug("[SERVER-MUX] Write initialData to %s failed: %v", targetAddr, err)
 			s.SendFrame(st.id, MuxCmdRST, nil)
@@ -4475,6 +4623,8 @@ func (s *MuxServerSession) handleNewStream(st *MuxServerStream, targetStr string
 	logDebug("[SERVER-MUX] Stream %d -> %s", st.id, targetStr)
 
 	go func() {
+		var lastWriteSet time.Time
+		writeTimeout := time.Duration(s.cfg.ConnTimeout) * time.Second
 		for {
 			select {
 			case <-st.closed:
@@ -4487,6 +4637,7 @@ func (s *MuxServerSession) handleNewStream(st *MuxServerStream, targetStr string
 					return
 				}
 				data := frame.data
+				refreshWriteDeadline(targetConn, writeTimeout, &lastWriteSet)
 				// Receive direction (client -> target): no send-credit
 				// charge here; book consumption for WINDOW refunds instead.
 				_, err := targetConn.Write(data)
@@ -4667,6 +4818,9 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 	}
 
 	errCh := make(chan error, 2)
+	// Egress writes get a deadline too (M6): a client or target that stops
+	// draining must fail the write instead of wedging the relay forever.
+	writeTimeout := time.Duration(cfg.ConnTimeout) * time.Second
 
 	// WS -> TCP (server receives masked frames from client, unmasks, writes to target)
 	// No mask generation needed here — server never masks outbound TCP data.
@@ -4677,6 +4831,7 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
 		var lastDeadline time.Time
+		var lastWriteSet time.Time
 		var localUp int64 // batch counter — avoids atomic on every frame
 		for {
 			if deadlineThrottle(&lastDeadline) {
@@ -4694,6 +4849,7 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 				err = errRead
 				return
 			}
+			refreshWriteDeadline(targetConn, writeTimeout, &lastWriteSet)
 			if _, errWrite := targetConn.Write(data); errWrite != nil {
 				if localUp > 0 {
 					stats.AddBytes(localUp, 0)
@@ -4713,6 +4869,7 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
 		var lastDeadline time.Time
+		var lastWriteSet time.Time
 		var localDown int64
 		for {
 			if deadlineThrottle(&lastDeadline) {
@@ -4731,6 +4888,7 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 				return
 			}
 			// Server->client frames are unmasked (masked=false) — no PRNG needed
+			refreshWriteDeadline(wsConn, writeTimeout, &lastWriteSet)
 			if errWrite := writeWSFramePreallocated(wsConn, buf, 14, nr, 0x2, false); errWrite != nil {
 				if localDown > 0 {
 					stats.AddBytes(0, localDown)
@@ -4765,6 +4923,12 @@ type udpBatch struct {
 	msgs     []ipv4.Message
 	addrs    []net.UDPAddr
 	fallback bool
+	// write side (sendmmsg); only populated on instances from newUDPBatchWriter
+	wmsgs     []ipv4.Message
+	wbufs     [][]byte
+	wcount    int
+	wup       bool
+	wfallback bool
 }
 
 func newUDPBatch(conn *net.UDPConn) *udpBatch {
@@ -4813,6 +4977,116 @@ func cloneUDPAddr(a *net.UDPAddr) *net.UDPAddr {
 	return &cp
 }
 
+// --- UDP batch writes (sendmmsg) ---
+//
+// The tunnel→UDP direction used to issue one WriteToUDP syscall per
+// datagram. newUDPBatchWriter queues up to udpBatchCount datagrams and
+// drains them with a single ipv4 WriteBatch (sendmmsg) — the mirror of
+// the read side. Callers must flush before their next blocking read,
+// when the queue fills, and on loop exit, so batching only covers
+// datagrams whose frames were already sitting in the bufio buffer (no
+// added latency). Payloads are copied: callers reuse their read buffer
+// on the next iteration. On platforms without sendmmsg (everything but
+// Linux) datagrams are written through immediately, exactly like the
+// old code path; write slots are 8×64KB per session, mirroring the
+// read side, and live as long as the session.
+
+// newUDPBatchWriter creates the write half for one relay direction; up
+// selects the stats direction (true: tunnel→target, false: target→app).
+func newUDPBatchWriter(conn *net.UDPConn, up bool) *udpBatch {
+	b := &udpBatch{
+		conn:      conn,
+		pc:        ipv4.NewPacketConn(conn),
+		wup:       up,
+		wfallback: runtime.GOOS != "linux",
+	}
+	b.wmsgs = make([]ipv4.Message, udpBatchCount)
+	b.wbufs = make([][]byte, udpBatchCount)
+	for i := range b.wmsgs {
+		b.wbufs[i] = make([]byte, udpBatchBufSize)
+		b.wmsgs[i].Buffers = [][]byte{b.wbufs[i][:0]}
+	}
+	return b
+}
+
+// queueWrite hands one datagram to the writer, copying the payload into a
+// batch slot (or writing through immediately when the batch is unusable,
+// empty datagrams would violate the "at least one byte" batch contract,
+// or the datagram does not fit a slot). On success the datagram is
+// accounted to stats either here (immediate path) or at flush time.
+func (b *udpBatch) queueWrite(payload []byte, addr *net.UDPAddr) error {
+	if b.wfallback || len(payload) == 0 || len(payload) > udpBatchBufSize {
+		_, err := b.conn.WriteToUDP(payload, addr)
+		if err == nil {
+			b.addWriteStats(len(payload))
+		}
+		return err
+	}
+	if b.wcount == udpBatchCount {
+		_ = b.flushWrites() // errors surface on the loop's periodic flush
+	}
+	copy(b.wbufs[b.wcount], payload)
+	b.wmsgs[b.wcount].Buffers[0] = b.wbufs[b.wcount][:len(payload)]
+	b.wmsgs[b.wcount].Addr = addr
+	b.wcount++
+	return nil
+}
+
+// flushWrites sends every queued datagram — one sendmmsg on Linux, plus
+// per-datagram WriteToUDP for anything the batch did not take (partial
+// send, or all of it when running in fallback mode). Sent bytes are
+// accounted to stats; the first error is returned for logging.
+func (b *udpBatch) flushWrites() error {
+	if b.wcount == 0 {
+		return nil
+	}
+	n := b.wcount
+	b.wcount = 0
+	var firstErr error
+	done := 0
+	if !b.wfallback {
+		m, err := b.pc.WriteBatch(b.wmsgs[:n], 0)
+		if err != nil {
+			b.wfallback = true // batch unusable from now on
+			firstErr = err
+		}
+		if m > 0 {
+			batched := 0
+			for i := 0; i < m; i++ {
+				batched += len(b.wmsgs[i].Buffers[0])
+			}
+			b.addWriteStats(batched)
+		}
+		done = m
+	}
+	for i := done; i < n; i++ {
+		buf := b.wmsgs[i].Buffers[0]
+		dst, ok := b.wmsgs[i].Addr.(*net.UDPAddr)
+		if !ok {
+			if firstErr == nil {
+				firstErr = errors.New("udpBatch: write address is not *net.UDPAddr")
+			}
+			continue
+		}
+		if _, err := b.conn.WriteToUDP(buf, dst); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+		} else {
+			b.addWriteStats(len(buf))
+		}
+	}
+	return firstErr
+}
+
+func (b *udpBatch) addWriteStats(n int) {
+	if b.wup {
+		stats.AddBytes(int64(n), 0)
+	} else {
+		stats.AddBytes(0, int64(n))
+	}
+}
+
 func handleServerUDP(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, cfg *Config) {
 	logInfo("[SERVER] UDP Tunnel requested")
 	var ok []byte
@@ -4847,9 +5121,16 @@ func handleServerUDP(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
 		var lastDeadline time.Time
+		wb := newUDPBatchWriter(udpConn, true)
+		defer func() { _ = wb.flushWrites() }()
 		for {
 			if deadlineThrottle(&lastDeadline) {
 				setTCPReadDeadline(wsTCPConn, cfg.ConnTimeout)
+			}
+			if br.Buffered() == 0 {
+				if errF := wb.flushWrites(); errF != nil {
+					logDebug("[SERVER-UDP] batch flush failed: %v", errF)
+				}
 			}
 			data, errRead := readWSFrameInto(br, wsConn, buf[14:])
 			if errRead != nil {
@@ -4907,10 +5188,8 @@ func handleServerUDP(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 				continue
 			}
 
-			if _, errWrite := udpConn.WriteToUDP(payload, raddr); errWrite != nil {
+			if errWrite := wb.queueWrite(payload, raddr); errWrite != nil {
 				logDebug("[SERVER-UDP] WriteToUDP failed: %v", errWrite)
-			} else {
-				stats.AddBytes(int64(len(payload)), 0)
 			}
 		}
 	}()
@@ -4923,6 +5202,8 @@ func handleServerUDP(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 		defer cfg.BufPool.Put(bPtr)
 		rawBuf := *bPtr
 		batch := newUDPBatch(udpConn)
+		var lastWriteSet time.Time
+		writeTimeout := time.Duration(cfg.ConnTimeout) * time.Second
 		for {
 			count, errRead := batch.read()
 			if errRead != nil {
@@ -4960,6 +5241,7 @@ func handleServerUDP(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 					cfg.Crypto.TransformInPlace(frameData[:totalLen])
 				}
 
+				refreshWriteDeadline(wsConn, writeTimeout, &lastWriteSet)
 				if errWrite := writeWSFramePreallocated(wsConn, rawBuf, 14, totalLen, 0x2, false); errWrite != nil {
 					err = errWrite
 					return
@@ -5141,6 +5423,8 @@ func handleClientUDP(localConn net.Conn, cfg *Config) {
 		prng := maskPool.Get().(*maskPRNG)
 		defer maskPool.Put(prng)
 		batch := newUDPBatch(udpListener)
+		var lastWriteSet time.Time
+		writeTimeout := time.Duration(cfg.ConnTimeout) * time.Second
 		for {
 			count, errRead := batch.read()
 			if errRead != nil {
@@ -5155,6 +5439,7 @@ func handleClientUDP(localConn net.Conn, cfg *Config) {
 				if cfg.Crypto != nil {
 					cfg.Crypto.TransformInPlace(buf[14 : 14+n])
 				}
+				refreshWriteDeadline(wsConn, writeTimeout, &lastWriteSet)
 				if errWrite := writeWSFramePreallocatedFast(wsConn, buf, 14, n, 0x2, prng); errWrite != nil {
 					err = errWrite
 					return
@@ -5172,9 +5457,16 @@ func handleClientUDP(localConn net.Conn, cfg *Config) {
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
 		var lastDeadline time.Time
+		wb := newUDPBatchWriter(udpListener, false)
+		defer func() { _ = wb.flushWrites() }()
 		for {
 			if deadlineThrottle(&lastDeadline) {
 				setTCPReadDeadline(wsTCPConn, cfg.ConnTimeout)
+			}
+			if br.Buffered() == 0 {
+				if errF := wb.flushWrites(); errF != nil {
+					logDebug("[CLIENT-UDP] batch flush failed: %v", errF)
+				}
 			}
 			data, errRead := readWSFrameInto(br, wsConn, buf[14:])
 			if errRead != nil {
@@ -5186,10 +5478,8 @@ func handleClientUDP(localConn net.Conn, cfg *Config) {
 			}
 			cAddr := clientUDPAddr.Load()
 			if cAddr != nil {
-				if _, errWrite := udpListener.WriteToUDP(data, cAddr); errWrite != nil {
+				if errWrite := wb.queueWrite(data, cAddr); errWrite != nil {
 					logDebug("[CLIENT-UDP] WriteToUDP failed: %v", errWrite)
-				} else {
-					stats.AddBytes(0, int64(len(data)))
 				}
 			}
 		}
@@ -5557,6 +5847,9 @@ func handleClient(localConn net.Conn, cfg *Config) {
 	logInfo("[CLIENT] Tunnel -> %s:%s", targetHost, targetPort)
 
 	errCh := make(chan error, 2)
+	// Egress writes get a deadline too (M6): a server that stops reading
+	// (or a local app that stops draining) must fail, not wedge us.
+	writeTimeout := time.Duration(cfg.ConnTimeout) * time.Second
 
 	// Local -> WS (UPLOAD) — client-to-server frames must be masked (RFC 6455)
 	// Use per-goroutine maskPRNG from pool to avoid crypto/rand syscall per frame.
@@ -5569,6 +5862,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		prng := maskPool.Get().(*maskPRNG)
 		defer maskPool.Put(prng)
 		var lastDeadline time.Time
+		var lastWriteSet time.Time
 		var localUp int64
 		for {
 			if deadlineThrottle(&lastDeadline) {
@@ -5587,6 +5881,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 				return
 			}
 
+			refreshWriteDeadline(wsConn, writeTimeout, &lastWriteSet)
 			if errWrite := writeWSFramePreallocatedFast(wsConn, buf, 14, nr, 0x2, prng); errWrite != nil {
 				if localUp > 0 {
 					stats.AddBytes(localUp, 0)
@@ -5606,6 +5901,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
 		var lastDeadline time.Time
+		var lastWriteSet time.Time
 		var localDown int64
 		for {
 			if deadlineThrottle(&lastDeadline) {
@@ -5626,6 +5922,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 
 			// Write coalescing: try to write data immediately
 			// For download direction, we write as-is since data comes from WebSocket frames
+			refreshWriteDeadline(localConn, writeTimeout, &lastWriteSet)
 			if _, errWrite := localConn.Write(data); errWrite != nil {
 				if localDown > 0 {
 					stats.AddBytes(0, localDown)
@@ -5738,14 +6035,18 @@ func defaultQUICConfig() *quic.Config {
 		// no Send/ReceiveDatagram call exists anywhere, so negotiating
 		// it only costs handshake bytes. KeepAlive stays 15s: longer
 		// risks NAT-binding loss on strict networks.
-		MaxIdleTimeout:                 30 * time.Second,
-		KeepAlivePeriod:                15 * time.Second,
-		MaxIncomingStreams:             512,
+		MaxIdleTimeout:  30 * time.Second,
+		KeepAlivePeriod: 15 * time.Second,
+		// v1.8.13 Phase 3: stream cap 512->4096 (client pool opens one
+		// stream per local conn; 512 stalled bursts above 512 concurrent
+		// conns) and receive windows x2 for high-BDP paths. All four
+		// windows must stay <= their Max or quic-go rejects the config.
+		MaxIncomingStreams:             4096,
 		MaxIncomingUniStreams:          128,
-		InitialStreamReceiveWindow:     2 * 1024 * 1024,
-		MaxStreamReceiveWindow:         8 * 1024 * 1024,
-		InitialConnectionReceiveWindow: 4 * 1024 * 1024,
-		MaxConnectionReceiveWindow:     16 * 1024 * 1024,
+		InitialStreamReceiveWindow:     4 * 1024 * 1024,
+		MaxStreamReceiveWindow:         16 * 1024 * 1024,
+		InitialConnectionReceiveWindow: 8 * 1024 * 1024,
+		MaxConnectionReceiveWindow:     32 * 1024 * 1024,
 		EnableDatagrams:                false,
 	}
 }
@@ -5866,15 +6167,20 @@ func handleQUICStream(stream quic.Stream, cfg *Config) {
 	logDebug("[QUIC-SERVER] Stream %d -> %s", stream.StreamID(), targetStr)
 
 	errCh := make(chan error, 2)
+	// Egress writes get a deadline too (M6): a wedged peer must fail the
+	// write instead of pinning the relay goroutine forever.
+	writeTimeout := time.Duration(cfg.ConnTimeout) * time.Second
 
 	// Stream -> Target
 	go func() {
 		bPtr := cfg.BufPool.Get().(*[]byte)
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
+		var lastWriteSet time.Time
 		for {
 			nr, errRead := br.Read(buf)
 			if nr > 0 {
+				refreshWriteDeadline(targetConn, writeTimeout, &lastWriteSet)
 				if _, errWrite := targetConn.Write(buf[:nr]); errWrite != nil {
 					errCh <- errWrite
 					return
@@ -5896,9 +6202,11 @@ func handleQUICStream(stream quic.Stream, cfg *Config) {
 		bPtr := cfg.BufPool.Get().(*[]byte)
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
+		var lastWriteSet time.Time
 		for {
 			nr, errRead := targetConn.Read(buf)
 			if nr > 0 {
+				refreshWriteDeadline(stream, writeTimeout, &lastWriteSet)
 				if _, errWrite := stream.Write(buf[:nr]); errWrite != nil {
 					errCh <- errWrite
 					return
@@ -5936,7 +6244,12 @@ func handleQUICServerUDP(stream quic.Stream, br *bufio.Reader, cfg *Config) {
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
 		var lenBuf [2]byte
+		wb := newUDPBatchWriter(udpConn, true)
+		defer func() { _ = wb.flushWrites() }()
 		for {
+			if br.Buffered() == 0 {
+				_ = wb.flushWrites()
+			}
 			if _, err := io.ReadFull(br, lenBuf[:]); err != nil {
 				errCh <- err
 				return
@@ -5990,8 +6303,9 @@ func handleQUICServerUDP(stream quic.Stream, br *bufio.Reader, cfg *Config) {
 			if rErr != nil {
 				continue
 			}
-			udpConn.WriteToUDP(payload, raddr)
-			stats.AddBytes(int64(len(payload)), 0)
+			if errWrite := wb.queueWrite(payload, raddr); errWrite != nil {
+				logDebug("[QUIC-UDP] WriteToUDP failed: %v", errWrite)
+			}
 		}
 	}()
 
@@ -6000,6 +6314,8 @@ func handleQUICServerUDP(stream quic.Stream, br *bufio.Reader, cfg *Config) {
 		rawBuf := make([]byte, 65535)
 		var lenBuf [2]byte
 		batch := newUDPBatch(udpConn)
+		var lastWriteSet time.Time
+		writeTimeout := time.Duration(cfg.ConnTimeout) * time.Second
 		for {
 			count, errRead := batch.read()
 			if errRead != nil {
@@ -6029,6 +6345,7 @@ func handleQUICServerUDP(stream quic.Stream, br *bufio.Reader, cfg *Config) {
 				}
 				totalLen := hdrLen + n
 				binary.BigEndian.PutUint16(lenBuf[:], uint16(totalLen))
+				refreshWriteDeadline(stream, writeTimeout, &lastWriteSet)
 				if _, errWrite := stream.Write(lenBuf[:]); errWrite != nil {
 					errCh <- errWrite
 					return
@@ -6256,14 +6573,19 @@ func relayQUICClient(localConn net.Conn, ver byte, initialPayload []byte, target
 	}
 
 	errCh := make(chan error, 2)
+	// Egress writes get a deadline too (M6): a wedged peer must fail the
+	// write instead of pinning the relay goroutine forever.
+	writeTimeout := time.Duration(cfg.ConnTimeout) * time.Second
 
 	go func() {
 		bPtr := cfg.BufPool.Get().(*[]byte)
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
+		var lastWriteSet time.Time
 		for {
 			nr, errRead := localConn.Read(buf)
 			if nr > 0 {
+				refreshWriteDeadline(stream, writeTimeout, &lastWriteSet)
 				if _, errWrite := stream.Write(buf[:nr]); errWrite != nil {
 					errCh <- errWrite
 					return
@@ -6282,9 +6604,11 @@ func relayQUICClient(localConn net.Conn, ver byte, initialPayload []byte, target
 		bPtr := cfg.BufPool.Get().(*[]byte)
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
+		var lastWriteSet time.Time
 		for {
 			nr, errRead := br.Read(buf)
 			if nr > 0 {
+				refreshWriteDeadline(localConn, writeTimeout, &lastWriteSet)
 				if _, errWrite := localConn.Write(buf[:nr]); errWrite != nil {
 					errCh <- errWrite
 					return
@@ -6339,6 +6663,8 @@ func handleClientUDPQUIC(localConn net.Conn, boundAddr *net.UDPAddr, udpListener
 		buf := *bPtr
 		var lenBuf [2]byte
 		batch := newUDPBatch(udpListener)
+		var lastWriteSet time.Time
+		writeTimeout := time.Duration(cfg.ConnTimeout) * time.Second
 		for {
 			count, errRead := batch.read()
 			if errRead != nil {
@@ -6351,6 +6677,7 @@ func handleClientUDPQUIC(localConn net.Conn, boundAddr *net.UDPAddr, udpListener
 				clientUDPAddr.Store(cloneUDPAddr(batch.msgs[i].Addr.(*net.UDPAddr)))
 				copy(buf, pkt)
 				binary.BigEndian.PutUint16(lenBuf[:], uint16(n))
+				refreshWriteDeadline(stream, writeTimeout, &lastWriteSet)
 				if _, errWrite := stream.Write(lenBuf[:]); errWrite != nil {
 					errCh <- errWrite
 					return
@@ -6367,7 +6694,12 @@ func handleClientUDPQUIC(localConn net.Conn, boundAddr *net.UDPAddr, udpListener
 	go func() {
 		rawBuf := make([]byte, 65535)
 		var lenBuf [2]byte
+		wb := newUDPBatchWriter(udpListener, false)
+		defer func() { _ = wb.flushWrites() }()
 		for {
+			if br.Buffered() == 0 {
+				_ = wb.flushWrites()
+			}
 			if _, err := io.ReadFull(br, lenBuf[:]); err != nil {
 				errCh <- err
 				return
@@ -6383,10 +6715,8 @@ func handleClientUDPQUIC(localConn net.Conn, boundAddr *net.UDPAddr, udpListener
 			}
 			cAddr := clientUDPAddr.Load()
 			if cAddr != nil {
-				if _, errWrite := udpListener.WriteToUDP(rawBuf[:pLen], cAddr); errWrite != nil {
+				if errWrite := wb.queueWrite(rawBuf[:pLen], cAddr); errWrite != nil {
 					logDebug("[CLIENT-QUIC-UDP] WriteToUDP failed: %v", errWrite)
-				} else {
-					stats.AddBytes(0, int64(pLen))
 				}
 			}
 		}

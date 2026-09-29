@@ -24,7 +24,7 @@ import (
 )
 
 func TestRFC6455AcceptKey(t *testing.T) {
-	// RFC 6455 §1.3 official test vector
+	// RFC 6455 搂1.3 official test vector
 	clientKey := "dGhlIHNhbXBsZSBub25jZQ=="
 	expected := "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
 	actual := computeAcceptKey(clientKey)
@@ -715,7 +715,7 @@ func TestMuxStream_PushDataTimeout(t *testing.T) {
 	st := newMuxStream(1, session)
 	session.streams[1] = st
 
-	for i := 0; i < 128; i++ {
+	for i := 0; i < muxStreamAppQueue; i++ {
 		if !st.PushData([]byte("test")) {
 			t.Fatalf("PushData failed early at index %d", i)
 		}
@@ -823,16 +823,6 @@ func TestIsLocalTarget_AllVariants(t *testing.T) {
 		if isLocalTarget(a) {
 			t.Errorf("isLocalTarget(%q) = true, want false", a)
 		}
-	}
-}
-
-func TestLargeFramePoolCap(t *testing.T) {
-	largeBuf := make([]byte, 128*1024)
-	putLargeFrame(&largeBuf)
-
-	got := largeFramePool.Get().(*[]byte)
-	if cap(*got) > maxPooledFrameCap {
-		t.Fatalf("largeFramePool retained buffer exceeding cap: %d bytes", cap(*got))
 	}
 }
 
@@ -1139,7 +1129,7 @@ func TestMuxServerStream_PushDataCleanupOnFalse(t *testing.T) {
 	st := newMuxServerStream(42, session)
 	session.streams[42] = st
 
-	for i := 0; i < 256; i++ {
+	for i := 0; i < muxStreamAppQueue; i++ {
 		st.writeChan <- muxDataFrame{data: []byte("busy")}
 	}
 
@@ -1292,13 +1282,14 @@ func TestMuxStream_ByteLimitBackpressure(t *testing.T) {
 	defer st.Close()
 
 	chunk := make([]byte, 1024*1024)
-	for i := 0; i < 8; i++ {
+	fitChunks := muxClientStreamBufferLimit / (1024 * 1024)
+	for i := 0; i < fitChunks; i++ {
 		if !st.PushData(chunk) {
 			t.Fatalf("Failed to push chunk %d within limit", i)
 		}
 	}
-	if st.QueuedBytes() != 8*1024*1024 {
-		t.Fatalf("Expected 8MB queued, got %d", st.QueuedBytes())
+	if st.QueuedBytes() != int64(muxClientStreamBufferLimit) {
+		t.Fatalf("Expected %d queued, got %d", int64(muxClientStreamBufferLimit), st.QueuedBytes())
 	}
 
 	start := time.Now()
@@ -2018,11 +2009,23 @@ func TestMuxOutboundWriterFairness(t *testing.T) {
 		defer server.Close()
 		prng := maskPool.Get().(*maskPRNG)
 		defer maskPool.Put(prng)
-		w := newMuxOutboundWriter(client, prng, nil, true)
-		defer w.close()
+		// The Phase 4 writev drain pops queued frames without touching the
+		// pipe, so a running writer races the enqueue loop below (the pipe
+		// only blocks once a batch forms — the old one-frame-per-write loop
+		// blocked after every frame, which made the race invisible). Build
+		// the writer without its loop, queue every frame first, then start
+		// draining: with the full queue visible, DRR order is
+		// deterministic. close() waits for the loop, so the deferred close
+		// is registered only after go w.loop().
+		w := &muxOutboundWriter{
+			conn:    client,
+			prng:    prng,
+			masked:  true,
+			streams: make(map[uint32]*muxStreamQueue),
+			done:    make(chan struct{}),
+		}
+		w.cond = sync.NewCond(&w.mu)
 		br := bufio.NewReader(server)
-		// Bulk stream 1 floods first; the writer blocks on the first pipe
-		// write, so all enqueues below land before any read happens.
 		for i := 0; i < 4; i++ {
 			if !w.enqueue(mkframe(1, MuxCmdDATA, 32768)) {
 				t.Fatalf("bulk enqueue %d rejected", i)
@@ -2031,6 +2034,8 @@ func TestMuxOutboundWriterFairness(t *testing.T) {
 		if !w.enqueue(mkframe(2, MuxCmdDATA, 100)) {
 			t.Fatal("interactive enqueue rejected")
 		}
+		go w.loop()
+		defer w.close()
 		var order []uint32
 		for i := 0; i < 5; i++ {
 			id, _ := readMux(br, server)
@@ -2053,7 +2058,7 @@ func TestMuxOutboundWriterFairness(t *testing.T) {
 		defer server.Close()
 		prng := maskPool.Get().(*maskPRNG)
 		defer maskPool.Put(prng)
-		w := newMuxOutboundWriter(client, prng, nil, true)
+		w := newMuxOutboundWriter(client, prng, nil, true, 0)
 		defer w.close()
 		br := bufio.NewReader(server)
 		if !w.enqueue(mkframe(1, MuxCmdDATA, 32768)) {
@@ -2090,13 +2095,13 @@ func TestMuxOutboundWriterFairness(t *testing.T) {
 		defer server.Close()
 		prng := maskPool.Get().(*maskPRNG)
 		defer maskPool.Put(prng)
-		w := newMuxOutboundWriter(client, prng, nil, true)
+		w := newMuxOutboundWriter(client, prng, nil, true, 0)
 		defer w.close()
 		br := bufio.NewReader(server)
 		// Same stream: DATA, DATA, FIN all queued while the writer is
 		// blocked on the first pipe write. A FIN that jumps its own
 		// stream's DATA would make the peer close early and drop the
-		// tail — the FIN must come last.
+		// tail 鈥?the FIN must come last.
 		if !w.enqueue(mkframe(1, MuxCmdDATA, 1000)) {
 			t.Fatal("DATA enqueue rejected")
 		}
@@ -2121,7 +2126,7 @@ func TestMuxOutboundWriterFairness(t *testing.T) {
 		defer server.Close()
 		prng := maskPool.Get().(*maskPRNG)
 		defer maskPool.Put(prng)
-		w := newMuxOutboundWriter(client, prng, nil, true)
+		w := newMuxOutboundWriter(client, prng, nil, true, 0)
 		defer w.close()
 		br := bufio.NewReader(server)
 		// SYN creates the peer-side stream: it must lead even when its
@@ -2129,7 +2134,7 @@ func TestMuxOutboundWriterFairness(t *testing.T) {
 		// unknown-stream (live-caught: full flows vanishing under burst).
 		//
 		// Determinism: SYN is enqueued FIRST, so every interleave yields
-		// [SYN, DATA] — the loop either hasn't run yet (both queued, SYN
+		// [SYN, DATA] 鈥?the loop either hasn't run yet (both queued, SYN
 		// jumps via the priority lane) or already emitted SYN alone (then
 		// blocks on the pipe write until the first read). Enqueueing DATA
 		// first would race the loop's first scheduling decision instead.
@@ -2154,7 +2159,7 @@ func TestMuxOutboundWriterFairness(t *testing.T) {
 		defer server.Close()
 		prng := maskPool.Get().(*maskPRNG)
 		defer maskPool.Put(prng)
-		w := newMuxOutboundWriter(client, prng, nil, true)
+		w := newMuxOutboundWriter(client, prng, nil, true, 0)
 		defer w.close()
 		br := bufio.NewReader(server)
 
@@ -2194,7 +2199,7 @@ func TestMuxOutboundWriterFairness(t *testing.T) {
 		defer server.Close()
 		prng := maskPool.Get().(*maskPRNG)
 		defer maskPool.Put(prng)
-		w := newMuxOutboundWriter(client, prng, nil, true)
+		w := newMuxOutboundWriter(client, prng, nil, true, 0)
 		defer w.close()
 		br := bufio.NewReader(server)
 
@@ -2236,7 +2241,7 @@ func TestMuxObfsPadding(t *testing.T) {
 		t.Cleanup(func() { maskPool.Put(prng) })
 		cfg := &Config{BufPool: mkpool(), ConnTimeout: 60, Obfs: obfs}
 		s := &MuxClientSession{wsConn: client, cfg: cfg}
-		s.writer = newMuxOutboundWriter(client, prng, nil, true)
+		s.writer = newMuxOutboundWriter(client, prng, nil, true, 0)
 		t.Cleanup(func() { s.writer.close() })
 		return s, server, bufio.NewReader(server)
 	}
@@ -2608,4 +2613,140 @@ func BenchmarkMaskWordLUT(b *testing.B) {
 			buf[j] ^= mk[j&3]
 		}
 	}
+}
+
+// TestHeartbeatPingsWhileStreamsActive guards the v1.8.13 fix: the client
+// keepalive must ping even while streams exist. The old condition (skip
+// ping when ActiveStreams > 0) meant an active-but-idle session with open
+// streams and no traffic never pinged, both rolling read deadlines fired
+// at ConnTimeout, and session Close reset every stream.
+func TestHeartbeatPingsWhileStreamsActive(t *testing.T) {
+	oldInterval := muxHeartbeatInterval
+	muxHeartbeatInterval = 25 * time.Millisecond
+	defer func() { muxHeartbeatInterval = oldInterval }()
+
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	s := &MuxClientSession{
+		wsConn:  client,
+		cfg:     &Config{},
+		streams: make(map[uint32]*MuxStream),
+		closed:  make(chan struct{}),
+	}
+	s.activeStreams.Store(3) // the exact state the old condition suppressed pings for
+	s.writer = newMuxOutboundWriter(client, nil, nil, true, 0)
+
+	go s.heartbeatLoop()
+
+	// Two pings must arrive while the session reports active streams.
+	_ = server.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for i := 0; i < 2; i++ {
+		var head [2]byte
+		if _, err := io.ReadFull(server, head[:]); err != nil {
+			t.Fatalf("ping %d: read header: %v (heartbeats must be sent even with active streams)", i+1, err)
+		}
+		if head[0] != 0x89 {
+			t.Fatalf("ping %d: expected FIN+ping opcode, got 0x%02X", i+1, head[0])
+		}
+		if head[1]&0x80 == 0 {
+			t.Fatalf("ping %d: client frames must be masked, got byte 0x%02X", i+1, head[1])
+		}
+		var mask [4]byte
+		if _, err := io.ReadFull(server, mask[:]); err != nil {
+			t.Fatalf("ping %d: read mask: %v", i+1, err)
+		}
+	}
+
+	close(s.closed)
+	_ = client.Close()
+	_ = server.Close()
+	s.writer.close()
+}
+
+// TestHeartbeatNilWriterDoesNotPanic: the writer-nil guard must skip the
+// tick instead of dereferencing a nil writer (session teardown race).
+func TestHeartbeatNilWriterDoesNotPanic(t *testing.T) {
+	oldInterval := muxHeartbeatInterval
+	muxHeartbeatInterval = 10 * time.Millisecond
+	defer func() { muxHeartbeatInterval = oldInterval }()
+
+	s := &MuxClientSession{
+		cfg:     &Config{},
+		streams: make(map[uint32]*MuxStream),
+		closed:  make(chan struct{}),
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.heartbeatLoop()
+	}()
+	time.Sleep(50 * time.Millisecond) // several ticks with writer == nil
+	close(s.closed)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("heartbeatLoop did not exit after close")
+	}
+}
+
+// TestMuxOutboundWriterWriteDeadline guards the v1.8.13 M6 fix: a reader
+// that stops draining must not wedge the writer goroutine forever (the
+// process previously set no write deadline anywhere), while healthy
+// traffic must keep the throttled deadline refreshed.
+func TestMuxOutboundWriterWriteDeadline(t *testing.T) {
+	mkframe := func(id uint32, cmd byte, size int) muxOutboundFrame {
+		buf := make([]byte, 14+MuxHeaderLen+size)
+		binary.BigEndian.PutUint32(buf[14:18], id)
+		buf[18] = cmd
+		binary.BigEndian.PutUint16(buf[19:21], uint16(size))
+		return muxOutboundFrame{bPtr: &buf, pool: &sync.Pool{}, payloadOff: 14, payloadLen: MuxHeaderLen + size, opcode: 0x2, streamID: id, cmd: cmd}
+	}
+
+	t.Run("WedgeedReaderFailsAfterTimeout", func(t *testing.T) {
+		client, server := net.Pipe()
+		defer server.Close()
+		prng := maskPool.Get().(*maskPRNG)
+		defer maskPool.Put(prng)
+		w := newMuxOutboundWriter(client, prng, nil, true, 700*time.Millisecond)
+		if !w.enqueue(mkframe(1, MuxCmdDATA, 1024)) {
+			t.Fatal("enqueue rejected")
+		}
+		// Nobody ever reads the server side: the pipe write blocks. With
+		// no write deadline this hung forever (old bug); it must now
+		// time out, error, and tear the conn down.
+		select {
+		case <-w.done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("writer wedged: expected write deadline to tear it down")
+		}
+		_ = server.SetReadDeadline(time.Now().Add(time.Second))
+		if _, err := bufio.NewReader(server).ReadByte(); err == nil {
+			t.Fatal("expected conn closed after write deadline fired")
+		}
+	})
+
+	t.Run("ActiveReaderSeesNoSpuriousTimeout", func(t *testing.T) {
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		prng := maskPool.Get().(*maskPRNG)
+		defer maskPool.Put(prng)
+		w := newMuxOutboundWriter(client, prng, nil, true, 700*time.Millisecond)
+		defer w.close()
+		br := bufio.NewReader(server)
+		// Keep writing for far longer than the write timeout: throttled
+		// refreshes must keep the deadline alive for healthy traffic.
+		for i := 0; i < 15; i++ {
+			if !w.enqueue(mkframe(1, MuxCmdDATA, 512)) {
+				t.Fatalf("enqueue %d rejected", i)
+			}
+			_ = server.SetReadDeadline(time.Now().Add(2 * time.Second))
+			if _, err := readWSFrame(br, server); err != nil {
+				t.Fatalf("healthy write %d failed: %v (deadline must refresh for active traffic)", i, err)
+			}
+			time.Sleep(120 * time.Millisecond) // 15 * 120ms = 1.8s > 700ms timeout
+		}
+	})
 }

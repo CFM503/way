@@ -203,3 +203,60 @@ func putBe32(b []byte, v uint32) {
 	b[2] = byte(v >> 8)
 	b[3] = byte(v)
 }
+
+// TestRefundThresholdNeverExceedsHalfWindow pins the anti-stall invariant:
+// WINDOW refunds must fire at least every half advertised window, else a
+// peer can exhaust its send credit before the first refund is emitted
+// (permanent silent stall for any window < muxWindowRefresh).
+func TestRefundThresholdNeverExceedsHalfWindow(t *testing.T) {
+	window := int64(muxInitialWindowKib) * 1024
+	if muxRefundThreshold <= 0 {
+		t.Fatalf("muxRefundThreshold must be positive, got %d", muxRefundThreshold)
+	}
+	if muxRefundThreshold*2 > window {
+		t.Fatalf("muxRefundThreshold %d exceeds half the advertised window %d: refunds fire too late to prevent credit exhaustion",
+			muxRefundThreshold, window/2)
+	}
+	if muxRefundThreshold > muxWindowRefresh {
+		t.Fatalf("muxRefundThreshold %d must not exceed muxWindowRefresh %d", muxRefundThreshold, muxWindowRefresh)
+	}
+}
+
+// TestStreamBufferLimitCoversWindow pins the Phase-2 buffer invariant:
+// each side's ingress buffer limit must hold a full window plus one
+// refresh of unconsumed data, otherwise queuedBytes hits the cap while
+// credit is still outstanding and the peer gets a spurious RST under
+// sustained high-BDP load.
+func TestStreamBufferLimitCoversWindow(t *testing.T) {
+	need := int64(muxInitialWindowKib)*1024 + muxWindowRefresh
+	if int64(muxClientStreamBufferLimit) < need {
+		t.Fatalf("muxClientStreamBufferLimit %d < window %d + refresh %d: ingress fills before credit drains (RST regression)",
+			int64(muxClientStreamBufferLimit), int64(muxInitialWindowKib)*1024, int64(muxWindowRefresh))
+	}
+	if int64(muxServerStreamBufferLimit) < need {
+		t.Fatalf("muxServerStreamBufferLimit %d < window %d + refresh %d: ingress fills before credit drains (RST regression)",
+			int64(muxServerStreamBufferLimit), int64(muxInitialWindowKib)*1024, int64(muxWindowRefresh))
+	}
+	// VERSION payload carries the window as uint16 KiB.
+	if muxInitialWindowKib > 0xffff {
+		t.Fatalf("muxInitialWindowKib %d does not fit the uint16 VERSION field", muxInitialWindowKib)
+	}
+	// Frame-count queues must cover the byte budget at maximum frame
+	// size, else depth (not bytes) binds first and the non-blocking
+	// ingress enqueue resets streams mid-burst (the v1.8.13 Phase-2
+	// netem regression: "ingress queue full, resetting stream").
+	const maxMuxPayload = 65535
+	budget := int64(muxClientStreamBufferLimit)
+	if int64(muxServerStreamBufferLimit) > budget {
+		budget = int64(muxServerStreamBufferLimit)
+	}
+	needFrames := (budget + maxMuxPayload - 1) / maxMuxPayload
+	if int64(muxStreamIngressQueue) < needFrames {
+		t.Fatalf("muxStreamIngressQueue %d < %d frames (buffer budget %d at max frame size): ingress burst resets streams",
+			muxStreamIngressQueue, needFrames, budget)
+	}
+	if int64(muxStreamAppQueue) < needFrames {
+		t.Fatalf("muxStreamAppQueue %d < %d frames (buffer budget %d at max frame size): app queue depth forces ingress reset",
+			muxStreamAppQueue, needFrames, budget)
+	}
+}
