@@ -52,7 +52,7 @@ import (
 )
 
 const (
-	Version        = "1.8.14"
+	Version        = "1.8.15"
 	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -112,6 +112,29 @@ func readMask(dst []byte, p *maskPRNG) {
 	dst[1] = byte(v >> 8)
 	dst[2] = byte(v >> 16)
 	dst[3] = byte(v >> 24)
+}
+
+// randIntn returns a pseudorandom int in [0, n) using xorshift64 (zero locks).
+func (p *maskPRNG) randIntn(n int) int {
+	if n <= 1 {
+		return 0
+	}
+	return int(p.next32() % uint32(n))
+}
+
+// fillRandom fills dst with fast pseudorandom bytes (zero locks).
+func (p *maskPRNG) fillRandom(dst []byte) {
+	i := 0
+	for ; i+4 <= len(dst); i += 4 {
+		binary.NativeEndian.PutUint32(dst[i:], p.next32())
+	}
+	if i < len(dst) {
+		v := p.next32()
+		for j := i; j < len(dst); j++ {
+			dst[j] = byte(v)
+			v >>= 8
+		}
+	}
 }
 
 // Small-frame stack threshold for readWSFrame pool optimization
@@ -219,10 +242,6 @@ var (
 		return err == nil && (fi.Mode()&os.ModeCharDevice) != 0
 	}()
 )
-
-func initWindowsConsole() {
-	// No-op on single-file cross-platform version
-}
 
 func getTerminalSize() (width int, height int) {
 	return 80, 24
@@ -745,6 +764,33 @@ func (r *RemoteResolver) Resolve(host string) (string, error) {
 	return sysAddrs[0], nil
 }
 
+// resolveTargetAddr uses resolver to resolve target's host if configured.
+func resolveTargetAddr(resolver *RemoteResolver, target string) string {
+	if resolver == nil {
+		return target
+	}
+	host, port, splitErr := net.SplitHostPort(target)
+	if splitErr != nil {
+		return target
+	}
+	if resolvedIP, resolveErr := resolver.Resolve(host); resolveErr == nil {
+		return net.JoinHostPort(resolvedIP, port)
+	}
+	return target
+}
+
+// verifyAuthKey checks if input matches expectedKey (if key is set).
+func verifyAuthKey(input string, expectedKey string) (cleanStr string, ok bool) {
+	if expectedKey == "" {
+		return input, true
+	}
+	parts := strings.SplitN(input, " ", 2)
+	if len(parts) == 2 && parts[0] == expectedKey {
+		return parts[1], true
+	}
+	return "", false
+}
+
 // --- Logger ---
 
 type LogLevel int
@@ -1144,7 +1190,9 @@ func writeWSFramePreallocated(w io.Writer, buf []byte, payloadOffset int, payloa
 	if masked {
 		mkOffset := frameStart + hdrLen
 		mk := buf[mkOffset : mkOffset+4]
-		// maskPRNG is passed in from the relay goroutine — zero syscalls
+		prng := maskPool.Get().(*maskPRNG)
+		readMask(mk, prng)
+		maskPool.Put(prng)
 		maskWord := binary.NativeEndian.Uint32(mk)
 
 		payload := buf[payloadOffset : payloadOffset+payloadLen]
@@ -1969,6 +2017,14 @@ var connPool *ConnPool
 // read on the stack and handed back as a heap copy, large payloads are read
 // straight into the heap slice returned to the caller (no intermediate copy).
 func readWSFrameInto(r io.Reader, w io.Writer, buf []byte) ([]byte, error) {
+	return readWSFrameIntoFused(r, w, buf, nil)
+}
+
+// readWSFrameIntoFused reads one WebSocket data frame from r, writing any Ping replies
+// to w. If crypto != nil and the frame is masked, unmasking and keystream decryption
+// are applied in a SINGLE 64-bit fused pass (payload ^ mask64 ^ keystream), halving
+// memory bus traffic on the ingress hot path.
+func readWSFrameIntoFused(r io.Reader, w io.Writer, buf []byte, crypto *Crypto) ([]byte, error) {
 	for {
 		var head [2]byte
 		if _, err := io.ReadFull(r, head[:]); err != nil {
@@ -2052,16 +2108,47 @@ func readWSFrameInto(r io.Reader, w io.Writer, buf []byte) ([]byte, error) {
 			return nil, err
 		}
 
-		if masked {
-			mk := maskKey[:]
-			maskWord := binary.NativeEndian.Uint32(mk)
+		// Ingress unmask + decryption:
+		// Data frames: single-pass fused 64-bit XOR when masked and crypto != nil.
+		// Control frames: unmask only (RFC 6455 control payloads are never ciphered).
+		if opcode < 0x8 {
+			if masked && crypto != nil {
+				ek := crypto.expandedKey
+				maskWord := binary.NativeEndian.Uint32(maskKey[:])
+				mask64 := uint64(maskWord) | (uint64(maskWord) << 32)
+				i := 0
+				for ; i+8 <= len(payload); i += 8 {
+					off := i & (cryptoChunkSize - 1)
+					binary.NativeEndian.PutUint64(payload[i:],
+						binary.NativeEndian.Uint64(payload[i:])^
+							binary.NativeEndian.Uint64(ek[off:])^mask64)
+				}
+				for ; i < len(payload); i++ {
+					payload[i] ^= ek[i&(cryptoChunkSize-1)] ^ maskKey[i&3]
+				}
+			} else if masked {
+				maskWord := binary.NativeEndian.Uint32(maskKey[:])
+				mask64 := uint64(maskWord) | (uint64(maskWord) << 32)
+				i := 0
+				for ; i+8 <= len(payload); i += 8 {
+					binary.NativeEndian.PutUint64(payload[i:],
+						binary.NativeEndian.Uint64(payload[i:])^mask64)
+				}
+				for ; i < len(payload); i++ {
+					payload[i] ^= maskKey[i&3]
+				}
+			} else if crypto != nil {
+				crypto.TransformInPlace(payload)
+			}
+		} else if masked {
+			maskWord := binary.NativeEndian.Uint32(maskKey[:])
 			i := 0
 			for ; i+4 <= len(payload); i += 4 {
 				binary.NativeEndian.PutUint32(payload[i:],
 					binary.NativeEndian.Uint32(payload[i:])^maskWord)
 			}
 			for ; i < len(payload); i++ {
-				payload[i] ^= mk[i&3]
+				payload[i] ^= maskKey[i&3]
 			}
 		}
 
@@ -2104,7 +2191,6 @@ func readWSFrame(r io.Reader, w io.Writer) ([]byte, error) {
 // --- Main Logic ---
 
 func main() {
-	initWindowsConsole()
 	defer saveLogFile()
 
 	pFlag := flag.String("p", "", "Listen Address (e.g. :8080 or 0.0.0.0:8080) [Required]")
@@ -2644,8 +2730,8 @@ const (
 	// raised without scaling these). Frame depths only bound burst
 	// absorption, never steady-state memory (credit gating does).
 	// Invariant guarded by TestStreamBufferLimitCoversWindow.
-	muxStreamIngressQueue = 768
-	muxStreamAppQueue     = 768 // client readChan / server writeChan depth
+	muxStreamIngressQueue = 256
+	muxStreamAppQueue     = 256 // client readChan / server writeChan depth
 	muxPushStallTimeout   = 15 * time.Second
 
 	// W3 flow control: version advertised in VERSION frames, initial
@@ -2830,10 +2916,29 @@ func newMuxStream(id uint32, session MuxSessionInterface) *MuxStream {
 }
 
 func (s *MuxStream) enqueueDataFrame(frame muxDataFrame) bool {
+	s.bufMu.Lock()
+	defer s.bufMu.Unlock()
 	select {
 	case <-s.closed:
 		frame.release()
 		return false
+	default:
+	}
+	if frame.data == nil {
+		s.readClosed.Store(true)
+	}
+	dataLen := int64(len(frame.data))
+	// Fast path: if ingress queue is empty and byte budget allows, bypass deliveryLoop directly into readChan
+	if len(s.ingress) == 0 && s.queuedBytes+dataLen <= muxClientStreamBufferLimit {
+		select {
+		case s.readChan <- frame:
+			s.queuedBytes += dataLen
+			return true
+		default:
+		}
+	}
+	// Fallback path: queue into ingress for deliveryLoop backpressure handling
+	select {
 	case s.ingress <- frame:
 		return true
 	default:
@@ -3139,6 +3244,8 @@ type muxOutboundWriter struct {
 	lastWriteSet time.Time
 	// scratch is the loop goroutine's writev batch buffer (Phase 4).
 	scratch []muxOutboundFrame
+	// scratchBufs is the loop goroutine's reused net.Buffers slice (zero heap alloc).
+	scratchBufs net.Buffers
 	// batchMax caps the writev drain (1 = single-frame fast link, up to
 	// muxWritevMaxFrames on weak-net); set once from the handshake
 	// classification before loop() starts, read-only afterwards.
@@ -3191,6 +3298,7 @@ func newMuxOutboundWriterBatched(conn net.Conn, prng *maskPRNG, crypto *Crypto, 
 		done:         make(chan struct{}),
 		writeTimeout: writeTimeout,
 		batchMax:     batchMax,
+		scratchBufs:  make(net.Buffers, 0, muxWritevMaxFrames),
 	}
 	w.cond = sync.NewCond(&w.mu)
 	go w.loop()
@@ -3334,15 +3442,15 @@ func (w *muxOutboundWriter) writeBatch(batch []muxOutboundFrame) error {
 	if len(batch) == 1 {
 		return w.writeFrame(batch[0])
 	}
-	var bufs net.Buffers
+	w.scratchBufs = w.scratchBufs[:0]
 	for i := range batch {
 		f := batch[i]
 		if f.ping {
-			if len(bufs) > 0 {
-				if _, err := bufs.WriteTo(w.conn); err != nil {
+			if len(w.scratchBufs) > 0 {
+				if _, err := w.scratchBufs.WriteTo(w.conn); err != nil {
 					return err
 				}
-				bufs = net.Buffers{}
+				w.scratchBufs = w.scratchBufs[:0]
 			}
 			if err := w.writeFrame(f); err != nil {
 				return err
@@ -3353,12 +3461,12 @@ func (w *muxOutboundWriter) writeBatch(batch []muxOutboundFrame) error {
 		if err != nil {
 			return err
 		}
-		bufs = append(bufs, slice)
+		w.scratchBufs = append(w.scratchBufs, slice)
 	}
-	if len(bufs) == 0 {
+	if len(w.scratchBufs) == 0 {
 		return nil
 	}
-	_, err := bufs.WriteTo(w.conn)
+	_, err := w.scratchBufs.WriteTo(w.conn)
 	return err
 }
 
@@ -3714,9 +3822,10 @@ func (s *MuxClientSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 			if room > obfsPadMax {
 				room = obfsPadMax
 			}
-			padLen = mrand.Intn(room + 1)
-			// Random fill: zero padding would itself be fingerprintable.
-			mrand.Read(buf[frameStart+frameLen : frameStart+frameLen+padLen])
+			prng := maskPool.Get().(*maskPRNG)
+			padLen = prng.randIntn(room + 1)
+			prng.fillRandom(buf[frameStart+frameLen : frameStart+frameLen+padLen])
+			maskPool.Put(prng)
 		}
 	}
 	frame := muxOutboundFrame{bPtr: bPtr, pool: s.cfg.BufPool, payloadOff: frameStart, payloadLen: frameLen + padLen, opcode: 0x2, streamID: streamID, cmd: cmd}
@@ -3742,12 +3851,9 @@ func (s *MuxClientSession) readLoop() {
 		if deadlineThrottle(&lastDeadline) {
 			setTCPReadDeadline(s.wsTCPConn, s.cfg.ConnTimeout)
 		}
-		data, err := readWSFrameInto(s.br, s.wsConn, buf[14:])
+		data, err := readWSFrameIntoFused(s.br, s.wsConn, buf[14:], s.cfg.Crypto)
 		if err != nil {
 			return
-		}
-		if s.cfg.Crypto != nil {
-			s.cfg.Crypto.TransformInPlace(data)
 		}
 
 		if len(data) < MuxHeaderLen {
@@ -4014,7 +4120,14 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 		synInitial = initialPayload
 	}
 
-	synPayload := make([]byte, 2+tLen+len(synInitial))
+	needed := 2 + tLen + len(synInitial)
+	var synStack [256]byte
+	var synPayload []byte
+	if needed <= len(synStack) {
+		synPayload = synStack[:needed]
+	} else {
+		synPayload = make([]byte, needed)
+	}
 	binary.BigEndian.PutUint16(synPayload[:2], uint16(tLen))
 	copy(synPayload[2:2+tLen], targetAddr)
 	if len(synInitial) > 0 {
@@ -4183,10 +4296,25 @@ func (s *MuxServerStream) addConsumed(n int) {
 }
 
 func (s *MuxServerStream) enqueueDataFrame(frame muxDataFrame) bool {
+	s.bufMu.Lock()
+	defer s.bufMu.Unlock()
 	select {
 	case <-s.closed:
 		frame.release()
 		return false
+	default:
+	}
+	dataLen := int64(len(frame.data))
+	// Fast path: if ingress queue is empty and byte budget allows, bypass deliveryLoop directly into writeChan
+	if len(s.ingress) == 0 && s.queuedBytes+dataLen <= muxServerStreamBufferLimit {
+		select {
+		case s.writeChan <- frame:
+			s.queuedBytes += dataLen
+			return true
+		default:
+		}
+	}
+	select {
 	case s.ingress <- frame:
 		return true
 	default:
@@ -4391,8 +4519,10 @@ func (s *MuxServerSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 			if room > obfsPadMax {
 				room = obfsPadMax
 			}
-			padLen = mrand.Intn(room + 1)
-			mrand.Read(buf[frameStart+frameLen : frameStart+frameLen+padLen])
+			prng := maskPool.Get().(*maskPRNG)
+			padLen = prng.randIntn(room + 1)
+			prng.fillRandom(buf[frameStart+frameLen : frameStart+frameLen+padLen])
+			maskPool.Put(prng)
 		}
 	}
 	frame := muxOutboundFrame{bPtr: bPtr, pool: s.cfg.BufPool, payloadOff: frameStart, payloadLen: frameLen + padLen, opcode: 0x2, streamID: streamID, cmd: cmd}
@@ -4499,12 +4629,9 @@ func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 		if deadlineThrottle(&lastDeadline) {
 			setTCPReadDeadline(wsTCPConn, cfg.ConnTimeout)
 		}
-		data, err := readWSFrameInto(br, wsConn, buf[14:])
+		data, err := readWSFrameIntoFused(br, wsConn, buf[14:], cfg.Crypto)
 		if err != nil {
 			return
-		}
-		if cfg.Crypto != nil {
-			cfg.Crypto.TransformInPlace(data)
 		}
 
 		if len(data) < MuxHeaderLen {
@@ -4621,15 +4748,7 @@ func (s *MuxServerSession) handleNewStream(st *MuxServerStream, targetStr string
 		s.streamsMu.Unlock()
 	}()
 
-	targetAddr := targetStr
-	if s.cfg.Resolver != nil {
-		host, port, splitErr := net.SplitHostPort(targetStr)
-		if splitErr == nil {
-			if resolvedIP, resolveErr := s.cfg.Resolver.Resolve(host); resolveErr == nil {
-				targetAddr = net.JoinHostPort(resolvedIP, port)
-			}
-		}
-	}
+	targetAddr := resolveTargetAddr(s.cfg.Resolver, targetStr)
 
 	targetConn, err := net.DialTimeout("tcp", targetAddr, time.Duration(s.cfg.ConnTimeout)*time.Second)
 	if err != nil {
@@ -4815,16 +4934,7 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 	}
 
 	// Remote DNS resolution for target address
-	if cfg.Resolver != nil {
-		host, port, splitErr := net.SplitHostPort(targetStr)
-		if splitErr == nil {
-			if resolvedIP, resolveErr := cfg.Resolver.Resolve(host); resolveErr == nil {
-				targetStr = net.JoinHostPort(resolvedIP, port)
-			} else {
-				logError("[DNS] Failed to resolve %s: %v", host, resolveErr)
-			}
-		}
-	}
+	targetStr = resolveTargetAddr(cfg.Resolver, targetStr)
 
 	targetConn, err := net.DialTimeout("tcp", targetStr, time.Duration(cfg.ConnTimeout)*time.Second)
 	if err != nil {
@@ -5168,13 +5278,10 @@ func handleServerUDP(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 					logDebug("[SERVER-UDP] batch flush failed: %v", errF)
 				}
 			}
-			data, errRead := readWSFrameInto(br, wsConn, buf[14:])
+			data, errRead := readWSFrameIntoFused(br, wsConn, buf[14:], cfg.Crypto)
 			if errRead != nil {
 				err = errRead
 				return
-			}
-			if cfg.Crypto != nil {
-				cfg.Crypto.TransformInPlace(data)
 			}
 			if len(data) < 7 {
 				continue
@@ -5504,13 +5611,10 @@ func handleClientUDP(localConn net.Conn, cfg *Config) {
 					logDebug("[CLIENT-UDP] batch flush failed: %v", errF)
 				}
 			}
-			data, errRead := readWSFrameInto(br, wsConn, buf[14:])
+			data, errRead := readWSFrameIntoFused(br, wsConn, buf[14:], cfg.Crypto)
 			if errRead != nil {
 				err = errRead
 				return
-			}
-			if cfg.Crypto != nil {
-				cfg.Crypto.TransformInPlace(data)
 			}
 			cAddr := clientUDPAddr.Load()
 			if cAddr != nil {
@@ -5544,22 +5648,39 @@ func handleClientUDP(localConn net.Conn, cfg *Config) {
 	localConn.Close()
 }
 
+type preReader struct {
+	r   net.Conn
+	buf []byte
+	pos int
+}
+
+func (pr *preReader) Read(p []byte) (int, error) {
+	if pr.pos < len(pr.buf) {
+		n := copy(p, pr.buf[pr.pos:])
+		pr.pos += n
+		return n, nil
+	}
+	return pr.r.Read(p)
+}
+
 // --- Client Mode ---
 func handleClient(localConn net.Conn, cfg *Config) {
-	var buf [1]byte
-	if _, err := localConn.Read(buf[:]); err != nil {
+	var stackBuf [256]byte
+	nr, err := localConn.Read(stackBuf[:])
+	if err != nil || nr == 0 {
 		return
 	}
 
+	pr := preReader{r: localConn, buf: stackBuf[:nr], pos: 1}
 	var targetHost string
 	var targetPort string
 	var initialPayload []byte
 
-	ver := buf[0]
+	ver := stackBuf[0]
 	if ver == 0x05 {
-		// SOCKS5
+		// SOCKS5: read greeting methods from pre-buffer with zero syscalls
 		var nmBuf [1]byte
-		if _, err := io.ReadFull(localConn, nmBuf[:]); err != nil {
+		if _, err := io.ReadFull(&pr, nmBuf[:]); err != nil {
 			return
 		}
 		nmethods := int(nmBuf[0])
@@ -5570,7 +5691,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		} else {
 			discard = make([]byte, nmethods)
 		}
-		if _, err := io.ReadFull(localConn, discard); err != nil {
+		if _, err := io.ReadFull(&pr, discard); err != nil {
 			return
 		}
 
@@ -5579,7 +5700,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		}
 
 		var reqHead [4]byte
-		if _, err := io.ReadFull(localConn, reqHead[:]); err != nil {
+		if _, err := io.ReadFull(&pr, reqHead[:]); err != nil {
 			return
 		}
 		cmd := reqHead[1]
@@ -5589,28 +5710,28 @@ func handleClient(localConn net.Conn, cfg *Config) {
 			// SOCKS5 UDP ASSOCIATE: strictly check all read errors to avoid processing truncated requests
 			if atyp == 0x01 {
 				var ipBuf [4]byte
-				if _, err := io.ReadFull(localConn, ipBuf[:]); err != nil {
+				if _, err := io.ReadFull(&pr, ipBuf[:]); err != nil {
 					return
 				}
 			} else if atyp == 0x03 {
 				var lenBuf [1]byte
-				if _, err := io.ReadFull(localConn, lenBuf[:]); err != nil {
+				if _, err := io.ReadFull(&pr, lenBuf[:]); err != nil {
 					return
 				}
 				domainBuf := make([]byte, int(lenBuf[0]))
-				if _, err := io.ReadFull(localConn, domainBuf); err != nil {
+				if _, err := io.ReadFull(&pr, domainBuf); err != nil {
 					return
 				}
 			} else if atyp == 0x04 {
 				var ipBuf [16]byte
-				if _, err := io.ReadFull(localConn, ipBuf[:]); err != nil {
+				if _, err := io.ReadFull(&pr, ipBuf[:]); err != nil {
 					return
 				}
 			} else {
 				return
 			}
 			var portBuf [2]byte
-			if _, err := io.ReadFull(localConn, portBuf[:]); err != nil {
+			if _, err := io.ReadFull(&pr, portBuf[:]); err != nil {
 				return
 			}
 
@@ -5628,40 +5749,47 @@ func handleClient(localConn net.Conn, cfg *Config) {
 
 		if atyp == 0x01 {
 			var ipBuf [4]byte
-			if _, err := io.ReadFull(localConn, ipBuf[:]); err != nil {
+			if _, err := io.ReadFull(&pr, ipBuf[:]); err != nil {
 				return
 			}
 			targetHost = net.IP(ipBuf[:]).String()
 		} else if atyp == 0x03 {
 			var lenBuf [1]byte
-			if _, err := io.ReadFull(localConn, lenBuf[:]); err != nil {
+			if _, err := io.ReadFull(&pr, lenBuf[:]); err != nil {
 				return
 			}
 			domainBuf := make([]byte, int(lenBuf[0]))
-			if _, err := io.ReadFull(localConn, domainBuf); err != nil {
+			if _, err := io.ReadFull(&pr, domainBuf); err != nil {
 				return
 			}
 			targetHost = string(domainBuf)
 		} else if atyp == 0x04 {
 			var ipBuf [16]byte
-			if _, err := io.ReadFull(localConn, ipBuf[:]); err != nil {
+			if _, err := io.ReadFull(&pr, ipBuf[:]); err != nil {
 				return
 			}
 			targetHost = "[" + net.IP(ipBuf[:]).String() + "]"
 		}
 
 		var portBuf [2]byte
-		if _, err := io.ReadFull(localConn, portBuf[:]); err != nil {
+		if _, err := io.ReadFull(&pr, portBuf[:]); err != nil {
 			return
 		}
 		portVal := binary.BigEndian.Uint16(portBuf[:])
 		targetPort = strconv.Itoa(int(portVal))
+
+		// If initial application data was already received in the pre-buffer
+		// (e.g. 0-RTT TLS ClientHello), capture it as initialPayload for MUX SYN.
+		if pr.pos < len(pr.buf) {
+			rem := pr.buf[pr.pos:]
+			initialPayload = make([]byte, len(rem))
+			copy(initialPayload, rem)
+		}
 	} else {
 		// HTTP Proxy: read full request header handling TCP fragmentation
 		restPtr := cfg.HeaderBufPool.Get().(*[]byte)
 		restBuf := *restPtr
-		restBuf[0] = buf[0]
-		totalRead := 1
+		totalRead := copy(restBuf, stackBuf[:nr])
 
 		for {
 			if bytes.Contains(restBuf[:totalRead], []byte("\r\n\r\n")) ||
@@ -6101,9 +6229,23 @@ func startQUICServer(listenAddr string, cfg *Config, shutdown <-chan struct{}) {
 		NextProtos:   []string{"goway-quic", "h3"},
 	}
 
-	listener, err := quic.ListenAddr(listenAddr, tlsConf, defaultQUICConfig())
+	udpAddr, err := net.ResolveUDPAddr("udp", listenAddr)
+	if err != nil {
+		logError("[QUIC-SERVER] ResolveUDPAddr %s err: %v", listenAddr, err)
+		return
+	}
+	udpConn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
 		logError("[QUIC-SERVER] Failed to bind UDP %s: %v", listenAddr, err)
+		return
+	}
+	_ = udpConn.SetReadBuffer(4 * 1024 * 1024)
+	_ = udpConn.SetWriteBuffer(4 * 1024 * 1024)
+
+	listener, err := quic.Listen(udpConn, tlsConf, defaultQUICConfig())
+	if err != nil {
+		logError("[QUIC-SERVER] quic.Listen on %s err: %v", listenAddr, err)
+		udpConn.Close()
 		return
 	}
 	logInfo("[QUIC-SERVER] Listening on UDP %s (QUIC Mode)", listenAddr)
@@ -6150,10 +6292,28 @@ func handleQUICConnection(qConn quic.Connection, cfg *Config) {
 	}
 }
 
+var bufioReaderPool = sync.Pool{
+	New: func() interface{} {
+		return bufio.NewReaderSize(nil, 4096)
+	},
+}
+
+func getBufioReader(r io.Reader) *bufio.Reader {
+	br := bufioReaderPool.Get().(*bufio.Reader)
+	br.Reset(r)
+	return br
+}
+
+func putBufioReader(br *bufio.Reader) {
+	br.Reset(nil)
+	bufioReaderPool.Put(br)
+}
+
 func handleQUICStream(stream quic.Stream, cfg *Config) {
 	defer stream.Close()
 
-	br := bufio.NewReader(stream)
+	br := getBufioReader(stream)
+	defer putBufioReader(br)
 	targetLine, err := br.ReadString('\n')
 	if err != nil {
 		return
@@ -6161,14 +6321,12 @@ func handleQUICStream(stream quic.Stream, cfg *Config) {
 	targetStr := strings.TrimSpace(targetLine)
 
 	// Authentication check if key is set
-	if cfg.Key != "" {
-		parts := strings.SplitN(targetStr, " ", 2)
-		if len(parts) != 2 || parts[0] != cfg.Key {
-			logWarn("[QUIC-SERVER] Auth rejected for stream from %v", stream.StreamID())
-			stream.Write([]byte("ERR: AUTH_FAILED\n"))
-			return
-		}
-		targetStr = parts[1]
+	if clean, ok := verifyAuthKey(targetStr, cfg.Key); !ok {
+		logWarn("[QUIC-SERVER] Auth rejected for stream from %v", stream.StreamID())
+		stream.Write([]byte("ERR: AUTH_FAILED\n"))
+		return
+	} else {
+		targetStr = clean
 	}
 
 	if strings.EqualFold(targetStr, "UDP") || strings.HasPrefix(strings.ToUpper(targetStr), "UDP") {
@@ -6177,15 +6335,7 @@ func handleQUICStream(stream quic.Stream, cfg *Config) {
 	}
 
 	// Remote DNS resolution for target address
-	targetAddr := targetStr
-	if cfg.Resolver != nil {
-		host, port, splitErr := net.SplitHostPort(targetStr)
-		if splitErr == nil {
-			if resolvedIP, resolveErr := cfg.Resolver.Resolve(host); resolveErr == nil {
-				targetAddr = net.JoinHostPort(resolvedIP, port)
-			}
-		}
-	}
+	targetAddr := resolveTargetAddr(cfg.Resolver, targetStr)
 
 	targetConn, err := net.DialTimeout("tcp", targetAddr, time.Duration(cfg.ConnTimeout)*time.Second)
 	if err != nil {
@@ -6528,17 +6678,25 @@ func (p *QUICClientPool) dialAndOpenStream(ctx context.Context, dialingCh chan s
 	}()
 
 	// 1. DNS Resolve outside lock
-	dialHost, dialPort, _ := net.SplitHostPort(p.dialAddr)
-	if p.cfg.Resolver != nil {
-		if resolvedIP, rErr := p.cfg.Resolver.Resolve(dialHost); rErr == nil {
-			dialHost = resolvedIP
-		}
-	}
-	actualAddr := net.JoinHostPort(dialHost, dialPort)
+	actualAddr := resolveTargetAddr(p.cfg.Resolver, p.dialAddr)
 
-	// 2. DialAddr outside lock
-	newConn, dialErr = quic.DialAddr(ctx, actualAddr, p.tlsConf, defaultQUICConfig())
+	// 2. Bind UDP with 4MB buffers and Dial outside lock
+	udpAddr, rErr := net.ResolveUDPAddr("udp", actualAddr)
+	if rErr != nil {
+		dialErr = rErr
+		return nil, dialErr
+	}
+	udpConn, lErr := net.ListenUDP("udp", nil)
+	if lErr != nil {
+		dialErr = lErr
+		return nil, dialErr
+	}
+	_ = udpConn.SetReadBuffer(4 * 1024 * 1024)
+	_ = udpConn.SetWriteBuffer(4 * 1024 * 1024)
+
+	newConn, dialErr = quic.Dial(ctx, udpConn, udpAddr, p.tlsConf, defaultQUICConfig())
 	if dialErr != nil {
+		udpConn.Close()
 		return nil, dialErr
 	}
 
