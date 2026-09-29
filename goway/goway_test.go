@@ -2448,6 +2448,66 @@ func TestMuxFrameUnmaskedEqualsTwoPass(t *testing.T) {
 	}
 }
 
+// TestReadWSFrameIntoFusedEqualsTwoPass proves single-pass fused unmask+decrypt
+// produces identical plaintext as legacy two-pass (readWSFrameInto then TransformInPlace).
+func TestReadWSFrameIntoFusedEqualsTwoPass(t *testing.T) {
+	prng := maskPool.Get().(*maskPRNG)
+	defer maskPool.Put(prng)
+
+	for _, key := range []string{"", "fused-ingress-key"} {
+		var crypto *Crypto
+		if key != "" {
+			crypto = NewCrypto(key)
+		}
+		for _, masked := range []bool{true, false} {
+			for _, sz := range []int{0, 1, 7, 10, 125, 126, 128, 1000, 7000, 65535, 70000} {
+				raw := make([]byte, sz)
+				for i := range raw {
+					raw[i] = byte((i*31 + sz) % 256)
+				}
+
+				// Encode frame to a buffer
+				frameBuf := make([]byte, sz+32)
+				copy(frameBuf[14:], raw)
+				var wire bytes.Buffer
+				if masked {
+					if err := writeWSFramePreallocatedFast(&wire, frameBuf, 14, sz, 0x2, prng); err != nil {
+						t.Fatalf("masked encode fail: %v", err)
+					}
+				} else {
+					if err := writeWSFramePreallocated(&wire, frameBuf, 14, sz, 0x2, false); err != nil {
+						t.Fatalf("unmasked encode fail: %v", err)
+					}
+				}
+
+				// 1. Two-pass decode
+				wireTwoPass := wire.Bytes()
+				scratch1 := make([]byte, sz+32)
+				gotTwoPass, err := readWSFrameInto(bytes.NewReader(wireTwoPass), nil, scratch1[14:])
+				if err != nil {
+					t.Fatalf("two-pass read failed: %v", err)
+				}
+				gotTwoPassPlain := append([]byte(nil), gotTwoPass...)
+				if crypto != nil {
+					crypto.TransformInPlace(gotTwoPassPlain)
+				}
+
+				// 2. Fused single-pass decode
+				wireFused := wire.Bytes()
+				scratch2 := make([]byte, sz+32)
+				gotFused, err := readWSFrameIntoFused(bytes.NewReader(wireFused), nil, scratch2[14:], crypto)
+				if err != nil {
+					t.Fatalf("fused read failed: %v", err)
+				}
+
+				if !bytes.Equal(gotTwoPassPlain, gotFused) {
+					t.Fatalf("mismatch between two-pass and fused: key=%q masked=%v sz=%d", key, masked, sz)
+				}
+			}
+		}
+	}
+}
+
 func BenchmarkMUXEncodeTwoPass(b *testing.B) {
 	crypto := NewCrypto("bench-key")
 	raw := make([]byte, 65535)
