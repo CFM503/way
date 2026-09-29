@@ -393,3 +393,88 @@ EnableDatagrams false untouched (v1.8.7 trims).
   investigation (pre-existing, Phase 3 blocker); real-WAN high-BDP A/B to
   validate the Phase 5 +10~30% claim; Phase 7 UDP batch path has no live
   bench coverage (add a UDP bench arm if UDP throughput becomes a target).
+
+## v1.8.14 cycle: head-to-head regression hunt + handshake-gated writev — 2026-09-29
+
+### Trigger: v1.8.13 vs v1.8.12 head-to-head (user request)
+- Weak net (WSL2 40ms netem, n=10): **2 IMPROVED / 0 REGRESSED**
+  (c8 up +25.2% 1/9, c1 cpu -9.6% 1/9) — v1.8.13's netem story held.
+- Loopback (Windows, n=10): c32 rss flagged 9/1 (+8.0%) → protocol
+  confirmation **n=20: c32 down 16/4 -8.4% REGRESSED** (up 14/6, rss
+  13/7 both NOISE). The per-phase chain (n=10/crit9) had missed it: five
+  steps leaned negative at 6-7/3 individually, all sub-crit.
+- Two placebo runs (v12_final vs identical rebuild v12_copy, n=20 each):
+  11/9 -4.5% and 9/11 +0.5% — harness has no phantom-regression
+  mechanism; later verdicts trustworthy. Order-parity splits (ord1/ord2)
+  exposed ±8% positional swings; runs whose signal lives in ONE parity
+  only (e.g. v14c 15/5 = ord1 10/10 + ord2 5/10) are suspect, runs
+  negative in BOTH parities (v13: -33.7/-30.4) are real.
+
+### Attribution (all n=20, same-day binaries, direct adjacent pairs)
+- P1 (heartbeat/deadlines/refund): v12 vs p1 **9/11 +0.5% NOISE** — clean.
+- P2 (queue 768/40MiB): p1 vs p2 **9/11 +4.0% NOISE** — clean.
+- P3 (QUIC params): p2 vs p3 **9/11 +1.4% NOISE** — clean.
+- **P4 (writev) = the culprit:** p3 vs p4 down **16/4 -11.8%** then
+  replication **20/0 -7.6%** REGRESSED; up 15/5 -4.7% (confirmed in
+  rep 2). v12 vs p4 pooled 29/40 down. Linux loopback p3 vs p4 n=20:
+  up **15/4 -6.5%**, down **15/4 -7.9%** REGRESSED → platform-independent
+  fast-link cost, not Windows/WSASend.
+- v12 vs p3 (P1-P3 cumulative): **8/12 GOOD-leaning NOISE** — confirms
+  P1-P3 as a block too.
+- P5 (sessions 8): in-context toggle (v14c vs sessions-4 build) all
+  NOISE — task-book sessions 8 stays. P6 (PGO): -pgo=off toggle all
+  NOISE (13/7 leans "PGO helps") — stays. P7 not exercised by the WS
+  TCP bench (handshake-only + UDP paths).
+- RSS: v12 vs p4 16/4 +10.6% and v12 vs wv2(f2) 17/3 +11.5% confirmed;
+  individual steps sub-noise → thin spread with the 40MiB stream buffer
+  limit as the retention driver.
+
+### Frame-cap sweep (single-variable builds off HEAD)
+| cap | loopback c32 down (vs f8/v13) | netem up (vs f8) |
+|---|---|---|
+| 8 | baseline (v13: -8.4% vs v12) | baseline (v13 netem +25% vs v12) |
+| 4 | +2.6% 3/7 NOISE | -1.8% 6/4 NOISE |
+| 2 | **+10.5% 3/7** (median restored) | c8 -9.5% 8/2, c32 -6.7% 7/3 (sub-crit) |
+| 1 | **+10.5% 0/10 IMPROVED** | **c8 -12.8% 9/1, c32 -15.9% 9/1 REGRESSED** |
+
+### Fix shipped (v1.8.14)
+1. **Handshake-duration classification** replaces both fixed caps and the
+   failed write-duration EMA attempt (EMA selected f8 on loopback too:
+   c32 backpressure blocks writes >500µs → v14d reproduced -8.4% —
+   documented dead end). Design: client times `dialNewSession` (dial +
+   upgrade + MUX auth ≈ 2-3 RTT), server times `handleServer` entry →
+   auth frame; `writevBatchFor(setupDur)` = batch8 if >30ms else
+   single-frame (loopback/LAN <10ms, 40ms netem 80-120ms). Static per
+   session, no protocol change, no per-write state. Plumbing:
+   `newMuxOutboundWriterBatched(..., batchMax)`, `w.batchMax` field set
+   before `go loop()`; old 5-arg constructor kept as wrapper (tests).
+2. **`muxClient/ServerStreamBufferLimit` 40MiB → 9MiB** (= window
+   8192KiB + refresh 1MiB exactly; `TestStreamBufferLimitCoversWindow`
+   still passes; queue depths stay 768). The 40MiB headroom belonged to
+   the reverted 32MiB-window arm and let streams retain pooled buffers.
+
+### Certification (candidate `v14e` vs v12_final, same-machine paired)
+- Loopback full c1/c8/c32 n=10: **15/15 NOISE**.
+- Loopback c32 n=20: all NOISE — down **+9.8% 6/14 good-leaning**, rss
+  +2.5% 11/9 (was 17/3 +11.5%) — both prior regressions eliminated.
+- WSL2 40ms netem n=10: **2 IMPROVED / 0 REGRESSED** — c8 up +12.3%
+  (1/9), c8 down +14.1% (1/9), c1 cpu -6.2% (1/9); c1 rss +4.6% 10/0
+  under the 5% practice gate → NOISE; c8/c32 cpu +13% at 8/2 under crit.
+- `gofmt -l` empty, `go vet` clean, full `go test -count=1 ./...` ok
+  62.9 s; Windows + cross-compiled Linux builds OK.
+- Evidence CSVs: `bench_ab_12_13_*`, `bench_ab_placebo*`, `bench_ab_p4_c32_confirm*`,
+  `bench_ab_p1_p4_*`, `bench_ab_p*_c32_confirm*`, `bench_ab_p5off_c32`,
+  `bench_ab_p6off_c32`, `bench_ab_v14*_vs12_*`, `bench_ab_wv*` (local, gitignored).
+
+### Session notes (methodology / environment)
+- Cross-day chain step-sums are INVALID (regime drift ±10%: base_med
+  c32 down swung 315→470 within one day); only direct adjacent same-run
+  pairs count. ±3% effects need n=20; n=10/crit9 cannot certify them.
+- WSL `go` broken (toolchain go1.25.0 download timeout) → cross-compile
+  `GOOS=linux GOARCH=amd64 go build` from Windows (matches how all
+  prior `*_linux` binaries were produced). PS5.1 `Set-Content -Raw` /
+  `Get-Content -Raw` corrupt UTF-8 source files → always use the Edit
+  tool for goway.go; byte-faithful copies via `Copy-Item`.
+- Status: **released v1.8.14** (version const, CHANGELOG, tag, push).
+  Open items unchanged: QUIC+WSL2 netem stall, real-WAN high-BDP A/B,
+  UDP bench arm.

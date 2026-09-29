@@ -20,6 +20,9 @@ goway/cand_*.exe
 goway/bench_*.csv
 goway/cand_*_linux
 goway/bench_linux
+# regression-hunt / tuning candidate binaries (v1.8.14 cycle)
+goway/v1*_linux
+goway/wv*_linux
 
 # PGO profile collection artifacts (default.pgo itself is tracked)
 goway/*.pprof

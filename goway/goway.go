@@ -52,7 +52,7 @@ import (
 )
 
 const (
-	Version        = "1.8.13"
+	Version        = "1.8.14"
 	MaxWSFrameSize = 64 * 1024 * 1024 // 64MB (increased from 16MB for better throughput)
 	MaxHeaderSize  = 8192
 	CRLF           = "\r\n"
@@ -2627,21 +2627,23 @@ const (
 	// Invariant: >= muxInitialWindowKib*1024 + muxWindowRefresh, else the
 	// ingress queue fills before credit can drain -> spurious RST under
 	// high-BDP load (guarded by TestStreamBufferLimitCoversWindow).
-	muxClientStreamBufferLimit = 40 * 1024 * 1024
+	// 9MiB = window (8192KiB) + refresh (1MiB) exactly: the Phase-2 40MiB
+	// headroom was sized for the reverted 32MiB window arm and let streams
+	// retain pooled frame buffers ~+11% RSS vs v1.8.12 at c32 loopback.
+	muxClientStreamBufferLimit = 9 * 1024 * 1024
 
 	// Server-side Mux stream buffer limit.
-	// Same window+refresh invariant as the client side; higher headroom
-	// for downstream fan-out / asymmetric traffic patterns.
-	muxServerStreamBufferLimit = 40 * 1024 * 1024
-	// Frame-count queue depths. PushDataFrame budgets bytes
-	// (buffer limits above, 40MiB), so the frame depths must not bind
-	// first: at maximum frame size (65535B) a 40MiB budget needs 641
-	// frames, hence 768 slots per queue. Anything smaller lets the
-	// non-blocking ingress enqueue reset the stream mid-burst ("ingress
-	// queue full", observed under 40ms netem when the window was raised
-	// without scaling these). Frame depths only bound burst absorption,
-	// never steady-state memory (credit gating does). Invariant guarded
-	// by TestStreamBufferLimitCoversWindow.
+	// Same window+refresh invariant as the client side.
+	muxServerStreamBufferLimit = 9 * 1024 * 1024
+	// Frame-count queue depths. PushDataFrame budgets bytes (buffer limits
+	// above, 9MiB), so the frame depths must not bind first: at maximum
+	// frame size (65535B) a 9MiB budget needs 144 frames; 768 slots keep
+	// burst absorption far above the budget (small-frame bursts bind the
+	// byte budget before depth, and 768 still bounds the "ingress queue
+	// full" reset risk observed under 40ms netem when the window was
+	// raised without scaling these). Frame depths only bound burst
+	// absorption, never steady-state memory (credit gating does).
+	// Invariant guarded by TestStreamBufferLimitCoversWindow.
 	muxStreamIngressQueue = 768
 	muxStreamAppQueue     = 768 // client readChan / server writeChan depth
 	muxPushStallTimeout   = 15 * time.Second
@@ -3137,6 +3139,10 @@ type muxOutboundWriter struct {
 	lastWriteSet time.Time
 	// scratch is the loop goroutine's writev batch buffer (Phase 4).
 	scratch []muxOutboundFrame
+	// batchMax caps the writev drain (1 = single-frame fast link, up to
+	// muxWritevMaxFrames on weak-net); set once from the handshake
+	// classification before loop() starts, read-only afterwards.
+	batchMax int
 }
 
 const (
@@ -3153,12 +3159,29 @@ const (
 	// Max random padding appended to MUX DATA frames when -obfs is on.
 	// Sized near MTU so padded lengths spread across the full range.
 	obfsPadMax = 1400
-	// Phase 4 writev: coalesce up to 8 frames / 256KB per egress syscall.
+	// Phase 4 writev: coalesce scheduled frames per egress syscall.
+	// Adaptive cap by handshake classification: loopback/low-RTT links
+	// regress -3~12% c32 throughput with multi-frame batches (writev burst
+	// serializes send/recv on the same host), while weak-net (40ms) gains
+	// up to +21% c32 up. The mux handshake duration (~2-3 RTT) classifies
+	// the link once per session: slow -> batch up to muxWritevMaxFrames,
+	// fast -> single-frame writes. No per-write state (write-duration EMA
+	// proved unusable: loopback backpressure blocks writes too).
 	muxWritevMaxFrames = 8
 	muxWritevMaxBytes  = 256 * 1024
+	// Handshake durations above this classify the link as weak-net
+	// (RTT-bound) -> enable writev batching; at/below -> single-frame.
+	// Loopback/LAN setups measure <10ms, 40ms netem ~80-120ms.
+	muxWritevSlowLinkSetup = 30 * time.Millisecond
 )
 
 func newMuxOutboundWriter(conn net.Conn, prng *maskPRNG, crypto *Crypto, masked bool, writeTimeout time.Duration) *muxOutboundWriter {
+	return newMuxOutboundWriterBatched(conn, prng, crypto, masked, writeTimeout, muxWritevMaxFrames)
+}
+
+// newMuxOutboundWriterBatched is newMuxOutboundWriter with an explicit
+// writev batch cap chosen by the caller's handshake classification.
+func newMuxOutboundWriterBatched(conn net.Conn, prng *maskPRNG, crypto *Crypto, masked bool, writeTimeout time.Duration, batchMax int) *muxOutboundWriter {
 	w := &muxOutboundWriter{
 		conn:         conn,
 		prng:         prng,
@@ -3167,10 +3190,21 @@ func newMuxOutboundWriter(conn net.Conn, prng *maskPRNG, crypto *Crypto, masked 
 		streams:      make(map[uint32]*muxStreamQueue),
 		done:         make(chan struct{}),
 		writeTimeout: writeTimeout,
+		batchMax:     batchMax,
 	}
 	w.cond = sync.NewCond(&w.mu)
 	go w.loop()
 	return w
+}
+
+// writevBatchFor maps a mux handshake duration (~2-3 RTT) to the egress
+// writev batch cap: weak-net (slow setup) batches, fast links stay
+// single-frame.
+func writevBatchFor(setupDur time.Duration) int {
+	if setupDur > muxWritevSlowLinkSetup {
+		return muxWritevMaxFrames
+	}
+	return 1
 }
 
 func (w *muxOutboundWriter) releaseFrame(f muxOutboundFrame) {
@@ -3267,7 +3301,7 @@ func (w *muxOutboundWriter) loop() {
 		// DRR fairness and frame order are unchanged (popLocked sequence).
 		batch := append(w.scratch[:0], f)
 		batchBytes := frameWireLen(f) + MuxHeaderLen + 14
-		for len(batch) < muxWritevMaxFrames && batchBytes < muxWritevMaxBytes {
+		for len(batch) < w.batchMax && batchBytes < muxWritevMaxBytes {
 			f2, ok2 := w.tryNext()
 			if !ok2 {
 				break
@@ -3524,10 +3558,10 @@ func (s *MuxClientSession) decrementActiveStreams() {
 	}
 }
 
-func newMuxClientSession(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, cfg *Config) *MuxClientSession {
+func newMuxClientSession(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, cfg *Config, setupDur time.Duration) *MuxClientSession {
 	prng := maskPool.Get().(*maskPRNG)
 	s := &MuxClientSession{wsConn: wsConn, br: br, wsTCPConn: wsTCPConn, cfg: cfg, streams: make(map[uint32]*MuxStream), closed: make(chan struct{}), prng: prng}
-	s.writer = newMuxOutboundWriter(wsConn, prng, cfg.Crypto, true, time.Duration(cfg.ConnTimeout)*time.Second)
+	s.writer = newMuxOutboundWriterBatched(wsConn, prng, cfg.Crypto, true, time.Duration(cfg.ConnTimeout)*time.Second, writevBatchFor(setupDur))
 	// W3 version negotiation: advertise our version + initial receive
 	// window right after the session handshake. Old servers skip the
 	// unknown command; new servers answer with their own VERSION.
@@ -3896,6 +3930,7 @@ func (p *MuxClientPool) dialBackgroundSession() {
 }
 
 func (p *MuxClientPool) dialNewSession() (*MuxClientSession, error) {
+	setupStart := time.Now()
 	wsConn, br, wsTCPConn, err := dialUpstreamWS(p.cfg)
 	if err != nil {
 		return nil, err
@@ -3925,7 +3960,7 @@ func (p *MuxClientPool) dialNewSession() (*MuxClientSession, error) {
 	}
 
 	logInfo("[MUX] Client session established to upstream")
-	return newMuxClientSession(wsConn, br, wsTCPConn, p.cfg), nil
+	return newMuxClientSession(wsConn, br, wsTCPConn, p.cfg, time.Since(setupStart)), nil
 }
 
 func (p *MuxClientPool) Close() {
@@ -4417,7 +4452,7 @@ func (s *MuxServerSession) sendFrameInline(streamID uint32, cmd byte, payload []
 	return writeWSFramePreallocated(s.wsConn, buf, frameStart, writeLen, 0x2, false)
 }
 
-func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, cfg *Config) {
+func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, cfg *Config, setupDur time.Duration) {
 	logInfo("[SERVER] Mux Session requested")
 	var ok []byte
 	if cfg.Crypto != nil {
@@ -4440,7 +4475,7 @@ func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 		closed:    make(chan struct{}),
 	}
 	// Server never masks; prng unused by the unmasked write path.
-	session.writer = newMuxOutboundWriter(wsConn, nil, cfg.Crypto, false, time.Duration(cfg.ConnTimeout)*time.Second)
+	session.writer = newMuxOutboundWriterBatched(wsConn, nil, cfg.Crypto, false, time.Duration(cfg.ConnTimeout)*time.Second, writevBatchFor(setupDur))
 	defer session.Close()
 
 	// W3 version negotiation: advertise our version + initial receive
@@ -4700,6 +4735,7 @@ func handleConnection(conn net.Conn, cfg *Config) {
 // --- Server Mode ---
 func handleServer(wsConn net.Conn, cfg *Config) {
 	logDebug("handleServer started for %v", wsConn.RemoteAddr())
+	setupStart := time.Now()
 	br := bufio.NewReaderSize(wsConn, MaxHeaderSize)
 	wsTCPConn := extractTCPConn(wsConn) // cached for tight-loop deadline sets
 
@@ -4774,7 +4810,7 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 		return
 	}
 	if strings.EqualFold(targetStr, "MUX") || strings.HasPrefix(strings.ToUpper(targetStr), "MUX") {
-		handleServerMux(wsConn, br, wsTCPConn, cfg)
+		handleServerMux(wsConn, br, wsTCPConn, cfg, time.Since(setupStart))
 		return
 	}
 

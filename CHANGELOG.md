@@ -6,6 +6,16 @@ All notable changes to the **Way Proxy** project (Goway & Pyway) are documented 
 
 ---
 
+## [v1.8.14] - 2026-09-29
+
+### 头对头回归修复：writev 按握手时长自适应门控 + 流缓冲限额 40MiB→9MiB
+
+- **背景（v1.8.13 头对头发现）**: 直接 A/B v1.8.13 vs v1.8.12，loopback c32 下行 **-8.4%（16/4, n=20, REGRESSED）**、RSS +8~11% 偏移——逐步链 A/B（n=10/crit9）因功效不足全部漏检。双安慰剂（同源码重建对打）证明 harness 无假阳性。
+- **归因（全部 n=20 双侧直测）**: P1 心跳/期限、P2 队列/缓冲、P3 QUIC 参数、P5 sessions、P6 PGO 全部 NOISE 清白；**P4 writev 攒批 = 元凶**（p3 vs p4 下行 16/4 -11.8% + 复现 20/0 -7.6%，上行 15/5 -4.7% 也确认；Linux loopback 同样 15/4 -6.5/-7.9% → 非平台问题）。批量上限扫描：frames=8 弱网强收益但 loopback -8~-12%；frames=1 loopback 恢复（0/10 +10.5%）但弱网上行 -15.9% REGRESSED；=2 折中仍残留 -3%。
+- **修复**: ① writev 改**握手时长分类**（client `dialNewSession` 建链起测、server `handleServer` 到 auth 起测，~2-3 RTT；>30ms 判弱网启用攒批（≤8帧/256KB），否则单帧直写）——无每写状态、无协议变更、按会话一次判定；写时长 EMA 方案实测失效已否决（loopback 背压下写同样阻塞）。② `muxClient/ServerStreamBufferLimit` 40MiB→**9MiB**（= 窗口8192KiB+刷新1MiB 精确满足 `TestStreamBufferLimitCoversWindow`；40MiB 为已回滚的 32MiB 窗口臂设计，驻留池化缓冲 +11.5% RSS 的来源）。
+- **认证（v1.8.14 vs v1.8.12 同机直测）**: loopback 全档 n=10 **15/15 NOISE**；loopback c32 n=20 全 NOISE（下行 +9.8% 偏正、RSS +2.5%——两项回归全消）；WSL2 40ms netem n=10 **2 IMPROVED / 0 REGRESSED**（c8 上行 +12.3% 1/9、c8 下行 +14.1% 1/9、c1 CPU -6.2% 1/9——弱网收益保留）。gofmt/vet 干净、全套 `go test` ok 62.9s。
+- **方法论备注**: 跨日逐步链相加无效（机况漂移 ±10%）；±3% 量级效应需 n=20+ 才可判定；order 奇偶拆分可检出位置伪影；证据 CSV `goway/bench_ab_*.csv`（本地，gitignore）。
+
 ## [v1.8.13] - 2026-09-29
 
 ### Goway 不改协议七项优化落地（bug修复 / 调参 / QUIC / writev / 并行度 / PGO / 减拷贝）
