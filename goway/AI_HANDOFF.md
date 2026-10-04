@@ -11,6 +11,222 @@
 - Record before/after numbers in this file with every performance-relevant change. **No numbers, no completion.**
 - User mandate, 2026-09-23. 违反此规则的改动一律不得合入：只允许正向优化，永远禁止反向优化。
 
+
+## v1.8.16 cycle: P0 mux frame-reorder fix + P1 robustness + P2/security batch (2026-10-03)
+### P0 FIX (correctness, reproduced 3/3 pre-fix): v1.8.15 direct-push fast path reordered same-stream frames
+- Mechanism: with the stream byte budget nearly full, a large frame A misses the budget in
+  `enqueueDataFrame` and falls back to ingress; deliveryLoop dequeues A and `PushDataFrame` STALLS
+  on the budget - holding A OUTSIDE ingress with `bufMu` RELEASED while waiting on `hasSpace`. A
+  later SMALLER frame B passed the fast path (`len(ingress)==0` + budget fits) and landed in
+  `readChan` ahead of A -> same-stream FIFO violation -> relayed TCP stream corruption under
+  backpressure with mixed frame sizes (routine on real WANs). Probe test reproduced 3/3 pre-fix.
+  NOTE: throughput benchmarks cannot catch this class - the v1.8.15 A/B showed all metrics
+  IMPROVED/NOISE while correctness broke.
+- Fix: per-stream `inFlight atomic.Int64` - +1 when a frame is admitted via the fallback path
+  (under bufMu, before the ingress send), -1 in `deliveryLoop` after `PushDataFrame` returns; the
+  direct-push fast path now requires `inFlight == 0`. Under backpressure the stream automatically
+  reverts to the v1.8.14 pure-ingress ordering; the uncontended fast path is unchanged (one extra
+  atomic load). Client (`MuxStream`) and server (`MuxServerStream`) both fixed. Regression tests:
+  `goway_reorder_test.go` (client+server, deterministic fill/stall/overtake sequence).
+### P1 fixes (four small ones)
+1. **UDP/MUX tunnel routing exact-match** (`classifyServerTarget`): the old
+   `strings.HasPrefix(ToUpper(targetStr), "UDP"/"MUX")` misrouted real targets like
+   `udp-example.com:443` / `mux.dev:443` into the tunnels (WS server + QUIC server paths).
+2. **RemoteResolver DNS cache bound**: 4096-entry cap + expired-sweep + quarter-drop eviction
+   (the map previously only ever grew).
+3. **Log-file flush throttle**: every WARN/ERROR used to rewrite the log file synchronously UNDER
+   `logRingMu` (relay hot paths call logWarn) - an error storm converted log volume into disk
+   stalls on every relay goroutine. Now: ring updated per entry, flushed at most once per 2s,
+   write OUTSIDE the mutex; `saveLogFile` still finalizes on exit.
+4. **flag.Usage text drift fixed**: -W default 128 (said 64), -mux-sessions default 8 (said 4)
+   - defaults changed in v1.8.13 Phase 5 without updating the manual usage text.
+### P2 / security (all default-off or behavior-preserving; non-mux/XOR wire format byte-identical)
+- **`MaxWSFrameSize` 64MB -> 12MB+64**: aligned to the largest frame the sender side can build
+  (BufPool caps at 12MB + MUX header + AEAD overhead). The 64MB ceiling was pure memory-flood
+  surface (a claimed length heap-allocates on receipt; pre-auth on the handshake path too).
+- **`verifyAuthKey`**: constant-time key compare (`crypto/subtle`).
+- **QUIC cert pinning**: server cert is now DETERMINISTIC (Ed25519 from
+  `sha256("GOWAY-QUIC-CERT-SEED:"+key)`) when a proxy key is set; new `-verify-quic` client flag
+  pins it (`VerifyPeerCertificate`), turning QUIC mode from encrypted-but-MITMable
+  (InsecureSkipVerify) into real authentication. No key (-allow-open) keeps the random ECDSA
+  cert; old clients skip verification -> wire-compatible either direction.
+- **`-cipher aead` (opt-in, BOTH ends)**: per-frame AES-256-GCM, wire layout
+  `[nonce(4B random process prefix + 8B atomic counter)|ct|tag]` (+28B per frame),
+  `muxDataChunkLimit` auto-lowered to 65507. MUX header stays cleartext for routing; payload
+  sealed at enqueue (`SealRegion`), opened in the mux readLoops (`OpenRegion`) - the WS layer
+  passes `crypto.xorOnly()` (unmask-only for AEAD) to avoid double decryption (caught live: mux
+  frames died when both layers opened). **Fixes the non-mux cleartext data plane**: legacy XOR
+  ships relay payloads UNENCRYPTED (only auth/OK/MUX/UDP frames were ciphered - pre-existing
+  design gap, kept for wire compat); AEAD mode encrypts the non-mux relay data plane too via
+  `relayCrypto`. Verified end-to-end manually (SOCKS5 flows incl. 70KB round trip).
+- **`-quic-conns N` (default 1 = baseline, <=16)**: QUICClientPool now holds N connections with
+  round-robin + background top-up (parallel congestion windows, mirroring mux-sessions). N=1
+  degenerates to the exact old single-conn behavior.
+- **UDP egress address cache** (`udpAddrCache`): ResolveUDPAddr result memoized per relay session
+  (was parse+alloc per datagram), 4096-entry bound.
+- **PushDataFrame stall timer reuse**: one Timer per call instead of one `time.NewTimer` per
+  backpressure wakeup (client + server).
+- **QUIC-UDP single-write datagrams**: len-prefix + payload merged into one `stream.Write` in
+  both directions.
+- **QUIC UDP atyp=0x04 explicit length check** (handleQUICServerUDP read relied on cap-based
+  slicing into stale buffer bytes).
+- **`-server-block-local` (opt-in)**: server-side dial-target LAN/loopback blocking at all five
+  dial points (TCP, MUX, WS-UDP, QUIC TCP, QUIC-UDP); default off = behavior unchanged.
+  Mitigates -allow-open SSRF.
+- **Dead code**: `Statistics.AddConn/RemoveConn`, `Config.TUI` removed.
+- **File split**: goway.go (7.5k lines) split into package-main files
+  (main/crypto/tui/resolver/logger/ws/mux/server/udp/client/quic) - purely mechanical section
+  moves, verified by build + full test suite.
+### Bench certification (v1.8.16 vs v1.8.15, Windows loopback, interleaved paired, order flipped per sample)
+- Round 1 n=5 c1/c8/c32 (`goway/bench_ab_v16_n5.csv`): **15/15 NOISE, 0 REGRESSED** - throughput
+  medDelta within +/-2.0%, cpu +/-3.9%, rss +/-2.2%. Watch item: setup_ms +8.2~10.1% (4/1, 4/1,
+  5/0) - under crit=6 but consistent, hence round 2.
+- Round 2 n=10 confirmation (`goway/bench_ab_v16_n10.csv`): throughput/cpu/rss 12 items all
+  NOISE (c1 cpu +5.0% 8/2 sub-crit); **setup_ms REGRESSED all three tiers 10/0** (c1 +8.0%,
+  c8 +10.1%, c32 +11.5%) - base setup medians ~116-117ms vs cand ~127-130ms; per-sample
+  paired deltas are a constant ~+9-13ms (medians from the integer-rounded CSV: c1 +9,
+  c8 +12, c32 +13ms). Order-parity split (AI_HANDOFF v1.8.14 method): bad-leaning in BOTH
+  parities at every tier = real. c1 parity deltas as medians of paired deltas (this file's
+  medDelta definition): base-first samples (s1/3/5/7/9) +8.0ms, cand-first samples
+  (s2/4/6/8/10) +13.0ms; c8 +10.0/+12.0, c32 +13.0/+14.0 (parity means c1 +7.8/+11.4). The
+  earlier parity numbers "+9.8/+9.4 (c1), +11.0/+12.0 (c8), +13.0/+13.6 (c32)" reproduce
+  under neither the median nor the mean reading - withdrawn (CORRECTED 2026-10-04; verdict
+  unaffected, both parities bad). Per-parity c1 distributions: cand-first parity SEPARATED
+  (base max 118 vs cand min 124); base-first parity OVERLAPS (base max 121 at s9 vs cand
+  min 120 at s3) - the original "base max 121 vs cand min 124 disjoint" wording mixed the
+  overall base max with the cand-first cand min, and the first correction wrongly gave the
+  base-first base max as 118; both fixed against the CSV rows (review 2026-10-04).
+- Placebo (cand vs byte-identical copy `goway_cand_copy.exe`, `bench_placebo_v16.csv`, n=6,
+  c=1): setup raw signs 3/3 -> NOISE, medDelta +0.3%, both arms ~127-137ms = rules out
+  binary provenance / Defender artifacts; the regression is real code difference.
+
+#### setup_ms regression hunt (2026-10-04) - ROOT CAUSE: Windows 10 MiB process-creation cliff, NOT code
+- Instrumented A/B (env GOWAY_T0 parent-spawn clock + microsecond stage logs, single-shot
+  bench-replica probe_setup; instrumented base rebuilt from the v1.8.15 HEAD worktree, same
+  go1.26.0 + same PGO): the entire +9-13ms sits between parent `exec.Start()` returning and
+  the child's `main()` entry; all in-main stages (entry->parsed->crypto->pool->listen) are
+  sub-ms EQUAL, the "Client session established" minus "Proxy listening" span is equal
+  (~84-86ms both arms), and in-child initialization is equal too (base ~8.7ms vs cand
+  ~7.6ms) - the gap appears only in when the PARENT's Start() returns. The child never
+  executes regression code - the cost is Windows `CreateProcess` on the image itself.
+- `GODEBUG=inittrace=1`: package inits identical (last init @3.7 vs @3.9ms, 0ms clock each).
+  No `func init()` anywhere; package-level initializers trivial; toolchain identical
+  (go1.26.0, same module deps); PE structure identical (16 sections, relocs 65KB both).
+- Spawn probe (`exec.Start()` of `-version`, interleaved n=30): base median 10.0ms vs cand
+  22.2ms (+12ms at process creation).
+- **Size-cliff proof (linker pads of inert 'A' strings into .rdata, interleaved n=15):**
+  base 10,475,520B -> 10.9ms; +4KB pad (actual file 10,482,176B) -> 11.3ms FAST; +8KB pad
+  (actual 10,486,272B) -> 22.1ms SLOW. Each ACTUAL size exceeds its nominal pad by exactly
+  2,560B of fixed build overhead (nominal +4KB = 10,479,616; +8KB = 10,483,712), so the
+  ACTUAL sizes are what straddle the cliff: 10,482,176 is 3,584B under the 10,485,760B line
+  (FAST), 10,486,272 is 512B over it (SLOW) - bare nominal pads would place the +8KB run
+  below the line and contradict its SLOW timing, i.e. the parenthetical sizes are the real
+  ones and only the pad labels understate growth (labels/sizes reconciled, review
+  2026-10-04). Every pad >= +8KB (up to +70KB) -> ~22-24ms; base+70KB == cand's 22ms exactly.
+  **The cliff is 10 MiB = 10,485,760 bytes of FILE SIZE**: at/above it, per-spawn cost on this
+  Windows/Defender machine jumps ~+11-12ms (plus occasional 300-900ms first-touch rescan
+  outliers). v1.8.16's cumulative +28KB of code pushed the unstripped bench build
+  (10,503,680B) over the line; v1.8.15's unstripped build (10,475,520B) sat 10,240B under it.
+  This is why Round 1/2 saw a constant setup delta while every executed metric was clean.
+- **Disposition (no code change; P0/P1 fixes untouched):** release artifacts already build
+  stripped via `.github/workflows/release.yml:93` (`go build -trimpath -ldflags='-s -w'`),
+  dropping DWARF + .symtab (~3.2MB) - file 7.27MB, far below the cliff; the regression only
+  ever existed for plain-`go build` bench artifacts. Certified with the release-style
+  candidate build (goway/gw1816_rel.exe):
+  - n=5 (`goway/bench_fix_v16_n5.csv`): **15/15 NOISE**; setup_ms c1 +3.6% (3/2), c8 +1.7%
+    (4/1), c32 +1.3% (3/2); medians 117.7-122.7ms BOTH arms.
+  - n=10 (`goway/bench_fix_v16_n10.csv`, crit=9): **15/15 NOISE**; setup_ms c1 -0.8% (4/6),
+    c8 +0.0% (5/5), c32 -0.5% (2/8). Throughput/cpu all NOISE; watch item: c32 rss +6.0%
+    (7/3) sub-crit - recheck next cycle. Both arms' setup medians fall in 115.7-122.7ms
+    across the two runs.
+  - Stripped-vs-stripped spawn medians: base rebuild 9.2ms vs cand 9.0ms - parity.
+  - Cleanup (disposition item 4): the ④ wording ("clean up ALL investigation artifacts -
+    worktree, probe programs, temp exes; keep gw1816_rel.exe + the two certification CSVs")
+    was the PLAN, not the executed action. What executed: instrumentation removal (grep
+    T0PROBE goway/*.go = 0 hits, re-verified 2026-10-04) plus .gitignore coverage, with
+    deletion left to the user. Verified still on disk 2026-10-04: goway.go.splitbak
+    (211,413B, 2026-10-03 13:11), goway_cand_copy.exe (10,503,680B), gw_dbg.exe
+    (10,503,680B), bench_v16.exe (3,963,904B), goway_v1815_base.exe (10,475,520B, mtime
+    2026-10-03 13:09), goway_v1816_cand.exe (10,503,680B), stray goway/goway/ rebuild
+    (bench_v16.exe + goway_v1816_cand.exe 10,505,216B, 2026-10-04 09:57, not referenced by
+    any CSV); worktree D:/SOFT/cache/temp/way_v1815_base still registered (git worktree
+    list); no probe* files under goway/. Gitignore note: all *.exe here were ALREADY
+    ignored by the global `*.exe` rule; the only pattern this cycle adds is
+    `goway/goway.go.splitbak` (the four redundant explicit exe patterns were removed,
+    review 2026-10-04). Keep-set: gw1816_rel.exe + bench_fix_v16_n5.csv +
+    bench_fix_v16_n10.csv per ④, PLUS bench_ab_v16_final_n5.csv (the final-cert run) -
+    three CSVs, one more than ④'s literal two.
+- Post-hunt validation: full `go test -count=1 ./...` ok (171.1s, `ok goway`); `go vet`
+  clean; `gofmt` clean; instrumentation fully removed (`grep T0PROBE goway/*.go` = 0 hits);
+  protected baseline `goway_v1815_base.exe` untouched (10,475,520B, mtime 2026-10-03 13:09).
+- **Standing methodology rule (added):** benchmark arms MUST be built release-style
+  (`go build -trimpath -ldflags='-s -w'`) so certified binaries match shipped artifacts, AND
+  record each arm's file size in the bench notes: on Windows, a binary crossing 10 MiB
+  file-size pays ~+12ms per process spawn (Defender scan tier) which pollutes setup_ms
+  (client spawn -> first SOCKS5 CONNECT) with a code-independent constant. Base v1.8.15 sat
+  just under the cliff, so ANY new code of this cycle was at risk; future cycles will cross
+  it immediately unless arms are stripped.
+#### Final certification run (2026-10-04) - `goway/bench_ab_v16_final_n5.csv`
+- n=5 interleaved paired, order flipped per sample; arms as recorded in the CSV:
+  `goway_v1815_base.exe` (10,475,520B) vs `goway_v1816_cand.exe` (10,503,680B) - the
+  ORIGINAL unstripped pair. Verdict: **15/15 NOISE, 0 REGRESSED** (crit=6 at n=5). All 30
+  raw rows are in the CSV (verified against it); paired summary (medDelta = median of
+  per-sample paired deltas):
+```
+-- concurrency 1 --
+  up_mbps     base_med=   463.76 cand_med=   455.57  medΔ=    -2.13 (-0.5%)  bad/good/tie=3/2/0  crit=6  → NOISE
+  down_mbps   base_med=   502.94 cand_med=   494.28  medΔ=   -15.79 (-3.1%)  bad/good/tie=5/0/0  crit=6  → NOISE
+  cpu_s       base_med=    30.61 cand_med=    29.30  medΔ=    +0.36 (+1.2%)  bad/good/tie=3/2/0  crit=6  → NOISE
+  rss_mb      base_med=   124.98 cand_med=   126.45  medΔ=    +1.66 (+1.3%)  bad/good/tie=3/2/0  crit=6  → NOISE
+  setup_ms    base_med=   114.46 cand_med=   126.59  medΔ=   +11.37 (+9.9%)  bad/good/tie=5/0/0  crit=6  → NOISE
+
+-- concurrency 8 --
+  up_mbps     base_med=   759.48 cand_med=   717.39  medΔ=    +5.50 (+0.7%)  bad/good/tie=2/3/0  crit=6  → NOISE
+  down_mbps   base_med=   787.44 cand_med=   758.99  medΔ=   +15.85 (+2.0%)  bad/good/tie=2/3/0  crit=6  → NOISE
+  cpu_s       base_med=    42.00 cand_med=    42.08  medΔ=    +0.38 (+0.9%)  bad/good/tie=3/2/0  crit=6  → NOISE
+  rss_mb      base_med=   275.50 cand_med=   271.00  medΔ=   -18.03 (-6.5%)  bad/good/tie=1/4/0  crit=6  → NOISE
+  setup_ms    base_med=   116.98 cand_med=   128.84  medΔ=   +10.80 (+9.2%)  bad/good/tie=4/1/0  crit=6  → NOISE
+
+-- concurrency 32 --
+  up_mbps     base_med=   703.32 cand_med=   708.30  medΔ=   +25.79 (+3.7%)  bad/good/tie=2/3/0  crit=6  → NOISE
+  down_mbps   base_med=   737.46 cand_med=   738.34  medΔ=   +27.18 (+3.7%)  bad/good/tie=2/3/0  crit=6  → NOISE
+  cpu_s       base_med=    43.55 cand_med=    43.88  medΔ=    +2.39 (+5.5%)  bad/good/tie=3/2/0  crit=6  → NOISE
+  rss_mb      base_med=   344.43 cand_med=   309.96  medΔ=   -34.47 (-10.0%)  bad/good/tie=1/4/0  crit=6  → NOISE
+  setup_ms    base_med=   118.25 cand_med=   124.49  medΔ=    +8.13 (+6.9%)  bad/good/tie=4/1/0  crit=6  → NOISE
+```
+- setup_ms leans bad again (5/0, 4/1, 4/1; +9.9%/+9.2%/+6.9%) - the expected 10 MiB-cliff
+  signature of this unstripped pair (cand 10,503,680B over the line, base 10,240B under);
+  sub-crit at n=5. c1 down_mbps also leans 5/0 at -3.1% (past the 3% throughput practical
+  gate; sub-crit at n=5 -> NOISE) - ordinary loopback swing, listed for completeness, not
+  cliff-related. The certified artifact remains the release-style pair (`gw1816_rel.exe`):
+  clean at n=5 AND n=10 (`bench_fix_v16_n5/n10.csv`). One degraded base sample (s3: c8 up
+  280.3 vs ~740-780 typical; c32 rss 633) is visible in the raw rows and absorbed by the
+  medians.
+- Provenance note (recorded, not smoothed): this run was labeled "binary rebuilt from
+  post-split code". A post-split candidate rebuild does exist (`goway/goway/goway_v1816_cand.exe`,
+  10,505,216B, 2026-10-04 09:57, +1,536B vs the 2026-10-03 build - consistent with the
+  mechanical split; both binaries report `GOWAY v1.8.16`). But the CSV arm column carries
+  the literal `-arms` path (`cmd/bench` writes the flag value, cmd/bench/main.go:54/78),
+  which resolves to the OUTER `goway_v1816_cand.exe` whose mtime (2026-10-03 13:07) PREDATES
+  the split - so from the CSV this run certified the pre-split candidate binary. The two are
+  behaviorally equivalent (mechanical split; full suite green on the split tree), but the
+  post-split label could not be confirmed for this CSV.
+### Status / notes (updated 2026-10-04)
+- File split COMPLETE and verified: goway.go (7.5k lines, 211KB) -> 11 package-main files
+  (goway.go main-only remnant 26,325B + crypto/tui/resolver/logger/ws/mux/server/udp/
+  client/quic); pre-split backup `goway.go.splitbak` (211,413B) kept pending user decision.
+- Quality gates re-run this session ON THE SPLIT TREE (2026-10-04): `gofmt -l . cmd/bench`
+  clean, `go vet ./...` clean, `go test -C goway -count=1 ./...` -> `ok goway 170.560s`;
+  toolchain go1.26.0. Investigation instrumentation fully removed (`grep T0PROBE goway/*.go`
+  = 0 hits); no investigation code changes remain in goway/ sources (P0 inFlight gating +
+  P1 four fixes intact).
+- `goway_2000_test.go` (untracked) panics with nil session on the v1.8.15 baseline too -
+  pre-existing, fixed here by making `newMuxServerStream` nil-session tolerant.
+- Watch item (carried): n=10 recert c32 rss +6.0% (7/3) sub-crit in `bench_fix_v16_n10.csv`
+  - recheck next cycle.
+- Still open (unchanged): QUIC+WSL2 netem silent stall investigation; UDP bench arm; real-WAN
+  high-BDP A/B.
+
 ## 2026-09-23 — W3 Phase 3: Mux VERSION/WINDOW credit flow control (paired with RushWay W3)
 
 ### Shipped (uncommitted working tree, awaiting user approval)

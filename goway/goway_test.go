@@ -124,7 +124,7 @@ func TestWebSocketFraming(t *testing.T) {
 		}()
 
 		scratch := make([]byte, sz+32)
-		readData, err := readWSFrameInto(pr, nil, scratch[14:])
+		readData, err := readWSFrameInto(pr, nil, scratch[14:], nil)
 		pr.Close()
 		if err != nil {
 			t.Fatalf("readWSFrameInto failed for size %d: %v", sz, err)
@@ -930,7 +930,7 @@ func TestSOCKS5UDPAssociateTruncated(t *testing.T) {
 }
 
 func TestQUICClientPool_100ConcurrentGetStream(t *testing.T) {
-	cert, err := generateSelfSignedCert()
+	cert, err := generateSelfSignedCert("test-key")
 	if err != nil {
 		t.Fatalf("Failed to generate cert: %v", err)
 	}
@@ -1022,10 +1022,10 @@ func TestQUICClientPool_100ConcurrentGetStream(t *testing.T) {
 	}
 
 	pool.mu.Lock()
-	conn := pool.conn
+	nconn := len(pool.conns)
 	pool.mu.Unlock()
-	if conn == nil {
-		t.Fatal("Expected pool.conn to be non-nil after successful connections")
+	if nconn == 0 {
+		t.Fatal("Expected pool.conns to be non-empty after successful connections")
 	}
 }
 
@@ -1050,8 +1050,8 @@ func TestQUICClientPool_DialFailure(t *testing.T) {
 
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
-	if pool.conn != nil {
-		t.Fatal("Expected pool.conn to remain nil on dial failure")
+	if len(pool.conns) != 0 {
+		t.Fatal("Expected pool.conns to remain empty on dial failure")
 	}
 	if pool.dialing != nil {
 		t.Fatal("Expected pool.dialing to be cleared on dial failure")
@@ -1059,7 +1059,7 @@ func TestQUICClientPool_DialFailure(t *testing.T) {
 }
 
 func TestQUICClientPool_CloseConcurrent(t *testing.T) {
-	cert, err := generateSelfSignedCert()
+	cert, err := generateSelfSignedCert("test-key")
 	if err != nil {
 		t.Fatalf("Failed to generate cert: %v", err)
 	}
@@ -1149,7 +1149,7 @@ func TestMuxServerStream_PushDataCleanupOnFalse(t *testing.T) {
 }
 
 func TestQUICClientPool_OpenStreamFailureReconnect(t *testing.T) {
-	cert, err := generateSelfSignedCert()
+	cert, err := generateSelfSignedCert("test-key")
 	if err != nil {
 		t.Fatalf("Failed to generate cert: %v", err)
 	}
@@ -1210,11 +1210,12 @@ func TestQUICClientPool_OpenStreamFailureReconnect(t *testing.T) {
 
 	// 2. Abruptly close the underlying connection from under the pool
 	pool.mu.Lock()
-	conn := pool.conn
-	pool.mu.Unlock()
-	if conn == nil {
+	if len(pool.conns) == 0 {
+		pool.mu.Unlock()
 		t.Fatal("Expected active connection")
 	}
+	conn := pool.conns[0]
+	pool.mu.Unlock()
 	_ = conn.CloseWithError(0x02, "simulated abrupt disconnection")
 
 	// 3. Next GetStream detects failure on broken conn, clears pool reference, and reconnects!
@@ -1525,7 +1526,7 @@ func BenchmarkMuxDataTransferPooled(b *testing.B) {
 }
 
 func TestQUICServer_MaxConnsEnforcement(t *testing.T) {
-	cert, err := generateSelfSignedCert()
+	cert, err := generateSelfSignedCert("test-key")
 	if err != nil {
 		t.Fatalf("Failed to generate cert: %v", err)
 	}
@@ -1649,7 +1650,7 @@ func TestMuxServerStream_BufPoolUsage(t *testing.T) {
 	}()
 
 	br := bufio.NewReader(pipeR)
-	frame, err := readWSFrame(br, pipeR)
+	frame, err := readWSFrame(br, pipeR, nil)
 	if err != nil {
 		t.Fatalf("Failed to read Mux frame: %v", err)
 	}
@@ -1994,7 +1995,7 @@ func TestMuxOutboundWriterFairness(t *testing.T) {
 	}
 	readMux := func(br *bufio.Reader, conn net.Conn) (uint32, byte) {
 		t.Helper()
-		data, err := readWSFrame(br, conn)
+		data, err := readWSFrame(br, conn, nil)
 		if err != nil {
 			t.Fatalf("read frame: %v", err)
 		}
@@ -2247,7 +2248,7 @@ func TestMuxObfsPadding(t *testing.T) {
 	}
 	readMux := func(br *bufio.Reader, conn net.Conn) []byte {
 		t.Helper()
-		data, err := readWSFrame(br, conn)
+		data, err := readWSFrame(br, conn, nil)
 		if err != nil {
 			t.Fatalf("read frame: %v", err)
 		}
@@ -2483,7 +2484,7 @@ func TestReadWSFrameIntoFusedEqualsTwoPass(t *testing.T) {
 				// 1. Two-pass decode
 				wireTwoPass := wire.Bytes()
 				scratch1 := make([]byte, sz+32)
-				gotTwoPass, err := readWSFrameInto(bytes.NewReader(wireTwoPass), nil, scratch1[14:])
+				gotTwoPass, err := readWSFrameInto(bytes.NewReader(wireTwoPass), nil, scratch1[14:], nil)
 				if err != nil {
 					t.Fatalf("two-pass read failed: %v", err)
 				}
@@ -2803,7 +2804,7 @@ func TestMuxOutboundWriterWriteDeadline(t *testing.T) {
 				t.Fatalf("enqueue %d rejected", i)
 			}
 			_ = server.SetReadDeadline(time.Now().Add(2 * time.Second))
-			if _, err := readWSFrame(br, server); err != nil {
+			if _, err := readWSFrame(br, server, nil); err != nil {
 				t.Fatalf("healthy write %d failed: %v (deadline must refresh for active traffic)", i, err)
 			}
 			time.Sleep(120 * time.Millisecond) // 15 * 120ms = 1.8s > 700ms timeout

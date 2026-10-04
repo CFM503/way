@@ -6,6 +6,21 @@ All notable changes to the **Way Proxy** project (Goway & Pyway) are documented 
 
 ---
 
+## [v1.8.16] - 2026-10-03
+
+### 正确性修复 + 安全加固 + 默认关闭的新能力（P0 乱序 / AEAD / QUIC 证书钉扎 / QUIC 多连接）
+
+- **P0 乱序修复（正确性，实证 3/3 复现）**: v1.8.15 的 `enqueueDataFrame` 直推 fast-path 存在同流帧乱序——大帧 A 落入 ingress 被 `PushDataFrame` 阻塞等待字节预算（已释放 `bufMu`、不在 ingress 内）时，更晚到达的小帧 B 满足 `len(ingress)==0`+预算直推 `readChan`，越过 A 交付 → 背压窗口内混合帧长即触发流数据损坏。修复：`MuxStream`/`MuxServerStream` 增加 `inFlight` 原子计数（fallback 入队 +1、deliveryLoop 处理完 -1），fast-path 仅在 `inFlight==0` 时启用——背压时自动退回 v1.8.14 的纯 ingress 顺序，无背压热路径不变。回归测试 `goway_reorder_test.go`（client+server 双份，修复前 3/3 FAIL）。
+- **② 小修四项**: ① UDP/MUX 隧道判定改精确匹配（`classifyServerTarget`）——旧 `HasPrefix("UDP"/"MUX")` 会把 `udp-example.com:443`、`mux.dev:443` 等真实目标误路由进隧道；② `RemoteResolver` DNS 缓存加 4096 条上限+过期淘汰（原 map 只增不减）；③ 日志落盘节流 2s + 锁外写（原每条 WARN/ERROR 在全局锁内同步重写文件，错误风暴拖住全部转发 goroutine）；④ `flag.Usage` 帮助文本与实际默认值对齐（-W 128 / -mux-sessions 8）。
+- **③ 安全加固**: ① `MaxWSFrameSize` 64MB→12MB+64（对齐发送端 BufPool 上限；64MB 声称即分配是纯内存洪水攻击面，认证前同样受惠）；② `verifyAuthKey` 常数时间比较；③ **QUIC 证书从密钥确定性派生**（Ed25519，同 -k 同证书）+ `-verify-quic` 客户端钉扎——QUIC 模式从"自签+跳过验证（可 MITM）"升级为真认证，无密钥（-allow-open）保持随机证书；④ 服务端 `-server-block-local`（默认关）堵住 -allow-open 部署的内网 SSRF（TCP/MUX/UDP/QUIC 五个拨号点全覆盖）。
+- **③ `-cipher aead`（默认关闭，双端同开）**: 每帧 AES-256-GCM，线格式 `[nonce(4B 进程随机前缀+8B 计数)|ct|tag]`（+28B/帧），`muxDataChunkLimit` 自动降至 65507；同时**修复 non-mux 中继数据面明文传输的设计缺口**（XOR 模式仅加密 auth/OK/MUX/UDP 帧，中继载荷明文上线——本版在 aead 模式下将 non-mux 数据面一并纳入加密；XOR 模式保持字节兼容不变）。MUX 帧头明文路由、载荷密封：readLoop 层 per-region open（WS 层 `xorOnly` 只去掩码，杜绝双重解密）；obfs pad 位于密封区之外不受影响。手动双进程 e2e 验证（含 70KB 载荷往返）。
+- **③ 性能与健壮性**: ① `-quic-conns N`（默认 1=基线，≤16）：QUIC 池多连接轮询 + 后台补满，对标 mux-sessions 并联拥塞窗口；② UDP 出口 `ResolveUDPAddr` 结果按会话缓存（`udpAddrCache`，原每数据报解析+分配）；③ `PushDataFrame` 背压等待复用单个 Timer（原每次唤醒分配）；④ QUIC-UDP len 前缀+载荷合并单次 stream.Write（两方向）；⑤ WS/QUIC-UDP atyp=0x04 显式长度校验（原依赖 cap 切片读残留字节）。
+- **工程**: 死代码清除（`Statistics.AddConn/RemoveConn`、`Config.TUI`）；gofmt 全仓（cmd/bench、三个测试文件）；`newMuxServerStream` 容忍 nil session（未跟踪的 `goway_2000_test.go` 在 v1.8.15 基线即 panic，已确认非本版回归）。
+- **认证**: loopback interleaved A/B vs v1.8.15（n=5, c1/c8/c32, `goway/bench_ab_v16_n5.csv`）——结果与本版全部数据记录于 `goway/AI_HANDOFF.md`。
+- **setup_ms 回归调查（2026-10-04，结案：非代码路径成本）**: Round 2（n=10, `bench_ab_v16_n10.csv`）确认 setup_ms 三档 10/0 REGRESSED（恒定 +9-13ms，双侧 parity 均坏向：c1 配对中位差 +8.0/+13.0ms）；安慰剂排除 provenance。插桩定位：全部增量在父进程 `exec.Start()`→子进程 `main()` 之间（CreateProcess 阶段），子进程内各阶段与包 init（GODEBUG=inittrace）完全对等。**根因 = Windows 10 MiB 文件尺寸进程创建悬崖**：≥10,485,760 字节的镜像每次 spawn 多付 ~+12ms（Defender 扫描档位）；未 strip 的 v1.8.15 基线 10,475,520B 恰好压线之下，本版 +28KB 代码使未 strip 基准件 10,503,680B 越线（linker 惰性填充曲线精确复现悬崖位置）。**处置：无代码改动，P0/P1 修复原样保留**——发布构建本就使用 `-trimpath -ldflags='-s -w'`（release.yml:93，7.27MB 远离悬崖）；以发布风格候选件重认证 n=5 与 n=10（`bench_fix_v16_n5.csv` / `bench_fix_v16_n10.csv`）**各 15/15 NOISE**（setup：n=10 c1 -0.8%、c8 +0.0%、c32 -0.5%；n=5 c1 +3.6%、c8 +1.7%、c32 +1.3%，均亚临界）。新增方法论铁律：**基准 A/B 双臂必须按发布风格构建并记录文件尺寸**。全套 `go test -count=1` ok（171s）。
+
+---
+
 ## [v1.8.14] - 2026-09-29
 
 ### 头对头回归修复：writev 按握手时长自适应门控 + 流缓冲限额 40MiB→9MiB

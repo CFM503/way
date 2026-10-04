@@ -37,7 +37,7 @@ func FuzzWSFrame(f *testing.F) {
 		if len(data) > 70000 {
 			return
 		}
-		_, _ = readWSFrame(bytes.NewReader(data), io.Discard)
+		_, _ = readWSFrame(bytes.NewReader(data), io.Discard, nil)
 	})
 }
 
@@ -56,7 +56,7 @@ func FuzzWSFrameInto(f *testing.F) {
 			return
 		}
 		buf := make([]byte, 70000)
-		_, _ = readWSFrameInto(bytes.NewReader(data), io.Discard, buf)
+		_, _ = readWSFrameInto(bytes.NewReader(data), io.Discard, buf, nil)
 	})
 }
 
