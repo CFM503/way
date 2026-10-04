@@ -76,7 +76,13 @@
 - **Dead code**: `Statistics.AddConn/RemoveConn`, `Config.TUI` removed.
 - **File split**: goway.go (7.5k lines) split into package-main files
   (main/crypto/tui/resolver/logger/ws/mux/server/udp/client/quic) - purely mechanical section
-  moves, verified by build + full test suite.
+  moves; the split was implemented and passed all four gates (build/vet/gofmt/go test), then
+  REVERTED by maintainer decision on 2026-10-04: goway.go restored as the single file
+  (restored from the pre-split backup `goway.go.splitbak`, with the log.SetFlags
+  microsecond-timestamp change backfilled); after the restore the declaration set was checked
+  equivalent to the split tree and the four gates re-ran all green; no benchmark re-run
+  needed - what was restored has exactly the same source semantics as the certified build
+  (`bench_fix_v16_n5/n10.csv`).
 ### Bench certification (v1.8.16 vs v1.8.15, Windows loopback, interleaved paired, order flipped per sample)
 - Round 1 n=5 c1/c8/c32 (`goway/bench_ab_v16_n5.csv`): **15/15 NOISE, 0 REGRESSED** - throughput
   medDelta within +/-2.0%, cpu +/-3.9%, rss +/-2.2%. Watch item: setup_ms +8.2~10.1% (4/1, 4/1,
@@ -145,7 +151,8 @@
     was the PLAN, not the executed action. What executed: instrumentation removal (grep
     T0PROBE goway/*.go = 0 hits, re-verified 2026-10-04) plus .gitignore coverage, with
     deletion left to the user. Verified still on disk 2026-10-04: goway.go.splitbak
-    (211,413B, 2026-10-03 13:11), goway_cand_copy.exe (10,503,680B), gw_dbg.exe
+    (211,413B, 2026-10-03 13:11; deleted 2026-10-04 with the split revert - see File split
+    above), goway_cand_copy.exe (10,503,680B), gw_dbg.exe
     (10,503,680B), bench_v16.exe (3,963,904B), goway_v1815_base.exe (10,475,520B, mtime
     2026-10-03 13:09), goway_v1816_cand.exe (10,503,680B), stray goway/goway/ rebuild
     (bench_v16.exe + goway_v1816_cand.exe 10,505,216B, 2026-10-04 09:57, not referenced by
@@ -153,7 +160,8 @@
     list); no probe* files under goway/. Gitignore note: all *.exe here were ALREADY
     ignored by the global `*.exe` rule; the only pattern this cycle adds is
     `goway/goway.go.splitbak` (the four redundant explicit exe patterns were removed,
-    review 2026-10-04). Keep-set: gw1816_rel.exe + bench_fix_v16_n5.csv +
+    review 2026-10-04; that splitbak entry was itself removed 2026-10-04 with the split
+    revert). Keep-set: gw1816_rel.exe + bench_fix_v16_n5.csv +
     bench_fix_v16_n10.csv per ④, PLUS bench_ab_v16_final_n5.csv (the final-cert run) -
     three CSVs, one more than ④'s literal two.
 - Post-hunt validation: full `go test -count=1 ./...` ok (171.1s, `ok goway`); `go vet`
@@ -212,14 +220,19 @@
   behaviorally equivalent (mechanical split; full suite green on the split tree), but the
   post-split label could not be confirmed for this CSV.
 ### Status / notes (updated 2026-10-04)
-- File split COMPLETE and verified: goway.go (7.5k lines, 211KB) -> 11 package-main files
-  (goway.go main-only remnant 26,325B + crypto/tui/resolver/logger/ws/mux/server/udp/
-  client/quic); pre-split backup `goway.go.splitbak` (211,413B) kept pending user decision.
+- File split REVERTED (maintainer decision 2026-10-04): the tree is back to the single-file
+  goway.go (restored from the pre-split backup with the log.SetFlags microsecond-timestamp
+  change backfilled; declaration set checked equivalent to the split tree; four gates green -
+  build/vet/gofmt clean + `go test -C goway -count=1 ./...` -> `ok goway 170.721s` on
+  go1.26.0). The pre-split backup `goway.go.splitbak` (211,413B) is deleted and its
+  .gitignore entry removed.
 - Quality gates re-run this session ON THE SPLIT TREE (2026-10-04): `gofmt -l . cmd/bench`
   clean, `go vet ./...` clean, `go test -C goway -count=1 ./...` -> `ok goway 170.560s`;
-  toolchain go1.26.0. Investigation instrumentation fully removed (`grep T0PROBE goway/*.go`
-  = 0 hits); no investigation code changes remain in goway/ sources (P0 inFlight gating +
-  P1 four fixes intact).
+  toolchain go1.26.0. Re-run again after the split revert, ON THE RESTORED SINGLE FILE
+  (2026-10-04): build OK, `go vet -C goway ./...` clean, `gofmt -l goway` clean, `go test -C
+  goway -count=1 ./...` -> `ok goway 170.721s` (go1.26.0). Investigation instrumentation
+  fully removed (`grep T0PROBE goway/*.go` = 0 hits); no investigation code changes remain
+  in goway/ sources (P0 inFlight gating + P1 four fixes intact).
 - `goway_2000_test.go` (untracked) panics with nil session on the v1.8.15 baseline too -
   pre-existing, fixed here by making `newMuxServerStream` nil-session tolerant.
 - Watch item (carried): n=10 recert c32 rss +6.0% (7/3) sub-crit in `bench_fix_v16_n10.csv`

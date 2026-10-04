@@ -35,9 +35,3 @@ goway-openwrt-arm7
 goway/goway_v18*.exe
 goway/goway.exe
 goway/goway_v1816_cand.exe
-
-# v1.8.16 setup_ms investigation artifacts (kept on disk; deletion at user discretion)
-# All *.exe artifacts are already ignored by the global `*.exe` rule at the top of this
-# file; the four explicit exe patterns added on 2026-10-04 were removed as redundant
-# (review 2026-10-04). The only pattern here adding new coverage:
-goway/goway.go.splitbak
