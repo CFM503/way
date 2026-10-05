@@ -130,6 +130,28 @@ func Test2000MuxServerStreamsLifecycle(t *testing.T) {
 	t.Logf("[PASS] 2000 Concurrent MuxServerStream Lifecycles completed in %v", duration)
 }
 
+// syncBuffer is a mutex-guarded bytes.Buffer safe for use as exec.Cmd Stderr:
+// Cmd.Start spawns an internal io.Copy goroutine that keeps writing to Stderr
+// until the child process exits, while the benchmark report below reads the
+// buffer via String() before the Kill/Wait defers run. A plain bytes.Buffer
+// races there (race detector failure in CI); all accesses take the lock.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // Test2000ConcurrentEndToEndSOCKS5 launches real Goway Server + Client subprocesses
 // and runs 2,000 concurrent SOCKS5 proxy connections with payload echo verification.
 func Test2000ConcurrentEndToEndSOCKS5(t *testing.T) {
@@ -164,7 +186,7 @@ func Test2000ConcurrentEndToEndSOCKS5(t *testing.T) {
 		"-max-conn", "5000",
 		"-log", "WARN",
 	)
-	var serverStderr bytes.Buffer
+	var serverStderr syncBuffer
 	serverCmd.Stderr = &serverStderr
 	if err := serverCmd.Start(); err != nil {
 		t.Fatalf("Server start fail: %v", err)
@@ -188,7 +210,7 @@ func Test2000ConcurrentEndToEndSOCKS5(t *testing.T) {
 		"-block-local=false",
 		"-log", "WARN",
 	)
-	var clientStderr bytes.Buffer
+	var clientStderr syncBuffer
 	clientCmd.Stderr = &clientStderr
 	if err := clientCmd.Start(); err != nil {
 		t.Fatalf("Client start fail: %v", err)
