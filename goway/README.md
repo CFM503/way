@@ -1,4 +1,4 @@
-# GOWAY v1.8.12
+# GOWAY v1.8.17
 
 GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具，支持 HTTP 和完整 SOCKS5 (TCP + UDP) 协议，具备浏览器指纹伪装、0-RTT 多路复用 (Mux)、QUIC 弱网抗丢包传输、Cloudflare CDN 边缘接入与 PGO 机器码级性能优化。
 
@@ -7,6 +7,19 @@ GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具�
 > 接手本项目的 AI 必须先读 `goway/AI_HANDOFF.md` 顶部同名规则并原样保留；每个性能改动必须在 `AI_HANDOFF.md` 记录前后数据，**没有数据不算完成**。
 
 ## 版本历史
+
+### v1.8.17 (2026-10-08) - MUX 死锁修复、EOF 正确性修复与资源泄漏消除
+
+#### 核心修复
+
+| 修复项 | 说明 | 效果 |
+|---|---|---|
+| **MUX Ingress 溢出自死锁修复 (P0)** | `enqueueDataFrame` 持有 `bufMu` 调用 `Reset()`/`Close()`，其 `cleanup()` 重入 `bufMu` 导致 `sync.Mutex` 自死锁 | **彻底消除高背压下 session readLoop 冻结导致全会话流瘫痪的严重缺陷** |
+| **流尾部数据截断修复 (P0)** | `readClosed` 在 FIN 入队 ingress 时就被设置，`Read` 在 deliveryLoop 投递间隙误判 EOF | **保证背压下流尾部数据 100% 完整交付，消除 TCP 数据截断** |
+| **上游探测连接泄漏修复 (P1)** | `Dial("tcp", ...)` 成功后未 `Close()`，每次启动泄漏一个 TCP 连接和文件描述符 | **消除启动时资源泄漏** |
+| **W3 sendGate 竞态修复 (P1)** | `sendGate.Enable` 在流插入 map 前执行，并发 `applyPeerVersion` 可永久跳过该流 | **保证所有流都受 W3 上传流控约束，消除无限制上传隐患** |
+
+---
 
 ### v1.8.1 (2026-09-04) - Mux 会话预占时序强化、池化内存所有权竞态消除与并发安全加固
 
