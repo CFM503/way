@@ -56,7 +56,7 @@ import (
 )
 
 const (
-	Version = "1.8.16"
+	Version = "1.8.17"
 	// MaxWSFrameSize matches the largest frame the sender side can build
 	// (BufPool caps at 12MB + MUX header + AEAD overhead) — the old 64MB
 	// ceiling was pure memory-flood attack surface: a claimed-but-unsent
@@ -2815,7 +2815,7 @@ func main() {
 				}
 				testDialer := &net.Dialer{Timeout: probeTimeout}
 				testAddr := net.JoinHostPort(cfg.UpstreamHost, cfg.UpstreamPort)
-				if _, err := testDialer.Dial("tcp", testAddr); err != nil {
+				if c, err := testDialer.Dial("tcp", testAddr); err != nil {
 					logWarn("Upstream IP %s is unreachable: %v", testAddr, err)
 					logWarn("All connections will use DNS-resolved Cloudflare edges via -fakehost")
 					if connPool != nil {
@@ -2824,6 +2824,7 @@ func main() {
 						connPool.mu.Unlock()
 					}
 				} else {
+					c.Close()
 					logInfo("Upstream IP %s is reachable", testAddr)
 				}
 			}()
@@ -3164,7 +3165,12 @@ type MuxStream struct {
 	readPos     int
 	closeOnce   sync.Once
 	closed      chan struct{}
-	readClosed  atomic.Bool
+	// readClosed is set only once the FIN (nil) frame has actually been
+	// placed into readChan — never while it is still queued in ingress
+	// behind undelivered data (that caused premature EOF / tail truncation).
+	readClosed atomic.Bool
+	// eofSeen (guarded by readMu) makes EOF sticky after Read consumed FIN.
+	eofSeen bool
 	bufMu       sync.Mutex
 	queuedBytes int64
 	hasSpace    chan struct{}
@@ -3181,8 +3187,6 @@ type MuxStream struct {
 	inFlight atomic.Int64
 	// W3 upload credit: bounded once the server's VERSION is observed.
 	sendGate *creditGate
-	// W3 refund accumulator for WINDOW frames (bytes consumed locally).
-	refundPending int64
 }
 
 func newMuxStream(id uint32, session MuxSessionInterface) *MuxStream {
@@ -3193,15 +3197,12 @@ func newMuxStream(id uint32, session MuxSessionInterface) *MuxStream {
 
 func (s *MuxStream) enqueueDataFrame(frame muxDataFrame) bool {
 	s.bufMu.Lock()
-	defer s.bufMu.Unlock()
 	select {
 	case <-s.closed:
+		s.bufMu.Unlock()
 		frame.release()
 		return false
 	default:
-	}
-	if frame.data == nil {
-		s.readClosed.Store(true)
 	}
 	dataLen := int64(len(frame.data))
 	// Fast path: if ingress queue is empty, NO frame is in flight between
@@ -3213,6 +3214,10 @@ func (s *MuxStream) enqueueDataFrame(frame muxDataFrame) bool {
 		select {
 		case s.readChan <- frame:
 			s.queuedBytes += dataLen
+			if frame.data == nil {
+				s.readClosed.Store(true)
+			}
+			s.bufMu.Unlock()
 			return true
 		default:
 		}
@@ -3221,14 +3226,19 @@ func (s *MuxStream) enqueueDataFrame(frame muxDataFrame) bool {
 	s.inFlight.Add(1)
 	select {
 	case s.ingress <- frame:
+		s.bufMu.Unlock()
 		return true
 	default:
 		s.inFlight.Add(-1)
-		logWarn("[MUX] Stream %d ingress queue full, resetting stream", s.id)
-		frame.release()
-		s.Reset()
-		return false
 	}
+	// Ingress overflow. Reset() -> cleanup() takes bufMu again (sync.Mutex
+	// is not reentrant), so it MUST run after unlocking — calling it under
+	// the lock self-deadlocked the session readLoop and froze every stream.
+	s.bufMu.Unlock()
+	logWarn("[MUX] Stream %d ingress queue full, resetting stream", s.id)
+	frame.release()
+	s.Reset()
+	return false
 }
 
 func (s *MuxStream) deliveryLoop() {
@@ -3266,13 +3276,13 @@ func (s *MuxStream) PushDataFrame(frame muxDataFrame) bool {
 			return false
 		default:
 		}
-		if frame.data == nil {
-			s.readClosed.Store(true)
-		}
 		if s.queuedBytes+dataLen <= muxClientStreamBufferLimit {
 			select {
 			case s.readChan <- frame:
 				s.queuedBytes += dataLen
+				if frame.data == nil {
+					s.readClosed.Store(true)
+				}
 				s.bufMu.Unlock()
 				return true
 			default:
@@ -3301,18 +3311,6 @@ func (s *MuxStream) PushDataFrame(frame muxDataFrame) bool {
 
 func (s *MuxStream) PushData(data []byte) bool {
 	return s.PushDataFrame(muxDataFrame{data: data})
-}
-
-func (s *MuxStream) PushEOF() {
-	s.readClosed.Store(true)
-	select {
-	case <-s.closed:
-	default:
-		select {
-		case s.readChan <- muxDataFrame{data: nil}:
-		default:
-		}
-	}
 }
 
 func (s *MuxStream) consumedBytes(n int) {
@@ -3354,7 +3352,7 @@ func (s *MuxStream) Read(p []byte) (n int, err error) {
 			s.consumedBytes(n)
 			return n, nil
 		}
-		if s.readClosed.Load() && len(s.readChan) == 0 {
+		if s.eofSeen || (s.readClosed.Load() && len(s.readChan) == 0) {
 			s.readMu.Unlock()
 			return 0, io.EOF
 		}
@@ -3391,6 +3389,7 @@ func (s *MuxStream) Read(p []byte) (n int, err error) {
 				s.curFrame.release()
 				s.readBuf = nil
 				s.readPos = 0
+				s.eofSeen = true
 				s.readMu.Unlock()
 				return 0, io.EOF
 			}
@@ -4218,7 +4217,6 @@ func (s *MuxClientSession) readLoop() {
 				bPtr = s.cfg.BufPool.Get().(*[]byte)
 				buf = *bPtr
 				st.enqueueDataFrame(frame)
-				stats.AddBytes(0, int64(len(payload)))
 			}
 		case MuxCmdFIN:
 			st.enqueueDataFrame(muxDataFrame{data: nil})
@@ -4406,16 +4404,21 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 		streamID = atomic.AddUint32(&session.nextStreamID, 1)
 	}
 	stream := newMuxStream(streamID, session)
-	// W3: start bounded if the server already advertised its window.
-	if w := session.peerWindow.Load(); w > 0 {
-		stream.sendGate.Enable(w)
-	}
 	stream.onClose = func() {
 		session.decrementActiveStreams()
 	}
 
 	session.streamsMu.Lock()
 	session.streams[streamID] = stream
+	// W3: start bounded if the server already advertised its window. The
+	// load MUST happen after insertion and under streamsMu: applyPeerVersion
+	// stores peerWindow and then walks the map, so with this ordering either
+	// we observe the window here or its walk observes this stream. Loading
+	// before insertion let a concurrent VERSION miss the stream, leaving it
+	// permanently unbounded (no upload flow control).
+	if w := session.peerWindow.Load(); w > 0 {
+		stream.sendGate.Enable(w)
+	}
 	session.streamsMu.Unlock()
 
 	defer stream.Close()
@@ -4619,9 +4622,9 @@ func (s *MuxServerStream) addConsumed(n int) {
 
 func (s *MuxServerStream) enqueueDataFrame(frame muxDataFrame) bool {
 	s.bufMu.Lock()
-	defer s.bufMu.Unlock()
 	select {
 	case <-s.closed:
+		s.bufMu.Unlock()
 		frame.release()
 		return false
 	default:
@@ -4635,6 +4638,7 @@ func (s *MuxServerStream) enqueueDataFrame(frame muxDataFrame) bool {
 		select {
 		case s.writeChan <- frame:
 			s.queuedBytes += dataLen
+			s.bufMu.Unlock()
 			return true
 		default:
 		}
@@ -4642,15 +4646,19 @@ func (s *MuxServerStream) enqueueDataFrame(frame muxDataFrame) bool {
 	s.inFlight.Add(1)
 	select {
 	case s.ingress <- frame:
+		s.bufMu.Unlock()
 		return true
 	default:
 		s.inFlight.Add(-1)
-		logWarn("[SERVER-MUX] Stream %d ingress queue full, resetting stream", s.id)
-		frame.release()
-		s.Close()
-		_ = s.session.SendFrame(s.id, MuxCmdRST, nil)
-		return false
 	}
+	// Ingress overflow. Close() takes bufMu again (not reentrant): unlock
+	// first, otherwise handleServerMux's read loop self-deadlocks.
+	s.bufMu.Unlock()
+	logWarn("[SERVER-MUX] Stream %d ingress queue full, resetting stream", s.id)
+	frame.release()
+	s.Close()
+	_ = s.session.SendFrame(s.id, MuxCmdRST, nil)
+	return false
 }
 
 func (s *MuxServerStream) deliveryLoop() {

@@ -12,6 +12,54 @@
 - User mandate, 2026-09-23. 违反此规则的改动一律不得合入：只允许正向优化，永远禁止反向优化。
 
 
+## v1.8.17 cycle: P0 deadlock + EOF correctness + P1 leak/race fixes (2026-10-08)
+### P0 FIX: ingress-overflow self-deadlock (client + server MuxStream)
+- `enqueueDataFrame` held `bufMu` while calling `Reset()` (client) / `Close()` (server),
+  whose `cleanup()` re-locks `bufMu` — `sync.Mutex` is not reentrant, so the session
+  `readLoop` froze and killed every stream on that mux session. Fix: unlock `bufMu` BEFORE
+  calling Reset/Close on the overflow path; the other two early-return paths (`closed` check,
+  fast-path success) also unlock explicitly instead of using `defer` (eliminates deferred
+  unlock cost on the hot path). Both `MuxStream` and `MuxServerStream` fixed identically.
+  Regression test: `goway_bugfix_test.go` (`TestMuxStreamIngressOverflowDoesNotDeadlock`,
+  `TestMuxServerStreamIngressOverflowDoesNotDeadlock` — 5s deadlock guard).
+### P0 FIX: premature EOF / tail truncation under backpressure
+- `readClosed` was set as soon as FIN was ENQUEUED (even into the ingress queue, behind
+  undelivered data). When `Read` checked `readClosed.Load() && len(readChan) == 0` between
+  deliveryLoop draining ingress and pushing to readChan, it returned `io.EOF` prematurely,
+  truncating the stream tail. Fix: `readClosed` is now set ONLY when the FIN frame actually
+  lands in `readChan` (inside the fast-path or `PushDataFrame`), never while queued in
+  ingress. Additionally, `eofSeen` (guarded by `readMu`) makes EOF sticky after `Read`
+  consumes the nil-data FIN, preventing the `len(readChan) == 0` snapshot race from
+  oscillating between EOF and data. Removed dead `PushEOF()` method (was unreachable).
+  Regression test: `TestMuxStreamQueuedFINDoesNotTruncateTail` — fills readChan, pushes tail
+  data + FIN into ingress, verifies readClosed stays false until delivery, drains all data
+  bytes, asserts sticky EOF.
+### P1 FIX: upstream probe connection leak
+- `main()` reachability probe called `testDialer.Dial("tcp", ...)` but never closed the
+  returned `net.Conn` on the success path — leaked a TCP connection + file descriptor on
+  every startup. Fixed: `c.Close()` added.
+### P1 FIX: W3 sendGate race (stream visible without flow control)
+- `relayMuxClient` loaded `session.peerWindow` and called `sendGate.Enable(w)` BEFORE
+  inserting the stream into `session.streams` under `streamsMu`. A concurrent
+  `applyPeerVersion` (which stores `peerWindow` then walks the map to enable all gates)
+  could miss the stream entirely, leaving it permanently unbounded (no upload flow control).
+  Fix: move the `peerWindow.Load()` + `Enable` call AFTER map insertion, still under
+  `streamsMu`, so either this code observes the window or `applyPeerVersion`'s walk observes
+  the stream.
+### Cleanup
+- Remove unused `refundPending int64` field from `MuxStream`.
+- Remove stale `stats.AddBytes(0, ...)` call in `MuxClientSession.readLoop` (stats object
+  was removed in v1.8.16).
+- Delete obsolete `quicudp_diag.txt` (1806-line QUIC UDP packet dump, debug artifact).
+- Delete stale `.github/ci-trigger.txt`.
+### Validation (2026-10-08)
+- `go test -v -count=1 -timeout 600s ./...` → **all 63 tests + 3 fuzz targets PASS** (69.8s).
+  Key tests: `Test2000ConcurrentEndToEndSOCKS5` 100% success (1866 QPS), `TestViolentStressSimulation`
+  50-stream burst + 30MB streaming (601 MB/s) + 100 churn all green, all three new bugfix
+  regression tests pass within deadlock guard.
+- `go vet ./...` clean; `go build ./...` clean.
+- `-race` skipped (no GCC in this Windows environment; covered by CI).
+
 ## v1.8.16 cycle: P0 mux frame-reorder fix + P1 robustness + P2/security batch (2026-10-03)
 ### P0 FIX (correctness, reproduced 3/3 pre-fix): v1.8.15 direct-push fast path reordered same-stream frames
 - Mechanism: with the stream byte budget nearly full, a large frame A misses the budget in
