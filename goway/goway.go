@@ -56,15 +56,13 @@ import (
 )
 
 const (
-	Version = "1.8.17"
+	Version = "1.8.18"
 	// MaxWSFrameSize matches the largest frame the sender side can build
 	// (BufPool caps at 12MB + MUX header + AEAD overhead) — the old 64MB
 	// ceiling was pure memory-flood attack surface: a claimed-but-unsent
 	// frame length heap-allocates on receipt before any bytes arrive.
 	MaxWSFrameSize = 12*1024*1024 + 64
 	MaxHeaderSize  = 8192
-	CRLF           = "\r\n"
-	CRLFCRLF       = "\r\n\r\n"
 )
 
 var (
@@ -200,14 +198,6 @@ func releaseConn() {
 			return
 		}
 	}
-}
-
-func (s *Statistics) AddConn() {
-	atomic.AddInt64(&s.activeConns, 1)
-}
-
-func (s *Statistics) RemoveConn() {
-	atomic.AddInt64(&s.activeConns, -1)
 }
 
 func (s *Statistics) AddBytes(up, down int64) {
@@ -482,7 +472,11 @@ func drawTUI(cfg *Config) {
 
 	var authStr string
 	if cfg.Crypto != nil {
-		authStr = AnsiGreen + "Enabled (XOR)" + AnsiReset
+		if !cfg.Crypto.isXOR() {
+			authStr = AnsiGreen + "Enabled (AEAD)" + AnsiReset
+		} else {
+			authStr = AnsiGreen + "Enabled (XOR)" + AnsiReset
+		}
 	} else if cfg.Upstream == "" {
 		authStr = AnsiRed + "DISABLED (Open Proxy!)" + AnsiReset
 	} else {
@@ -1300,7 +1294,10 @@ func initProfileTLSConfigs(base *tls.Config) {
 
 func pickProfileTLSConfig() *tls.Config {
 	if len(profileTLSConfigs) == 0 {
-		return &tls.Config{InsecureSkipVerify: true}
+		return &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			MaxVersion: tls.VersionTLS13,
+		}
 	}
 	return profileTLSConfigs[mrand.Intn(len(profileTLSConfigs))]
 }
@@ -1919,7 +1916,13 @@ func performWSHandshake(wsConn net.Conn, br *bufio.Reader, cfg *Config, wsHost, 
 	if err != nil {
 		return err
 	}
-	return validateWSHandshakeResponse(respBytes)
+	if err := validateWSHandshakeResponse(respBytes); err != nil {
+		return err
+	}
+	if wsTCPConn != nil {
+		_ = wsTCPConn.SetReadDeadline(time.Time{})
+	}
+	return nil
 }
 
 // dialFallback attempts to resolve the fakehost domain to get alternative
@@ -2531,6 +2534,7 @@ func main() {
 					_ = f.Close()
 				})
 			} else {
+				defer f.Close()
 				defer pprof.StopCPUProfile()
 			}
 		}
@@ -2887,8 +2891,8 @@ func main() {
 				break
 			default:
 			}
-			if ne, ok := err.(net.Error); ok && (ne.Temporary() || ne.Timeout()) {
-				logWarn("Accept temporary error: %v (retrying...)", err)
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				logWarn("Accept timeout error: %v (retrying...)", err)
 				time.Sleep(10 * time.Millisecond)
 				continue
 			}
@@ -2919,7 +2923,6 @@ func main() {
 	}
 
 	logInfo("Proxy stopped.")
-	saveLogFile()
 }
 
 func monitorStats(shutdown <-chan struct{}) {
@@ -3471,10 +3474,20 @@ func (s *MuxStream) Close() error {
 }
 
 func (s *MuxStream) Reset() {
+	s.resetWithRST(true)
+}
+
+func (s *MuxStream) ResetLocal() {
+	s.resetWithRST(false)
+}
+
+func (s *MuxStream) resetWithRST(sendRST bool) {
 	s.closeOnce.Do(func() {
 		close(s.closed)
 		s.sendGate.Close()
-		s.session.SendFrame(s.id, MuxCmdRST, nil)
+		if sendRST {
+			s.session.SendFrame(s.id, MuxCmdRST, nil)
+		}
 		s.session.RemoveStream(s.id)
 		s.cleanup()
 		if s.onClose != nil {
@@ -4182,6 +4195,12 @@ func (s *MuxClientSession) readLoop() {
 			payload, openErr = s.cfg.Crypto.OpenRegion(payload)
 			if openErr != nil {
 				logDebug("[CLIENT-MUX] Stream %d aead open failed: %v", streamID, openErr)
+				s.streamsMu.RLock()
+				st, ok := s.streams[streamID]
+				s.streamsMu.RUnlock()
+				if ok {
+					st.Reset()
+				}
 				continue
 			}
 		}
@@ -4221,7 +4240,7 @@ func (s *MuxClientSession) readLoop() {
 		case MuxCmdFIN:
 			st.enqueueDataFrame(muxDataFrame{data: nil})
 		case MuxCmdRST:
-			st.Reset()
+			st.ResetLocal()
 		}
 	}
 }
@@ -4235,6 +4254,7 @@ type MuxClientPool struct {
 	roundIdx uint32
 	dialing  int
 	closed   bool
+	lastFail time.Time
 }
 
 func NewMuxClientPool(cfg *Config, maxSessions int) *MuxClientPool {
@@ -4292,8 +4312,8 @@ func (p *MuxClientPool) GetSession() (*MuxClientSession, error) {
 		sess := p.pickBestSessionLocked()
 		sess.activeStreams.Add(1)
 
-		// If pool capacity is not yet reached, trigger background dial to scale up
-		if !p.closed && len(p.sessions)+p.dialing < p.maxSess {
+		// If pool capacity is not yet reached, trigger background dial to scale up (with 1s cooldown on failure)
+		if !p.closed && len(p.sessions)+p.dialing < p.maxSess && time.Since(p.lastFail) >= time.Second {
 			p.dialing++
 			go p.dialBackgroundSession()
 		}
@@ -4316,6 +4336,7 @@ func (p *MuxClientPool) GetSession() (*MuxClientSession, error) {
 	p.mu.Lock()
 	p.dialing--
 	if err != nil {
+		p.lastFail = time.Now()
 		// If another goroutine succeeded while we were dialing, use that
 		if len(p.sessions) > 0 {
 			s := p.pickBestSessionLocked()
@@ -4349,6 +4370,8 @@ func (p *MuxClientPool) dialBackgroundSession() {
 		} else {
 			sess.Close()
 		}
+	} else {
+		p.lastFail = time.Now()
 	}
 	p.mu.Unlock()
 }
@@ -5004,6 +5027,13 @@ func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 			payload, openErr = cfg.Crypto.OpenRegion(payload)
 			if openErr != nil {
 				logDebug("[SERVER-MUX] Stream %d aead open failed: %v", streamID, openErr)
+				session.streamsMu.RLock()
+				st, ok := session.streams[streamID]
+				session.streamsMu.RUnlock()
+				if ok {
+					st.Close()
+					session.SendFrame(streamID, MuxCmdRST, nil)
+				}
 				continue
 			}
 		}
@@ -5059,8 +5089,14 @@ func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 				copy(initialData, payload[2+tLen:])
 			}
 
-			st := newMuxServerStream(streamID, session)
 			session.streamsMu.Lock()
+			if oldSt, ok := session.streams[streamID]; ok {
+				delete(session.streams, streamID)
+				session.streamsMu.Unlock()
+				oldSt.Close()
+				session.streamsMu.Lock()
+			}
+			st := newMuxServerStream(streamID, session)
 			session.streams[streamID] = st
 			session.streamsMu.Unlock()
 
@@ -5347,8 +5383,7 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 
 	logInfo("[SERVER] Connect -> %s", targetStr)
 
-	var ok []byte
-	ok = okCiphered(cfg.Crypto)
+	ok := okCiphered(cfg.Crypto)
 	if err := writeWSFrame(wsConn, ok, 0x2, false); err != nil {
 		return
 	}
@@ -5678,8 +5713,7 @@ func (b *udpBatch) addWriteStats(n int) {
 
 func handleServerUDP(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, cfg *Config) {
 	logInfo("[SERVER] UDP Tunnel requested")
-	var ok []byte
-	ok = okCiphered(cfg.Crypto)
+	ok := okCiphered(cfg.Crypto)
 	if err := writeWSFrame(wsConn, ok, 0x2, false); err != nil {
 		return
 	}
@@ -6229,7 +6263,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 			if _, err := io.ReadFull(&pr, ipBuf[:]); err != nil {
 				return
 			}
-			targetHost = "[" + net.IP(ipBuf[:]).String() + "]"
+			targetHost = net.IP(ipBuf[:]).String()
 		}
 
 		var portBuf [2]byte
@@ -6808,7 +6842,12 @@ func handleQUICStream(stream quic.Stream, cfg *Config) {
 	defer stream.Close()
 
 	br := getBufioReader(stream)
-	defer putBufioReader(br)
+	brReleased := false
+	defer func() {
+		if !brReleased {
+			putBufioReader(br)
+		}
+	}()
 	targetLine, err := br.ReadString('\n')
 	if err != nil {
 		return
@@ -6826,6 +6865,7 @@ func handleQUICStream(stream quic.Stream, cfg *Config) {
 
 	switch classifyServerTarget(targetStr) {
 	case 'u':
+		brReleased = true
 		handleQUICServerUDP(stream, br, cfg)
 		return
 	}
@@ -6858,8 +6898,10 @@ func handleQUICStream(stream quic.Stream, cfg *Config) {
 	// write instead of pinning the relay goroutine forever.
 	writeTimeout := time.Duration(cfg.ConnTimeout) * time.Second
 
+	brReleased = true
 	// Stream -> Target
 	go func() {
+		defer putBufioReader(br)
 		bPtr := cfg.BufPool.Get().(*[]byte)
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
@@ -6912,6 +6954,13 @@ func handleQUICStream(stream quic.Stream, cfg *Config) {
 }
 
 func handleQUICServerUDP(stream quic.Stream, br *bufio.Reader, cfg *Config) {
+	brReleased := false
+	defer func() {
+		if !brReleased {
+			putBufioReader(br)
+		}
+	}()
+
 	if _, err := stream.Write([]byte("OK\n")); err != nil {
 		return
 	}
@@ -6925,8 +6974,10 @@ func handleQUICServerUDP(stream quic.Stream, br *bufio.Reader, cfg *Config) {
 
 	errCh := make(chan error, 2)
 
+	brReleased = true
 	// Stream -> UDP
 	go func() {
+		defer putBufioReader(br)
 		bPtr := cfg.BufPool.Get().(*[]byte)
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
@@ -7470,7 +7521,9 @@ func handleClientUDPQUIC(localConn net.Conn, boundAddr *net.UDPAddr, udpListener
 	}()
 
 	go func() {
-		rawBuf := make([]byte, 65535)
+		bPtr := cfg.BufPool.Get().(*[]byte)
+		defer cfg.BufPool.Put(bPtr)
+		rawBuf := *bPtr
 		var lenBuf [2]byte
 		wb := newUDPBatchWriter(udpListener, false)
 		defer func() { _ = wb.flushWrites() }()

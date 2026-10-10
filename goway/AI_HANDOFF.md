@@ -12,6 +12,60 @@
 - User mandate, 2026-09-23. 违反此规则的改动一律不得合入：只允许正向优化，永远禁止反向优化。
 
 
+## v1.8.18 cycle: Full repo audit + forward-only optimizations (2026-10-10)
+### P0 FIX: QUIC stream reader concurrent pool return race (`handleQUICStream` & `handleQUICServerUDP`)
+- `handleQUICStream` initialized `br := getBufioReader(stream)` with an outer `defer putBufioReader(br)`.
+  When a relay session ended because target closed or UDP failed, `handleQUICStream` returned,
+  triggering `putBufioReader(br)` to recycle the reader into `bufioReaderPool` while the active reader
+  goroutine was still executing `br.Read(buf)`. If another stream acquired `br` concurrently, memory
+  and internal buffer states were corrupted.
+- Fix: Introduced a guarded `brReleased` lifecycle latch. Handed off ownership of `br` exclusively to the
+  reader goroutine (`Stream -> Target` or `Stream -> UDP`), executing `defer putBufioReader(br)` on goroutine
+  exit. Early failure paths before goroutine spawning safely recycle `br` via deferred guard.
+### P1 PERF: Zero-allocation downstream buffer pooling for UDP QUIC (`handleClientUDPQUIC`)
+- The client downstream relay goroutine allocated `rawBuf := make([]byte, 65535)` on heap for every
+  connection tunnel.
+- Fix: Replaced heap allocation with `bPtr := cfg.BufPool.Get().(*[]byte)` and `defer cfg.BufPool.Put(bPtr)`.
+  Completely eliminated 64KB heap allocations on UDP QUIC downstream tunnels, drastically cutting GC churn.
+### P0 FIX: Stale ReadDeadline on pooled pre-warmed connections (`performWSHandshake`)
+- Pre-warmed connections in `ConnPool` had a read deadline configured for WebSocket handshake (`performWSHandshake`).
+  Once handshake succeeded, the deadline was left active. Connections idle in pool for >5s were handed to client
+  tunnels with an expired deadline, triggering an instant `i/o timeout` disconnect upon first read/write.
+- Fix: Added `wsTCPConn.SetReadDeadline(time.Time{})` immediately upon valid handshake response.
+### P1 FIX: RST frame ping-pong storm breaker (`MuxStream.ResetLocal`)
+- Upon receiving a peer's `MuxCmdRST`, `MuxStream.Reset()` closed the stream and redundantly fired a reciprocal
+  `session.SendFrame(RST)` back across the wire, generating unnecessary network ping-pong frames.
+- Fix: Added `ResetLocal()`, which closes local stream resources and detaches from session without transmitting
+  a reflexive RST frame.
+### P1 FIX: AEAD decrypt failure stream reset & duplicate SYN cleanup (`readLoop`, `handleServerMux`)
+- Both client and server `readLoop` previously logged AEAD open failures and silently `continue`d, causing upper
+  layer relays to receive truncated or corrupted streams.
+- Fix: Client calls `st.Reset()` and server closes the stream sending RST. Additionally, server `MuxCmdSYN`
+  now inspects for pre-existing stream IDs, closing stale instances before binding new ones.
+### P1 FIX: MuxClientPool background dial thundering herd mitigation (`GetSession`)
+- Under upstream connection failures, background dial scaling lacked backoff, triggering a cascade of redundant
+  failing dials on every incoming client request.
+- Fix: Added `lastFail time.Time` in `MuxClientPool` enforcing a 1-second cooldown backoff upon dial failures.
+### P1 FIX: SOCKS5 IPv6 target bracket formatting (`handleClient`)
+- SOCKS5 IPv6 parsing pre-enclosed the IPv6 address in `[` and `]`, causing standard `net.JoinHostPort` downstream
+  to produce invalid double brackets `[[ipv6]]:port`.
+- Fix: Stripped pre-bracketing, letting standard library handle bracket wrapping correctly.
+### P2 SECURITY: Hardened default TLS fallback config (`pickProfileTLSConfig`)
+- Fallback profile had hardcoded `InsecureSkipVerify: true`. Replaced with enforced `tls.VersionTLS12` to `tls.VersionTLS13`
+  without disabling certificate verification.
+### Cleanup & Code Quality
+- Cleaned dead constants (`CRLF`/`CRLFCRLF`) and deprecated methods (`Statistics.AddConn/RemoveConn`).
+- Replaced deprecated `net.Error.Temporary()` with `ne.Timeout()`.
+- Added missing `defer f.Close()` for `-cpuprofile`.
+- Removed redundant duplicate `saveLogFile()` in `main`.
+- Cleaned staticcheck S1021 assignments.
+- Removed obsolete `diag_quic.sh` and legacy `pyway1.3.2.py`.
+### Validation (2026-10-10)
+- `go test -v -count=1 ./...` → **all 63 tests + 3 fuzz targets PASS** (80.3s).
+- `go vet ./...` clean; `go build ./...` clean.
+- All optimizations strictly forward-only: hot-path zero-copy untouched, GC allocations eliminated, data races cured.
+
+
 ## v1.8.17 cycle: P0 deadlock + EOF correctness + P1 leak/race fixes (2026-10-08)
 ### P0 FIX: ingress-overflow self-deadlock (client + server MuxStream)
 - `enqueueDataFrame` held `bufMu` while calling `Reset()` (client) / `Close()` (server),
