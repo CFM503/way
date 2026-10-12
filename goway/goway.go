@@ -56,7 +56,7 @@ import (
 )
 
 const (
-	Version = "1.8.18"
+	Version = "1.8.19"
 	// MaxWSFrameSize matches the largest frame the sender side can build
 	// (BufPool caps at 12MB + MUX header + AEAD overhead) — the old 64MB
 	// ceiling was pure memory-flood attack surface: a claimed-but-unsent
@@ -616,7 +616,9 @@ const (
 
 type Crypto struct {
 	mode        int
-	expandedKey []byte        // XOR mode: pre-expanded repeating keystream
+	key         [32]byte      // XOR mode: 32-byte repeating SHA-256 key
+	k0, k1      uint64        // XOR mode: pre-loaded 64-bit key words (bytes 0..15)
+	k2, k3      uint64        // XOR mode: pre-loaded 64-bit key words (bytes 16..31)
 	gcm         cipher.AEAD   // AEAD mode: AES-256-GCM built once
 	noncePrefix [4]byte       // AEAD: random per-process nonce prefix
 	frameCtr    atomic.Uint64 // AEAD: frame counter; prefix+counter is unique per process
@@ -633,7 +635,6 @@ func NewCryptoMode(key string, mode int) *Crypto {
 		return nil
 	}
 	hash := sha256.Sum256([]byte(key))
-	kl := len(hash)
 	if mode == cipherModeAEAD {
 		c := &Crypto{mode: mode}
 		block, err := aes.NewCipher(hash[:])
@@ -650,11 +651,13 @@ func NewCryptoMode(key string, mode int) *Crypto {
 		}
 		return c
 	}
-	// Pre-expand key to cryptoChunkSize + 8 for single-loop bulk XOR (prevents panic at end boundary)
-	ek := bytes.Repeat(hash[:], (cryptoChunkSize+8)/kl+1)[:cryptoChunkSize+8]
 	return &Crypto{
-		mode:        cipherModeXOR,
-		expandedKey: ek,
+		mode: cipherModeXOR,
+		key:  hash,
+		k0:   binary.NativeEndian.Uint64(hash[0:8]),
+		k1:   binary.NativeEndian.Uint64(hash[8:16]),
+		k2:   binary.NativeEndian.Uint64(hash[16:24]),
+		k3:   binary.NativeEndian.Uint64(hash[24:32]),
 	}
 }
 
@@ -754,19 +757,37 @@ func (c *Crypto) TransformInPlace(data []byte) {
 	if c == nil || len(data) == 0 {
 		return
 	}
-	ek := c.expandedKey
+	k0, k1, k2, k3 := c.k0, c.k1, c.k2, c.k3
 	n := len(data)
 	i := 0
-	// Bulk: 8-byte XOR against pre-expanded key — single loop, no nesting
-	for ; i+8 <= n; i += 8 {
-		off := i & (cryptoChunkSize - 1)
-		binary.NativeEndian.PutUint64(data[i:],
-			binary.NativeEndian.Uint64(data[i:])^
-				binary.NativeEndian.Uint64(ek[off:]))
+	// Bulk: 32-byte unrolled XOR against register-resident 64-bit key words
+	for ; i+32 <= n; i += 32 {
+		d := data[i : i+32 : i+32]
+		binary.NativeEndian.PutUint64(d[0:8], binary.NativeEndian.Uint64(d[0:8])^k0)
+		binary.NativeEndian.PutUint64(d[8:16], binary.NativeEndian.Uint64(d[8:16])^k1)
+		binary.NativeEndian.PutUint64(d[16:24], binary.NativeEndian.Uint64(d[16:24])^k2)
+		binary.NativeEndian.PutUint64(d[24:32], binary.NativeEndian.Uint64(d[24:32])^k3)
 	}
-	// Tail: byte-by-byte for remainder (< 8 bytes)
+	// Tail: byte-by-byte for remainder (< 32 bytes)
 	for ; i < n; i++ {
-		data[i] ^= ek[i&(cryptoChunkSize-1)]
+		data[i] ^= c.key[i&31]
+	}
+}
+
+func xorMaskInPlace(payload []byte, mk []byte) {
+	maskWord := binary.NativeEndian.Uint32(mk)
+	mask64 := uint64(maskWord) | (uint64(maskWord) << 32)
+	n := len(payload)
+	i := 0
+	for ; i+32 <= n; i += 32 {
+		d := payload[i : i+32 : i+32]
+		binary.NativeEndian.PutUint64(d[0:8], binary.NativeEndian.Uint64(d[0:8])^mask64)
+		binary.NativeEndian.PutUint64(d[8:16], binary.NativeEndian.Uint64(d[8:16])^mask64)
+		binary.NativeEndian.PutUint64(d[16:24], binary.NativeEndian.Uint64(d[16:24])^mask64)
+		binary.NativeEndian.PutUint64(d[24:32], binary.NativeEndian.Uint64(d[24:32])^mask64)
+	}
+	for ; i < n; i++ {
+		payload[i] ^= mk[i&3]
 	}
 }
 
@@ -1395,17 +1416,8 @@ func writeWSFramePreallocated(w io.Writer, buf []byte, payloadOffset int, payloa
 		prng := maskPool.Get().(*maskPRNG)
 		readMask(mk, prng)
 		maskPool.Put(prng)
-		maskWord := binary.NativeEndian.Uint32(mk)
 
-		payload := buf[payloadOffset : payloadOffset+payloadLen]
-		i := 0
-		for ; i+4 <= payloadLen; i += 4 {
-			binary.NativeEndian.PutUint32(payload[i:],
-				binary.NativeEndian.Uint32(payload[i:])^maskWord)
-		}
-		for ; i < payloadLen; i++ {
-			payload[i] ^= mk[i&3]
-		}
+		xorMaskInPlace(buf[payloadOffset:payloadOffset+payloadLen], mk)
 	}
 
 	var totalLen int
@@ -1450,17 +1462,8 @@ func writeWSFramePreallocatedFast(w io.Writer, buf []byte, payloadOffset int, pa
 	mkOffset := frameStart + hdrLen
 	mk := buf[mkOffset : mkOffset+4]
 	readMask(mk, prng) // fast xorshift64 — no syscall
-	maskWord := binary.NativeEndian.Uint32(mk)
 
-	payload := buf[payloadOffset : payloadOffset+payloadLen]
-	i := 0
-	for ; i+4 <= payloadLen; i += 4 {
-		binary.NativeEndian.PutUint32(payload[i:],
-			binary.NativeEndian.Uint32(payload[i:])^maskWord)
-	}
-	for ; i < payloadLen; i++ {
-		payload[i] ^= mk[i&3]
-	}
+	xorMaskInPlace(buf[payloadOffset:payloadOffset+payloadLen], mk)
 
 	_, err := w.Write(buf[frameStart : frameStart+hdrLen+4+payloadLen])
 	return err
@@ -1506,28 +1509,24 @@ func encodeMuxFrameFused(buf []byte, payloadOffset int, payloadLen int, opcode b
 
 	region := buf[payloadOffset : payloadOffset+payloadLen]
 	if crypto == nil {
-		maskWord := binary.NativeEndian.Uint32(mk)
-		i := 0
-		for ; i+4 <= payloadLen; i += 4 {
-			binary.NativeEndian.PutUint32(region[i:],
-				binary.NativeEndian.Uint32(region[i:])^maskWord)
-		}
-		for ; i < payloadLen; i++ {
-			region[i] ^= mk[i&3]
-		}
+		xorMaskInPlace(region, mk)
 	} else {
-		ek := crypto.expandedKey
 		maskWord := binary.NativeEndian.Uint32(mk)
 		mask64 := uint64(maskWord) | (uint64(maskWord) << 32)
+		km0 := crypto.k0 ^ mask64
+		km1 := crypto.k1 ^ mask64
+		km2 := crypto.k2 ^ mask64
+		km3 := crypto.k3 ^ mask64
 		i := 0
-		for ; i+8 <= payloadLen; i += 8 {
-			off := i & (cryptoChunkSize - 1)
-			binary.NativeEndian.PutUint64(region[i:],
-				binary.NativeEndian.Uint64(region[i:])^
-					binary.NativeEndian.Uint64(ek[off:])^mask64)
+		for ; i+32 <= payloadLen; i += 32 {
+			d := region[i : i+32 : i+32]
+			binary.NativeEndian.PutUint64(d[0:8], binary.NativeEndian.Uint64(d[0:8])^km0)
+			binary.NativeEndian.PutUint64(d[8:16], binary.NativeEndian.Uint64(d[8:16])^km1)
+			binary.NativeEndian.PutUint64(d[16:24], binary.NativeEndian.Uint64(d[16:24])^km2)
+			binary.NativeEndian.PutUint64(d[24:32], binary.NativeEndian.Uint64(d[24:32])^km3)
 		}
 		for ; i < payloadLen; i++ {
-			region[i] ^= ek[i&(cryptoChunkSize-1)] ^ mk[i&3]
+			region[i] ^= crypto.key[i&31] ^ mk[i&3]
 		}
 	}
 
@@ -1578,17 +1577,7 @@ func encodeMuxFrameUnmasked(buf []byte, payloadOffset int, payloadLen int, opcod
 
 	region := buf[payloadOffset : payloadOffset+payloadLen]
 	if crypto != nil {
-		ek := crypto.expandedKey
-		i := 0
-		for ; i+8 <= payloadLen; i += 8 {
-			off := i & (cryptoChunkSize - 1)
-			binary.NativeEndian.PutUint64(region[i:],
-				binary.NativeEndian.Uint64(region[i:])^
-					binary.NativeEndian.Uint64(ek[off:]))
-		}
-		for ; i < payloadLen; i++ {
-			region[i] ^= ek[i&(cryptoChunkSize-1)]
-		}
+		crypto.TransformInPlace(region)
 	}
 
 	return buf[frameStart : frameStart+hdrLen+payloadLen], nil
@@ -1640,19 +1629,9 @@ func writeWSFrame(w io.Writer, data []byte, opcode byte, masked bool) error {
 
 	mk := frame[hdrLen : hdrLen+4]
 	rand.Read(mk) // handshake path: crypto/rand is fine here (not per-frame hot path)
-	maskWord := binary.NativeEndian.Uint32(mk)
 
 	copy(frame[hdrLen+4:], data)
-
-	payload := frame[hdrLen+4:]
-	i := 0
-	for ; i+4 <= dl; i += 4 {
-		binary.NativeEndian.PutUint32(payload[i:],
-			binary.NativeEndian.Uint32(payload[i:])^maskWord)
-	}
-	for ; i < dl; i++ {
-		payload[i] ^= mk[i&3]
-	}
+	xorMaskInPlace(frame[hdrLen+4:], mk)
 
 	_, err := w.Write(frame)
 	return err
@@ -2233,29 +2212,33 @@ func readWSFrameInto(r io.Reader, w io.Writer, buf []byte, crypto *Crypto) ([]by
 // are applied in a SINGLE 64-bit fused pass (payload ^ mask64 ^ keystream), halving
 // memory bus traffic on the ingress hot path.
 func readWSFrameIntoFused(r io.Reader, w io.Writer, buf []byte, crypto *Crypto) ([]byte, error) {
+	var hdrBuf []byte
+	if len(buf) >= 8 {
+		hdrBuf = buf[:8]
+	} else {
+		var hdrStack [8]byte
+		hdrBuf = hdrStack[:]
+	}
 	for {
-		var head [2]byte
-		if _, err := io.ReadFull(r, head[:]); err != nil {
+		if _, err := io.ReadFull(r, hdrBuf[:2]); err != nil {
 			return nil, err
 		}
 
-		fin := (head[0] & 0x80) != 0
-		opcode := head[0] & 0x0F
-		masked := (head[1] & 0x80) != 0
-		payloadLen := uint64(head[1] & 0x7F)
+		fin := (hdrBuf[0] & 0x80) != 0
+		opcode := hdrBuf[0] & 0x0F
+		masked := (hdrBuf[1] & 0x80) != 0
+		payloadLen := uint64(hdrBuf[1] & 0x7F)
 
 		if payloadLen == 126 {
-			var b [2]byte
-			if _, err := io.ReadFull(r, b[:]); err != nil {
+			if _, err := io.ReadFull(r, hdrBuf[:2]); err != nil {
 				return nil, err
 			}
-			payloadLen = uint64(binary.BigEndian.Uint16(b[:]))
+			payloadLen = uint64(binary.BigEndian.Uint16(hdrBuf[:2]))
 		} else if payloadLen == 127 {
-			var b [8]byte
-			if _, err := io.ReadFull(r, b[:]); err != nil {
+			if _, err := io.ReadFull(r, hdrBuf[:8]); err != nil {
 				return nil, err
 			}
-			payloadLen = binary.BigEndian.Uint64(b[:])
+			payloadLen = binary.BigEndian.Uint64(hdrBuf[:8])
 		}
 
 		if payloadLen > uint64(MaxWSFrameSize) {
@@ -2282,9 +2265,10 @@ func readWSFrameIntoFused(r io.Reader, w io.Writer, buf []byte, crypto *Crypto) 
 
 		var maskKey [4]byte
 		if masked {
-			if _, err := io.ReadFull(r, maskKey[:]); err != nil {
+			if _, err := io.ReadFull(r, hdrBuf[:4]); err != nil {
 				return nil, err
 			}
+			maskKey = [4]byte{hdrBuf[0], hdrBuf[1], hdrBuf[2], hdrBuf[3]}
 		}
 
 		// Buffer selection:
@@ -2292,7 +2276,6 @@ func readWSFrameIntoFused(r io.Reader, w io.Writer, buf []byte, crypto *Crypto) 
 		//   handshake path (buf == nil): stack for small frames; large frames are
 		//   read directly into the heap slice handed back to the caller.
 		var payload []byte
-		var stackBuf [smallFrameSize]byte
 		var heapOwned []byte
 
 		if buf != nil {
@@ -2304,6 +2287,7 @@ func readWSFrameIntoFused(r io.Reader, w io.Writer, buf []byte, crypto *Crypto) 
 			}
 		} else {
 			// handshake path
+			var stackBuf [smallFrameSize]byte
 			if payloadLen <= smallFrameSize {
 				payload = stackBuf[:payloadLen]
 			} else {
@@ -2324,30 +2308,26 @@ func readWSFrameIntoFused(r io.Reader, w io.Writer, buf []byte, crypto *Crypto) 
 		if opcode < 0x8 {
 			aead := crypto != nil && !crypto.isXOR()
 			if masked && crypto != nil && !aead {
-				ek := crypto.expandedKey
 				maskWord := binary.NativeEndian.Uint32(maskKey[:])
 				mask64 := uint64(maskWord) | (uint64(maskWord) << 32)
+				km0 := crypto.k0 ^ mask64
+				km1 := crypto.k1 ^ mask64
+				km2 := crypto.k2 ^ mask64
+				km3 := crypto.k3 ^ mask64
+				n := len(payload)
 				i := 0
-				for ; i+8 <= len(payload); i += 8 {
-					off := i & (cryptoChunkSize - 1)
-					binary.NativeEndian.PutUint64(payload[i:],
-						binary.NativeEndian.Uint64(payload[i:])^
-							binary.NativeEndian.Uint64(ek[off:])^mask64)
+				for ; i+32 <= n; i += 32 {
+					d := payload[i : i+32 : i+32]
+					binary.NativeEndian.PutUint64(d[0:8], binary.NativeEndian.Uint64(d[0:8])^km0)
+					binary.NativeEndian.PutUint64(d[8:16], binary.NativeEndian.Uint64(d[8:16])^km1)
+					binary.NativeEndian.PutUint64(d[16:24], binary.NativeEndian.Uint64(d[16:24])^km2)
+					binary.NativeEndian.PutUint64(d[24:32], binary.NativeEndian.Uint64(d[24:32])^km3)
 				}
-				for ; i < len(payload); i++ {
-					payload[i] ^= ek[i&(cryptoChunkSize-1)] ^ maskKey[i&3]
+				for ; i < n; i++ {
+					payload[i] ^= crypto.key[i&31] ^ maskKey[i&3]
 				}
 			} else if masked {
-				maskWord := binary.NativeEndian.Uint32(maskKey[:])
-				mask64 := uint64(maskWord) | (uint64(maskWord) << 32)
-				i := 0
-				for ; i+8 <= len(payload); i += 8 {
-					binary.NativeEndian.PutUint64(payload[i:],
-						binary.NativeEndian.Uint64(payload[i:])^mask64)
-				}
-				for ; i < len(payload); i++ {
-					payload[i] ^= maskKey[i&3]
-				}
+				xorMaskInPlace(payload, maskKey[:])
 			} else if crypto != nil && !aead {
 				crypto.TransformInPlace(payload)
 			}
@@ -2359,15 +2339,7 @@ func readWSFrameIntoFused(r io.Reader, w io.Writer, buf []byte, crypto *Crypto) 
 				}
 			}
 		} else if masked {
-			maskWord := binary.NativeEndian.Uint32(maskKey[:])
-			i := 0
-			for ; i+4 <= len(payload); i += 4 {
-				binary.NativeEndian.PutUint32(payload[i:],
-					binary.NativeEndian.Uint32(payload[i:])^maskWord)
-			}
-			for ; i < len(payload); i++ {
-				payload[i] ^= maskKey[i&3]
-			}
+			xorMaskInPlace(payload, maskKey[:])
 		}
 
 		switch opcode {
@@ -3260,22 +3232,15 @@ func (s *MuxStream) deliveryLoop() {
 
 func (s *MuxStream) PushDataFrame(frame muxDataFrame) bool {
 	dataLen := int64(len(frame.data))
-	// One reusable stall Timer for the whole call: the old path allocated a
-	// fresh time.NewTimer on EVERY backpressure wakeup.
-	stall := time.NewTimer(muxPushStallTimeout)
-	defer func() {
-		if !stall.Stop() {
-			select {
-			case <-stall.C:
-			default:
-			}
-		}
-	}()
+	var stall *time.Timer
 	for {
 		s.bufMu.Lock()
 		select {
 		case <-s.closed:
 			s.bufMu.Unlock()
+			if stall != nil {
+				stall.Stop()
+			}
 			return false
 		default:
 		}
@@ -3287,20 +3252,28 @@ func (s *MuxStream) PushDataFrame(frame muxDataFrame) bool {
 					s.readClosed.Store(true)
 				}
 				s.bufMu.Unlock()
+				if stall != nil {
+					stall.Stop()
+				}
 				return true
 			default:
 			}
 		}
 		s.bufMu.Unlock()
-		if !stall.Stop() {
-			select {
-			case <-stall.C:
-			default:
+		if stall == nil {
+			stall = time.NewTimer(muxPushStallTimeout)
+		} else {
+			if !stall.Stop() {
+				select {
+				case <-stall.C:
+				default:
+				}
 			}
+			stall.Reset(muxPushStallTimeout)
 		}
-		stall.Reset(muxPushStallTimeout)
 		select {
 		case <-s.closed:
+			stall.Stop()
 			return false
 		case <-s.hasSpace:
 			continue
@@ -3402,6 +3375,37 @@ func (s *MuxStream) Read(p []byte) (n int, err error) {
 			s.readPos = 0
 			s.readMu.Unlock()
 		}
+	}
+}
+
+// ReadFrame pops the next complete muxDataFrame without copying into an
+// intermediate buffer. The caller owns the returned frame and must call
+// frame.release() after writing.
+func (s *MuxStream) ReadFrame() (muxDataFrame, error) {
+	if s.readClosed.Load() && len(s.readChan) == 0 {
+		return muxDataFrame{}, io.EOF
+	}
+	select {
+	case <-s.closed:
+		if s.readClosed.Load() {
+			return muxDataFrame{}, io.EOF
+		}
+		return muxDataFrame{}, errors.New("stream closed")
+	case frame, ok := <-s.readChan:
+		select {
+		case <-s.closed:
+			frame.release()
+			if s.readClosed.Load() {
+				return muxDataFrame{}, io.EOF
+			}
+			return muxDataFrame{}, errors.New("stream closed")
+		default:
+		}
+		if !ok || frame.data == nil {
+			return muxDataFrame{}, io.EOF
+		}
+		s.consumedBytes(len(frame.data))
+		return frame, nil
 	}
 }
 
@@ -3515,6 +3519,7 @@ type muxOutboundFrame struct {
 // deficit-round-robin byte credit.
 type muxStreamQueue struct {
 	frames  []muxOutboundFrame
+	head    int
 	deficit int
 }
 
@@ -3533,20 +3538,23 @@ type muxStreamQueue struct {
 // muxOutboundQueueDepth, preserving the old backpressure contract.
 // Locks are never held across network IO.
 type muxOutboundWriter struct {
-	conn     net.Conn
-	prng     *maskPRNG
-	crypto   *Crypto
-	masked   bool
-	mu       sync.Mutex
-	cond     *sync.Cond
-	streams  map[uint32]*muxStreamQueue
-	rotation []uint32
-	pos      int
-	priority []muxOutboundFrame
-	total    int
-	closed   bool
-	done     chan struct{}
-	closeMu  sync.Once
+	conn        net.Conn
+	prng        *maskPRNG
+	crypto      *Crypto
+	masked      bool
+	mu          sync.Mutex
+	cond        *sync.Cond
+	streams     map[uint32]*muxStreamQueue
+	freeQueues  []*muxStreamQueue
+	rotation    []uint32
+	pos         int
+	priority    []muxOutboundFrame
+	total       int
+	waiters     int
+	loopWaiting bool
+	closed      bool
+	done        chan struct{}
+	closeMu     sync.Once
 	// writeTimeout bounds each egress write; 0 disables (test fixtures).
 	// lastWriteSet is only touched by the loop goroutine.
 	writeTimeout time.Duration
@@ -3603,10 +3611,14 @@ func newMuxOutboundWriterBatched(conn net.Conn, prng *maskPRNG, crypto *Crypto, 
 		prng:         prng,
 		crypto:       crypto,
 		masked:       masked,
-		streams:      make(map[uint32]*muxStreamQueue),
+		streams:      make(map[uint32]*muxStreamQueue, 32),
+		freeQueues:   make([]*muxStreamQueue, 0, 32),
+		rotation:     make([]uint32, 0, 32),
+		priority:     make([]muxOutboundFrame, 0, 16),
 		done:         make(chan struct{}),
 		writeTimeout: writeTimeout,
 		batchMax:     batchMax,
+		scratch:      make([]muxOutboundFrame, 0, muxWritevMaxFrames),
 		scratchBufs:  make(net.Buffers, 0, muxWritevMaxFrames),
 	}
 	w.cond = sync.NewCond(&w.mu)
@@ -3668,17 +3680,22 @@ func (w *muxOutboundWriter) encodeFrame(f muxOutboundFrame) ([]byte, error) {
 // dropAllLocked releases every queued frame and resets scheduling state.
 // Caller must hold w.mu.
 func (w *muxOutboundWriter) dropAllLocked() {
-	for _, f := range w.priority {
-		w.releaseFrame(f)
+	for i := range w.priority {
+		w.releaseFrame(w.priority[i])
+		w.priority[i] = muxOutboundFrame{}
 	}
-	w.priority = nil
+	w.priority = w.priority[:0]
 	for _, q := range w.streams {
-		for _, f := range q.frames {
-			w.releaseFrame(f)
+		for i := q.head; i < len(q.frames); i++ {
+			w.releaseFrame(q.frames[i])
+			q.frames[i] = muxOutboundFrame{}
 		}
+		q.frames = q.frames[:0]
+		q.head = 0
+		q.deficit = 0
 	}
 	w.streams = make(map[uint32]*muxStreamQueue)
-	w.rotation = nil
+	w.rotation = w.rotation[:0]
 	w.pos = 0
 	w.total = 0
 }
@@ -3691,11 +3708,12 @@ func (w *muxOutboundWriter) removeLocked(id uint32) []muxOutboundFrame {
 	if q == nil {
 		return nil
 	}
-	doomed := q.frames
+	doomed := q.frames[q.head:]
 	delete(w.streams, id)
 	for i, sid := range w.rotation {
 		if sid == id {
-			w.rotation = append(w.rotation[:i], w.rotation[i+1:]...)
+			copy(w.rotation[i:], w.rotation[i+1:])
+			w.rotation = w.rotation[:len(w.rotation)-1]
 			if w.pos > i {
 				w.pos--
 			}
@@ -3733,6 +3751,7 @@ func (w *muxOutboundWriter) loop() {
 		err := w.writeBatch(batch)
 		for i := range batch {
 			w.releaseFrame(batch[i])
+			batch[i] = muxOutboundFrame{}
 		}
 		if err != nil {
 			w.mu.Lock()
@@ -3794,7 +3813,9 @@ func (w *muxOutboundWriter) next() (muxOutboundFrame, bool) {
 		if w.closed {
 			return empty, false
 		}
+		w.loopWaiting = true
 		w.cond.Wait()
+		w.loopWaiting = false
 	}
 }
 
@@ -3820,20 +3841,26 @@ func (w *muxOutboundWriter) popLocked() (muxOutboundFrame, bool) {
 		f := w.priority[i]
 		blocked := false
 		if !f.ping && f.streamID != 0 && (f.cmd == MuxCmdFIN || f.cmd == MuxCmdRST) {
-			if q := w.streams[f.streamID]; q != nil && len(q.frames) > 0 {
+			if q := w.streams[f.streamID]; q != nil && q.head < len(q.frames) {
 				blocked = true
 			}
 		}
 		if !blocked {
-			w.priority = append(w.priority[:i], w.priority[i+1:]...)
+			copy(w.priority[i:], w.priority[i+1:])
+			w.priority[len(w.priority)-1] = muxOutboundFrame{}
+			w.priority = w.priority[:len(w.priority)-1]
 			w.total--
-			w.cond.Signal()
+			if w.waiters > 0 {
+				w.cond.Signal()
+			}
 			return f, true
 		}
 	}
 	if f, ok := w.nextDataLocked(); ok {
 		w.total--
-		w.cond.Signal()
+		if w.waiters > 0 {
+			w.cond.Signal()
+		}
 		return f, true
 	}
 	return empty, false
@@ -3852,7 +3879,7 @@ func (w *muxOutboundWriter) nextDataLocked() (muxOutboundFrame, bool) {
 			idx := (start + k) % len(w.rotation)
 			id := w.rotation[idx]
 			q := w.streams[id]
-			if q == nil || len(q.frames) == 0 {
+			if q == nil || q.head >= len(q.frames) {
 				continue
 			}
 			hasFrames = true
@@ -3860,16 +3887,21 @@ func (w *muxOutboundWriter) nextDataLocked() (muxOutboundFrame, bool) {
 			if q.deficit > muxDRRMaxDeficit {
 				q.deficit = muxDRRMaxDeficit
 			}
-			head := q.frames[0]
+			head := q.frames[q.head]
 			if frameWireLen(head) > q.deficit {
 				continue
 			}
-			q.frames[0] = muxOutboundFrame{}
-			q.frames = q.frames[1:]
+			q.frames[q.head] = muxOutboundFrame{}
+			q.head++
 			q.deficit -= frameWireLen(head)
-			if len(q.frames) == 0 {
+			if q.head >= len(q.frames) {
+				q.frames = q.frames[:0]
+				q.head = 0
+				q.deficit = 0
 				delete(w.streams, id)
-				w.rotation = append(w.rotation[:idx], w.rotation[idx+1:]...)
+				copy(w.rotation[idx:], w.rotation[idx+1:])
+				w.rotation = w.rotation[:len(w.rotation)-1]
+				w.freeQueues = append(w.freeQueues, q)
 			}
 			// Advance PAST the served stream so the next round starts with
 			// its successor (strict rotation; idx would stick to one bulk
@@ -3884,28 +3916,55 @@ func (w *muxOutboundWriter) nextDataLocked() (muxOutboundFrame, bool) {
 }
 
 func (w *muxOutboundWriter) enqueue(f muxOutboundFrame) bool {
+	isPriority := f.ping || (f.cmd != 0 && f.cmd != MuxCmdDATA)
 	w.mu.Lock()
-	defer w.mu.Unlock()
-	for w.total >= muxOutboundQueueDepth && !w.closed {
-		w.cond.Wait()
+	if !isPriority {
+		for w.total >= muxOutboundQueueDepth && !w.closed {
+			w.waiters++
+			w.cond.Wait()
+			w.waiters--
+		}
 	}
 	if w.closed {
+		w.mu.Unlock()
 		w.releaseFrame(f)
 		return false
 	}
-	if f.ping || (f.cmd != 0 && f.cmd != MuxCmdDATA) {
+	if isPriority {
 		w.priority = append(w.priority, f)
 	} else {
 		q := w.streams[f.streamID]
 		if q == nil {
-			q = &muxStreamQueue{}
+			if n := len(w.freeQueues); n > 0 {
+				q = w.freeQueues[n-1]
+				w.freeQueues[n-1] = nil
+				w.freeQueues = w.freeQueues[:n-1]
+			} else {
+				q = &muxStreamQueue{
+					frames: make([]muxOutboundFrame, 0, 16),
+				}
+			}
 			w.streams[f.streamID] = q
 			w.rotation = append(w.rotation, f.streamID)
+		} else if q.head > 0 && len(q.frames) == cap(q.frames) {
+			n := copy(q.frames, q.frames[q.head:])
+			for i := n; i < len(q.frames); i++ {
+				q.frames[i] = muxOutboundFrame{}
+			}
+			q.frames = q.frames[:n]
+			q.head = 0
 		}
 		q.frames = append(q.frames, f)
 	}
 	w.total++
-	w.cond.Signal()
+	if w.loopWaiting {
+		if w.waiters > 0 {
+			w.cond.Broadcast()
+		} else {
+			w.cond.Signal()
+		}
+	}
+	w.mu.Unlock()
 	return true
 }
 
@@ -3918,10 +3977,10 @@ func (w *muxOutboundWriter) enqueuePing() bool {
 func (w *muxOutboundWriter) dropStream(id uint32) {
 	w.mu.Lock()
 	doomed := w.removeLocked(id)
-	for range doomed {
-		w.total--
+	w.total -= len(doomed)
+	if w.waiters > 0 {
+		w.cond.Broadcast()
 	}
-	w.cond.Broadcast()
 	w.mu.Unlock()
 	for _, f := range doomed {
 		w.releaseFrame(f)
@@ -4117,10 +4176,14 @@ func (s *MuxClientSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 		wireLen += aeadOverhead
 	}
 	frameLen := MuxHeaderLen + wireLen
-	bPtr := s.cfg.BufPool.Get().(*[]byte)
+	pool := s.cfg.BufPool
+	if cmd != MuxCmdDATA && s.cfg.HeaderBufPool != nil && frameLen+14 <= MaxHeaderSize {
+		pool = s.cfg.HeaderBufPool
+	}
+	bPtr := pool.Get().(*[]byte)
 	buf := *bPtr
 	if frameLen+14 > len(buf) {
-		s.cfg.BufPool.Put(bPtr)
+		pool.Put(bPtr)
 		return errors.New("mux frame exceeds buffer size")
 	}
 	frameStart := 14
@@ -4149,7 +4212,66 @@ func (s *MuxClientSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 			maskPool.Put(prng)
 		}
 	}
-	frame := muxOutboundFrame{bPtr: bPtr, pool: s.cfg.BufPool, payloadOff: frameStart, payloadLen: frameLen + padLen, opcode: 0x2, streamID: streamID, cmd: cmd}
+	frame := muxOutboundFrame{bPtr: bPtr, pool: pool, payloadOff: frameStart, payloadLen: frameLen + padLen, opcode: 0x2, streamID: streamID, cmd: cmd}
+	if !s.writer.enqueue(frame) {
+		return errors.New("mux session writer closed")
+	}
+	return nil
+}
+
+// SendDataFramePreallocated enqueues a MuxCmdDATA frame whose plaintext is
+// already placed at (*bPtr)[14+MuxHeaderLen : 14+MuxHeaderLen+payloadLen].
+// Always takes ownership of bPtr (returns it to BufPool on error or after write).
+func (s *MuxClientSession) SendDataFramePreallocated(streamID uint32, bPtr *[]byte, payloadLen int) error {
+	select {
+	case <-s.closed:
+		if bPtr != nil && s.cfg != nil && s.cfg.BufPool != nil {
+			s.cfg.BufPool.Put(bPtr)
+		}
+		return errors.New("mux session closed")
+	default:
+	}
+	if s.wsConn == nil || s.cfg == nil || s.cfg.BufPool == nil || s.writer == nil {
+		if bPtr != nil && s.cfg != nil && s.cfg.BufPool != nil {
+			s.cfg.BufPool.Put(bPtr)
+		}
+		return nil
+	}
+	if payloadLen > 65535 {
+		s.cfg.BufPool.Put(bPtr)
+		return fmt.Errorf("mux frame payload %d exceeds maximum uint16 length (65535)", payloadLen)
+	}
+	aead := s.cfg.Crypto != nil && !s.cfg.Crypto.isXOR()
+	wireLen := payloadLen
+	if aead && payloadLen > 0 {
+		wireLen += aeadOverhead
+	}
+	frameLen := MuxHeaderLen + wireLen
+	buf := *bPtr
+	if frameLen+14 > len(buf) {
+		s.cfg.BufPool.Put(bPtr)
+		return errors.New("mux frame exceeds buffer size")
+	}
+	const frameStart = 14
+	binary.BigEndian.PutUint32(buf[frameStart:frameStart+4], streamID)
+	buf[frameStart+4] = MuxCmdDATA
+	binary.BigEndian.PutUint16(buf[frameStart+5:frameStart+7], uint16(wireLen))
+	if aead && payloadLen > 0 {
+		s.cfg.Crypto.SealRegion(buf[frameStart+7:], payloadLen)
+	}
+	padLen := 0
+	if s.cfg.Obfs {
+		if room := len(buf) - 14 - frameLen; room > 0 {
+			if room > obfsPadMax {
+				room = obfsPadMax
+			}
+			prng := maskPool.Get().(*maskPRNG)
+			padLen = prng.randIntn(room + 1)
+			prng.fillRandom(buf[frameStart+frameLen : frameStart+frameLen+padLen])
+			maskPool.Put(prng)
+		}
+	}
+	frame := muxOutboundFrame{bPtr: bPtr, pool: s.cfg.BufPool, payloadOff: frameStart, payloadLen: frameLen + padLen, opcode: 0x2, streamID: streamID, cmd: MuxCmdDATA}
 	if !s.writer.enqueue(frame) {
 		return errors.New("mux session writer closed")
 	}
@@ -4505,17 +4627,30 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 	errCh := make(chan error, 2)
 
 	go func() {
-		bPtr := cfg.BufPool.Get().(*[]byte)
-		defer cfg.BufPool.Put(bPtr)
-		buf := *bPtr
+		const payloadStart = 14 + MuxHeaderLen
 		for {
-			nr, errRead := localConn.Read(buf)
+			bPtr := cfg.BufPool.Get().(*[]byte)
+			buf := *bPtr
+			limit := len(buf) - payloadStart
+			if limit > muxDataChunkLimit {
+				limit = muxDataChunkLimit
+			}
+			nr, errRead := localConn.Read(buf[payloadStart : payloadStart+limit])
 			if nr > 0 {
-				if _, errWrite := stream.Write(buf[:nr]); errWrite != nil {
+				if !stream.sendGate.Acquire(nr, stream.closed) {
+					cfg.BufPool.Put(bPtr)
+					errCh <- errors.New("stream closed")
+					return
+				}
+				if errWrite := session.SendDataFramePreallocated(streamID, bPtr, nr); errWrite != nil {
 					errCh <- errWrite
 					return
 				}
+				bPtr = nil
 				stats.AddBytes(int64(nr), 0)
+			}
+			if bPtr != nil {
+				cfg.BufPool.Put(bPtr)
 			}
 			if errRead != nil {
 				stream.Close()
@@ -4526,9 +4661,6 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 	}()
 
 	go func() {
-		bPtr := cfg.BufPool.Get().(*[]byte)
-		defer cfg.BufPool.Put(bPtr)
-		buf := *bPtr
 		// W3 receive-side refund accumulator (client -> server WINDOW).
 		var refundPending int64
 		// The local app may stop draining (M6 wedge): bound the egress
@@ -4536,10 +4668,17 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 		var lastWriteSet time.Time
 		writeTimeout := time.Duration(cfg.ConnTimeout) * time.Second
 		for {
-			nr, errRead := stream.Read(buf)
+			frame, errRead := stream.ReadFrame()
+			if errRead != nil {
+				errCh <- errRead
+				return
+			}
+			nr := len(frame.data)
 			if nr > 0 {
 				refreshWriteDeadline(localConn, writeTimeout, &lastWriteSet)
-				if _, errWrite := localConn.Write(buf[:nr]); errWrite != nil {
+				_, errWrite := localConn.Write(frame.data)
+				frame.release()
+				if errWrite != nil {
 					errCh <- errWrite
 					return
 				}
@@ -4556,10 +4695,8 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 						_ = session.SendFrame(streamID, MuxCmdWINDOW, wb[:])
 					}
 				}
-			}
-			if errRead != nil {
-				errCh <- errRead
-				return
+			} else {
+				frame.release()
 			}
 		}
 	}()
@@ -4700,21 +4837,15 @@ func (s *MuxServerStream) deliveryLoop() {
 
 func (s *MuxServerStream) PushDataFrame(frame muxDataFrame) bool {
 	dataLen := int64(len(frame.data))
-	// One reusable stall Timer for the whole call (see MuxStream).
-	stall := time.NewTimer(muxPushStallTimeout)
-	defer func() {
-		if !stall.Stop() {
-			select {
-			case <-stall.C:
-			default:
-			}
-		}
-	}()
+	var stall *time.Timer
 	for {
 		s.bufMu.Lock()
 		select {
 		case <-s.closed:
 			s.bufMu.Unlock()
+			if stall != nil {
+				stall.Stop()
+			}
 			return false
 		default:
 		}
@@ -4723,20 +4854,28 @@ func (s *MuxServerStream) PushDataFrame(frame muxDataFrame) bool {
 			case s.writeChan <- frame:
 				s.queuedBytes += dataLen
 				s.bufMu.Unlock()
+				if stall != nil {
+					stall.Stop()
+				}
 				return true
 			default:
 			}
 		}
 		s.bufMu.Unlock()
-		if !stall.Stop() {
-			select {
-			case <-stall.C:
-			default:
+		if stall == nil {
+			stall = time.NewTimer(muxPushStallTimeout)
+		} else {
+			if !stall.Stop() {
+				select {
+				case <-stall.C:
+				default:
+				}
 			}
+			stall.Reset(muxPushStallTimeout)
 		}
-		stall.Reset(muxPushStallTimeout)
 		select {
 		case <-s.closed:
+			stall.Stop()
 			return false
 		case <-s.hasSpace:
 			continue
@@ -4872,10 +5011,14 @@ func (s *MuxServerSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 		wireLen += aeadOverhead
 	}
 	frameLen := MuxHeaderLen + wireLen
-	bPtr := s.cfg.BufPool.Get().(*[]byte)
+	pool := s.cfg.BufPool
+	if cmd != MuxCmdDATA && s.cfg.HeaderBufPool != nil && frameLen+14 <= MaxHeaderSize {
+		pool = s.cfg.HeaderBufPool
+	}
+	bPtr := pool.Get().(*[]byte)
 	buf := *bPtr
 	if frameLen+14 > len(buf) {
-		s.cfg.BufPool.Put(bPtr)
+		pool.Put(bPtr)
 		return errors.New("mux server frame exceeds buffer")
 	}
 	frameStart := 14
@@ -4902,7 +5045,71 @@ func (s *MuxServerSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 			maskPool.Put(prng)
 		}
 	}
-	frame := muxOutboundFrame{bPtr: bPtr, pool: s.cfg.BufPool, payloadOff: frameStart, payloadLen: frameLen + padLen, opcode: 0x2, streamID: streamID, cmd: cmd}
+	frame := muxOutboundFrame{bPtr: bPtr, pool: pool, payloadOff: frameStart, payloadLen: frameLen + padLen, opcode: 0x2, streamID: streamID, cmd: cmd}
+	if !s.writer.enqueue(frame) {
+		return errors.New("mux server session writer closed")
+	}
+	return nil
+}
+
+// SendDataFramePreallocated enqueues a MuxCmdDATA frame whose plaintext is
+// already placed at (*bPtr)[14+MuxHeaderLen : 14+MuxHeaderLen+payloadLen].
+// Always takes ownership of bPtr (returns it to BufPool on error or after write).
+func (s *MuxServerSession) SendDataFramePreallocated(streamID uint32, bPtr *[]byte, payloadLen int) error {
+	select {
+	case <-s.closed:
+		if bPtr != nil && s.cfg != nil && s.cfg.BufPool != nil {
+			s.cfg.BufPool.Put(bPtr)
+		}
+		return errors.New("mux server session closed")
+	default:
+	}
+	if s.writer == nil {
+		var err error
+		if bPtr != nil {
+			const payloadStart = 14 + MuxHeaderLen
+			err = s.sendFrameInline(streamID, MuxCmdDATA, (*bPtr)[payloadStart:payloadStart+payloadLen])
+			if s.cfg != nil && s.cfg.BufPool != nil {
+				s.cfg.BufPool.Put(bPtr)
+			}
+		}
+		return err
+	}
+	if payloadLen > 65535 {
+		s.cfg.BufPool.Put(bPtr)
+		return fmt.Errorf("mux server frame payload %d exceeds maximum uint16 length (65535)", payloadLen)
+	}
+	aead := s.cfg.Crypto != nil && !s.cfg.Crypto.isXOR()
+	wireLen := payloadLen
+	if aead && payloadLen > 0 {
+		wireLen += aeadOverhead
+	}
+	frameLen := MuxHeaderLen + wireLen
+	buf := *bPtr
+	if frameLen+14 > len(buf) {
+		s.cfg.BufPool.Put(bPtr)
+		return errors.New("mux server frame exceeds buffer")
+	}
+	const frameStart = 14
+	binary.BigEndian.PutUint32(buf[frameStart:frameStart+4], streamID)
+	buf[frameStart+4] = MuxCmdDATA
+	binary.BigEndian.PutUint16(buf[frameStart+5:frameStart+7], uint16(wireLen))
+	if aead && payloadLen > 0 {
+		s.cfg.Crypto.SealRegion(buf[frameStart+7:], payloadLen)
+	}
+	padLen := 0
+	if s.cfg.Obfs {
+		if room := len(buf) - 14 - frameLen; room > 0 {
+			if room > obfsPadMax {
+				room = obfsPadMax
+			}
+			prng := maskPool.Get().(*maskPRNG)
+			padLen = prng.randIntn(room + 1)
+			prng.fillRandom(buf[frameStart+frameLen : frameStart+frameLen+padLen])
+			maskPool.Put(prng)
+		}
+	}
+	frame := muxOutboundFrame{bPtr: bPtr, pool: s.cfg.BufPool, payloadOff: frameStart, payloadLen: frameLen + padLen, opcode: 0x2, streamID: streamID, cmd: MuxCmdDATA}
 	if !s.writer.enqueue(frame) {
 		return errors.New("mux server session writer closed")
 	}
@@ -5211,35 +5418,30 @@ func (s *MuxServerSession) handleNewStream(st *MuxServerStream, targetStr string
 		}
 	}()
 
-	bPtr := s.cfg.BufPool.Get().(*[]byte)
-	defer s.cfg.BufPool.Put(bPtr)
-	buf := *bPtr
-	readBuf := buf
-	if len(readBuf) > 65535 {
-		readBuf = readBuf[:65535]
-	}
+	const payloadStart = 14 + MuxHeaderLen
 	for {
-		nr, errRead := targetConn.Read(readBuf)
+		bPtr := s.cfg.BufPool.Get().(*[]byte)
+		buf := *bPtr
+		limit := len(buf) - payloadStart
+		if limit > muxDataChunkLimit {
+			limit = muxDataChunkLimit
+		}
+		nr, errRead := targetConn.Read(buf[payloadStart : payloadStart+limit])
 		if nr > 0 {
 			// W3 server->client send gate: credit granted by the client's
 			// WINDOW frames; unbounded until its VERSION arrived.
 			if !st.sendGate.Acquire(nr, st.closed) {
+				s.cfg.BufPool.Put(bPtr)
 				return
 			}
-			// AEAD mode caps plaintext per frame below the read size, so
-			// split large reads into wire-legal DATA frames (legacy mode
-			// sends nr in one frame exactly as before).
-			for off := 0; off < nr; {
-				chunk := nr - off
-				if chunk > muxDataChunkLimit {
-					chunk = muxDataChunkLimit
-				}
-				if errWrite := s.SendFrame(st.id, MuxCmdDATA, readBuf[off:off+chunk]); errWrite != nil {
-					return
-				}
-				off += chunk
+			if errWrite := s.SendDataFramePreallocated(st.id, bPtr, nr); errWrite != nil {
+				return
 			}
+			bPtr = nil
 			stats.AddBytes(0, int64(nr))
+		}
+		if bPtr != nil {
+			s.cfg.BufPool.Put(bPtr)
 		}
 		if errRead != nil {
 			if errRead == io.EOF {
