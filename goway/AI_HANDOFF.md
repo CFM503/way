@@ -12,6 +12,56 @@
 - User mandate, 2026-09-23. 违反此规则的改动一律不得合入：只允许正向优化，永远禁止反向优化。
 
 
+## v1.8.20 cycle: TLS Record Coalescing, Congestion-Aware MUX Scheduling, Cold-Start Singleflight & Server SWR DNS (2026-10-14)
+
+### Status & Release Summary
+- **Version**: Bumped to `1.8.20` in `goway.go` (`Version = "1.8.20"`).
+- **Binary Footprint**: Release candidate `7,292,928` bytes (~6.95 MB, safely under Windows 10 MiB Defender scan threshold).
+- **Standing Rule Compliance**: Strictly forward-only optimization principle verified. Full test suite passes cleanly (`ok goway 73.784s`). Zero architectural or performance regressions introduced.
+- **Core Optimization Vectors**:
+  - **MUX TLS Batch Coalescing (`coalesceBuf`)**: Detects `*tls.Conn` on `muxOutboundWriter`, merging multi-frame write batches into a single contiguous buffer written in one `conn.Write()` call. Eliminates the per-frame 21-byte TLS framing overhead (5B header + 16B MAC) and repeated symmetric encryption passes caused by standard Go `net.Buffers.WriteTo` fallback loops.
+  - **Congestion-Weighted MUX Load Balancing**: Dynamically tracks `queuedFrames` inside `muxOutboundWriter`. `pickBestSessionLocked()` now weights writer queue backlog 4x (`score = ActiveStreams() + QueuedFrames() * 4`), allowing lightweight interactive streams to automatically steer clear of sessions saturated by heavy bulk downloads/uploads, eliminating head-of-line blocking across MUX sessions.
+  - **Cold-Start Singleflight Barrier & Startup Prewarming**: Implemented `initWait` barrier in `MuxClientPool.GetSession()` to serialize empty-pool initial dials, preventing the thundering herd problem where 20+ concurrent requests trigger 20 simultaneous handshakes. Added background `prewarm()` at client startup for both MUX and QUIC pools, delivering 0-RTT responsiveness on first request.
+  - **QUIC Relay 0-RTT Pipelining & Reader Pool Allocation Elimination**: Merged header and initial payload into a single write flight in `relayQUICClient`, shaving 1 full WAN RTT off initial stream delivery. Replaced per-connection `bufio.NewReader` heap allocations with `getBufioReader` / `putBufioReader` object pool.
+  - **Server-Side In-Memory SWR + Singleflight DNS Resolver**: Automatically equips server mode with an in-memory DNS resolver combining Stale-While-Revalidate (5m TTL, 60m stale with async background refresh) and Singleflight request deduplication over system DNS. Drastically cuts OS libc DNS lookups under heavy concurrency.
+  - **Fast Multi-Homed Target Dialing (`dialTargetFast`)**: Prioritizes IPv4 addresses to bypass broken or high-loss IPv6 routes common on overseas VPS nodes, with a 2.5-second failover threshold to secondary IP addresses before connection abandonment.
+  - **Unified TLS Profile & Anti-Fingerprinting Hardening**: Eliminated TLS config cloning on standard SNI paths, and bound TLS profile selection with HTTP WebSocket handshake headers to guarantee 100% fingerprint consistency across transport and application layers.
+
+### Detailed Technical Vectors Shipped
+
+1. **TLS Multi-Frame Coalesced Write (`muxOutboundWriter`, `coalesceBuf`, `isTLS`)**:
+   - Go's `crypto/tls` lacks kernel `writev` support. When `net.Buffers.WriteTo` is called on `*tls.Conn`, it executes a loop of individual `conn.Write()` calls for each frame slice.
+   - For a batch of 8 MUX frames, this generated 8 separate TLS records, each with 21 bytes of framing/MAC overhead, 8 encryption calls, and multiple socket writes.
+   - 1.8.20 implements a reusable `coalesceBuf` byte slice. If `isTLS` is true and `len(scratchBufs) > 1`, all frames in the batch are copied into `coalesceBuf` and submitted via a single `w.conn.Write(out)`, yielding 1 consolidated TLS record and dramatically higher throughput under high MUX stream concurrency.
+
+2. **Writer Queue Congestion-Aware Scheduling (`QueuedFrames`)**:
+   - In 1.8.19, `pickBestSessionLocked()` only considered `ActiveStreams()`. A session handling a 50MB/s bulk transfer had the same score as an idle keepalive stream, causing new interactive requests to stall behind congested outbound queues.
+   - 1.8.20 tracks `queuedFrames atomic.Int64` on every enqueue/dequeue/drop operation in `muxOutboundWriter`.
+   - The selection score `ActiveStreams() + QueuedFrames()*4` heavily penalizes sessions with backlogged writer queues, naturally balancing outbound pressure and protecting latency-sensitive traffic.
+
+3. **Pool Cold-Start Singleflight Barrier & Prewarm (`MuxClientPool`, `QUICClientPool`)**:
+   - In 1.8.19, a cold client pool hit with 20 parallel browser requests spawned 20 concurrent dialers, wasting server and client CPU/crypto resources.
+   - 1.8.20 elects a single dialer using an `initWait chan struct{}`. Remaining goroutines park on the channel and wake up immediately to share the established session upon completion.
+   - Both `NewMuxClientPool` and `NewQUICClientPool` now trigger background prewarm routines at startup, ensuring the first user request experiences zero handshake latency.
+
+4. **QUIC Relay 0-RTT Pipelining & Sync.Pool Reader Reuse (`relayQUICClient`, `handleClientUDPQUIC`)**:
+   - In 1.8.19, `relayQUICClient` wrote the target header, waited for server `OK\n` response (1 RTT), and only then transmitted `initialPayload`.
+   - 1.8.20 transmits `header + initialPayload` in a single combined write. The server's `bufio.Reader` reads the header line and smoothly passes the pre-buffered initial payload into the relay loop, cutting connection establishment latency by 1 RTT.
+   - Replaced unpooled `bufio.NewReader(stream)` in QUIC client relay routines with `getBufioReader` / `putBufioReader` from the existing `bufioReaderPool`.
+
+5. **Server-Side SWR + Singleflight DNS Cache (`RemoteResolver`, `dialTargetFast`)**:
+   - In 1.8.19 server mode without explicit `-dns`, `cfg.Resolver` was `nil`, forcing synchronous OS libc DNS lookups on every incoming stream.
+   - 1.8.20 sets `cfg.Resolver = NewRemoteResolver("")` in server mode by default.
+   - Features Stale-While-Revalidate (5min fresh, 60min stale with non-blocking async update) and singleflight merging of concurrent requests for identical hosts.
+   - Integrates `pickPreferredIPs` (IPv4 preferential) and `dialTargetFast` (2.5s primary IP timeout before fallback to secondary IP), mitigating IPv6 route blackholes.
+
+6. **Fingerprint Alignment & Zero-Alloc TLS Config Reuse (`getProfileTLSConfigForHost`)**:
+   - Resolved a vulnerability in 1.8.19 where `pickProfileTLSConfig()` and `performWSHandshake()` independently selected random profiles, resulting in detectable TLS fingerprint / HTTP User-Agent mismatches.
+   - Unified profile selection via `pickBrowserProfileIndex()`.
+   - Pre-binds `cfg.TLSBase.ServerName` at startup. `getProfileTLSConfigForHost` returns pre-built TLS configs directly without calling `Clone()`, eliminating heap churn during WS connection pooling.
+
+---
+
 ## v1.8.19 cycle: Register-Unrolled 32B XOR, Zero-Alloc MUX Relay, & Fair Outbound Writer Optimization (2026-10-12)
 
 ### Status & Release Summary

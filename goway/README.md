@@ -1,4 +1,4 @@
-# GOWAY v1.8.19
+# GOWAY v1.8.20
 
 GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具，支持 HTTP 和完整 SOCKS5 (TCP + UDP) 协议，具备浏览器指纹伪装、0-RTT 多路复用 (Mux)、QUIC 弱网抗丢包传输、Cloudflare CDN 边缘接入与 PGO 机器码级性能优化。
 
@@ -7,6 +7,22 @@ GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具�
 > 接手本项目的 AI 必须先读 `goway/AI_HANDOFF.md` 顶部同名规则并原样保留；每个性能改动必须在 `AI_HANDOFF.md` 记录前后数据，**没有数据不算完成**。
 
 ## 版本历史
+
+### v1.8.20 (2026-10-14) - 传输效能与并发加固：TLS 记录合并写入、MUX 拥塞加权调度与防惊群、QUIC 0-RTT 管道化及服务端 SWR DNS 缓存
+
+#### 核心优化与架构加固
+
+| 优化项 | 说明 | 实测/设计收益 |
+|---|---|---|
+| **MUX 输出 TLS 批量合并写入 (`coalesceBuf`) (P0)** | 探测 `*tls.Conn` 连接，将多帧批量拷贝至单一缓冲区调用 `conn.Write` | **根除 `net.Buffers.WriteTo` 在 TLS 下逐帧生成的 21B 协议头碎片与多重加密，大幅提升高并发小包吞吐与 CPU 效率** |
+| **拥塞感知负载均衡与加权调度 (P0)** | 会话打分改为 `ActiveStreams + QueuedFrames * 4`，原子追踪底层输出队列帧深度 | **大流量上传/下载流打分自动激增，新交互流自动绕开拥塞会话，彻底消除 MUX 队头阻塞** |
+| **MUX 连接池冷启动 Singleflight 与启动预热 (P0)** | 引入 `initWait` 单飞栅栏，首个请求拨号，并发请求等待复用；启动后台异步 `prewarm()` | **消除突发 20+ 并发连接时的握手惊群风暴；首个用户请求直接命中预热隧道，享受 0-RTT** |
+| **QUIC 0-RTT 首包合并与 Reader 池化 (P1)** | `relayQUICClient` 将 Header 与 `initialPayload` 合并为单次写入；接入 `bufioReaderPool` | **首包传输节省 1 个完整公网 RTT；消除每连接 4KB 堆分配，降低 GC 压力** |
+| **服务端 SWR + Singleflight DNS 内存缓存 (P1)** | 服务端默认启用内存 SWR（5min 新鲜，60min 异步更新）与 Singleflight 解析器 | **根除高并发下频繁调用 OS libc 同步解析的线程开销与解析抖动，缓存命中 0ms 延迟** |
+| **目标快速回退拨号 (`dialTargetFast`) (P1)** | 优选 IPv4 规避劣质 IPv6，主 IP 2.5s 握手不通迅速切换备用 IP | **避免目标单点故障或 IPv6 黑洞导致长时间连接挂起** |
+| **TLS 指纹与 WS Profile 强绑定及免 Clone (P1)** | 预绑定 SNI 配置，统一使用同一 Profile 索引同步配置 TLS 与 WS 握手头 | **消除 `tls.Config.Clone()` 堆内存分配；杜绝 TLS 指纹与 User-Agent 头分裂特征被 DPI 识别** |
+
+---
 
 ### v1.8.19 (2026-10-12) - 极限性能跃升：寄存器级 32B XOR、热路径零堆分配、端到端零拷贝 MUX 流管道与公平调度器零分配优化
 

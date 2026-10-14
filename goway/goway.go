@@ -56,7 +56,7 @@ import (
 )
 
 const (
-	Version = "1.8.19"
+	Version = "1.8.20"
 	// MaxWSFrameSize matches the largest frame the sender side can build
 	// (BufPool caps at 12MB + MUX header + AEAD overhead) — the old 64MB
 	// ceiling was pure memory-flood attack surface: a claimed-but-unsent
@@ -485,7 +485,7 @@ func drawTUI(cfg *Config) {
 	drawTuiRow(&buf, formatTwoColumns("Auth:      ", authStr, "SSL Verify:  ", sslVerifyStr, colWidth), boxWidth)
 
 	var dnsStr string
-	if cfg.Resolver != nil {
+	if cfg.Resolver != nil && cfg.Resolver.serverIP != "" {
 		dnsStr = AnsiGreen + "Remote: " + cfg.Resolver.serverIP + AnsiReset
 	} else {
 		dnsStr = AnsiYellow + "System Default" + AnsiReset
@@ -840,52 +840,62 @@ type Config struct {
 	TUIBorderWidth  int
 }
 
-// --- DNS Resolver ---
+// --- DNS Resolver (SWR + Singleflight + IPv4 Preference) ---
 
 type dnsCacheEntry struct {
-	ip      string
-	expires time.Time
+	ip         string
+	backupIP   string
+	expires    time.Time
+	staleUntil time.Time
 }
 
 type RemoteResolver struct {
-	serverIP  string
-	resolver  *net.Resolver
-	sysResolv *net.Resolver // pre-allocated; avoids per-call allocation on fallback
-	timeout   time.Duration
-	cache     map[string]dnsCacheEntry
-	cacheMu   sync.RWMutex
-	cacheTTL  time.Duration
+	serverIP   string
+	resolver   *net.Resolver
+	sysResolv  *net.Resolver // pre-allocated; avoids per-call allocation on fallback
+	timeout    time.Duration
+	cache      map[string]dnsCacheEntry
+	cacheMu    sync.RWMutex
+	cacheTTL   time.Duration
+	staleTTL   time.Duration
+	inflightMu sync.Mutex
+	inflight   map[string]chan struct{}
 }
 
 func NewRemoteResolver(serverIP string) *RemoteResolver {
 	r := &RemoteResolver{
 		serverIP:  serverIP,
-		timeout:   5 * time.Second,
+		timeout:   4 * time.Second,
 		sysResolv: &net.Resolver{PreferGo: false},
 		cache:     make(map[string]dnsCacheEntry),
 		cacheTTL:  5 * time.Minute,
+		staleTTL:  60 * time.Minute,
+		inflight:  make(map[string]chan struct{}),
 	}
-	r.resolver = &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{Timeout: r.timeout}
-			return d.DialContext(ctx, network, net.JoinHostPort(serverIP, "53"))
-		},
+	if serverIP != "" {
+		r.resolver = &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				d := net.Dialer{Timeout: r.timeout}
+				return d.DialContext(ctx, network, net.JoinHostPort(serverIP, "53"))
+			},
+		}
 	}
 	return r
 }
 
-// maxDNSCacheEntries bounds RemoteResolver.cache. Entries expired or not
-// are never auto-removed from a Go map, so an unbounded cache grew for the
-// lifetime of the process with every distinct host ever resolved.
 const maxDNSCacheEntries = 4096
 
-// evictDNSCacheLocked drops expired entries first; if the cache is still at
-// capacity, it drops a quarter of the remaining entries (map iteration
-// order, which is random — acceptable for a best-effort DNS cache).
-// Caller must hold r.cacheMu.
 func (r *RemoteResolver) evictDNSCacheLocked() {
 	now := time.Now()
+	for host, entry := range r.cache {
+		if now.After(entry.staleUntil) {
+			delete(r.cache, host)
+		}
+	}
+	if len(r.cache) < maxDNSCacheEntries {
+		return
+	}
 	for host, entry := range r.cache {
 		if now.After(entry.expires) {
 			delete(r.cache, host)
@@ -904,62 +914,161 @@ func (r *RemoteResolver) evictDNSCacheLocked() {
 	}
 }
 
-func (r *RemoteResolver) Resolve(host string) (string, error) {
-	// If already an IP, return as-is
-	if ip := net.ParseIP(host); ip != nil {
-		return host, nil
-	}
-
-	// Check cache first
-	r.cacheMu.RLock()
-	if entry, ok := r.cache[host]; ok && time.Now().Before(entry.expires) {
-		r.cacheMu.RUnlock()
-		return entry.ip, nil
-	}
-	r.cacheMu.RUnlock()
-
-	// Try remote DNS with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
-	defer cancel()
-
-	addrs, err := r.resolver.LookupHost(ctx, host)
-	if err == nil && len(addrs) > 0 {
-		logInfo("[DNS] %s -> %s (remote: %s)", host, addrs[0], r.serverIP)
-		// Cache the result
-		r.cacheMu.Lock()
-		if len(r.cache) >= maxDNSCacheEntries {
-			r.evictDNSCacheLocked()
+// pickPreferredIPs prefers IPv4 to avoid broken/high-RTT IPv6 paths while
+// retaining a secondary IP for fast Happy-Eyeballs fallback.
+func pickPreferredIPs(addrs []string) (primary, backup string) {
+	for _, a := range addrs {
+		if ip := net.ParseIP(a); ip != nil && ip.To4() != nil {
+			if primary == "" {
+				primary = a
+			} else if backup == "" && a != primary {
+				backup = a
+				return primary, backup
+			}
 		}
-		r.cache[host] = dnsCacheEntry{ip: addrs[0], expires: time.Now().Add(r.cacheTTL)}
-		r.cacheMu.Unlock()
-		return addrs[0], nil
+	}
+	for _, a := range addrs {
+		if primary == "" {
+			primary = a
+		} else if backup == "" && a != primary {
+			backup = a
+			break
+		}
+	}
+	return primary, backup
+}
+
+func (r *RemoteResolver) lookupFresh(host string) (string, string, error) {
+	if r.resolver != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
+		addrs, err := r.resolver.LookupHost(ctx, host)
+		cancel()
+		if err == nil && len(addrs) > 0 {
+			primary, backup := pickPreferredIPs(addrs)
+			logInfo("[DNS] %s -> %s (remote: %s)", host, primary, r.serverIP)
+			now := time.Now()
+			r.cacheMu.Lock()
+			if len(r.cache) >= maxDNSCacheEntries {
+				r.evictDNSCacheLocked()
+			}
+			r.cache[host] = dnsCacheEntry{
+				ip:         primary,
+				backupIP:   backup,
+				expires:    now.Add(r.cacheTTL),
+				staleUntil: now.Add(r.staleTTL),
+			}
+			r.cacheMu.Unlock()
+			return primary, backup, nil
+		}
+		if err != nil {
+			logWarn("[DNS] Remote lookup failed for %s: %v, falling back to system DNS", host, err)
+		} else {
+			logWarn("[DNS] Remote lookup returned no addresses for %s, falling back to system DNS", host)
+		}
 	}
 
-	if err != nil {
-		logWarn("[DNS] Remote lookup failed for %s: %v, falling back to system DNS", host, err)
-	} else {
-		logWarn("[DNS] Remote lookup returned no addresses for %s, falling back to system DNS", host)
-	}
-
-	// Fallback to pre-allocated system resolver (no heap alloc here)
 	sysCtx, sysCancel := context.WithTimeout(context.Background(), r.timeout)
-	defer sysCancel()
 	sysAddrs, sysErr := r.sysResolv.LookupHost(sysCtx, host)
+	sysCancel()
 	if sysErr != nil {
-		return "", fmt.Errorf("DNS resolution failed for %s: remote=%v, system=%v", host, err, sysErr)
+		return "", "", fmt.Errorf("DNS resolution failed for %s: %v", host, sysErr)
 	}
 	if len(sysAddrs) == 0 {
-		return "", fmt.Errorf("DNS resolution returned no addresses for %s", host)
+		return "", "", fmt.Errorf("DNS resolution returned no addresses for %s", host)
 	}
-	logInfo("[DNS] %s -> %s (system fallback)", host, sysAddrs[0])
-	// Cache the system fallback result too
+	primary, backup := pickPreferredIPs(sysAddrs)
+	if r.serverIP != "" {
+		logInfo("[DNS] %s -> %s (system fallback)", host, primary)
+	} else {
+		logDebug("[DNS] %s -> %s (cached system DNS)", host, primary)
+	}
+	now := time.Now()
 	r.cacheMu.Lock()
 	if len(r.cache) >= maxDNSCacheEntries {
 		r.evictDNSCacheLocked()
 	}
-	r.cache[host] = dnsCacheEntry{ip: sysAddrs[0], expires: time.Now().Add(r.cacheTTL)}
+	r.cache[host] = dnsCacheEntry{
+		ip:         primary,
+		backupIP:   backup,
+		expires:    now.Add(r.cacheTTL),
+		staleUntil: now.Add(r.staleTTL),
+	}
 	r.cacheMu.Unlock()
-	return sysAddrs[0], nil
+	return primary, backup, nil
+}
+
+func (r *RemoteResolver) lookupSingleflight(host string) (string, string, error) {
+	r.inflightMu.Lock()
+	if waitCh, ok := r.inflight[host]; ok {
+		r.inflightMu.Unlock()
+		<-waitCh
+		r.cacheMu.RLock()
+		entry, ok := r.cache[host]
+		r.cacheMu.RUnlock()
+		if ok && entry.ip != "" {
+			return entry.ip, entry.backupIP, nil
+		}
+		return "", "", fmt.Errorf("singleflight DNS lookup failed for %s", host)
+	}
+	waitCh := make(chan struct{})
+	r.inflight[host] = waitCh
+	r.inflightMu.Unlock()
+
+	primary, backup, err := r.lookupFresh(host)
+
+	r.inflightMu.Lock()
+	delete(r.inflight, host)
+	close(waitCh)
+	r.inflightMu.Unlock()
+	return primary, backup, err
+}
+
+func (r *RemoteResolver) refreshAsync(host string) {
+	r.inflightMu.Lock()
+	if _, ok := r.inflight[host]; ok {
+		r.inflightMu.Unlock()
+		return
+	}
+	waitCh := make(chan struct{})
+	r.inflight[host] = waitCh
+	r.inflightMu.Unlock()
+
+	go func() {
+		_, _, _ = r.lookupFresh(host)
+		r.inflightMu.Lock()
+		delete(r.inflight, host)
+		close(waitCh)
+		r.inflightMu.Unlock()
+	}()
+}
+
+func (r *RemoteResolver) ResolveDual(host string) (string, string, error) {
+	if ip := net.ParseIP(host); ip != nil {
+		return host, "", nil
+	}
+
+	now := time.Now()
+	r.cacheMu.RLock()
+	if entry, ok := r.cache[host]; ok {
+		if now.Before(entry.expires) {
+			r.cacheMu.RUnlock()
+			return entry.ip, entry.backupIP, nil
+		}
+		if now.Before(entry.staleUntil) {
+			ip, backup := entry.ip, entry.backupIP
+			r.cacheMu.RUnlock()
+			r.refreshAsync(host)
+			return ip, backup, nil
+		}
+	}
+	r.cacheMu.RUnlock()
+
+	return r.lookupSingleflight(host)
+}
+
+func (r *RemoteResolver) Resolve(host string) (string, error) {
+	primary, _, err := r.ResolveDual(host)
+	return primary, err
 }
 
 // resolveTargetAddr uses resolver to resolve target's host if configured.
@@ -975,6 +1084,57 @@ func resolveTargetAddr(resolver *RemoteResolver, target string) string {
 		return net.JoinHostPort(resolvedIP, port)
 	}
 	return target
+}
+
+// resolveTargetAddrDual returns primary and optional backup host:port pairs.
+func resolveTargetAddrDual(resolver *RemoteResolver, target string) (string, string) {
+	if resolver == nil {
+		return target, ""
+	}
+	host, port, splitErr := net.SplitHostPort(target)
+	if splitErr != nil {
+		return target, ""
+	}
+	primaryIP, backupIP, err := resolver.ResolveDual(host)
+	if err != nil || primaryIP == "" {
+		return target, ""
+	}
+	primaryAddr := net.JoinHostPort(primaryIP, port)
+	var backupAddr string
+	if backupIP != "" {
+		backupAddr = net.JoinHostPort(backupIP, port)
+	}
+	return primaryAddr, backupAddr
+}
+
+// dialTargetFast dials a target with bounded connect timeout and fast secondary IP fallback.
+func dialTargetFast(cfg *Config, targetStr string) (net.Conn, string, error) {
+	var resolver *RemoteResolver
+	totalTimeout := 10 * time.Second
+	if cfg != nil {
+		resolver = cfg.Resolver
+		if cfg.ConnTimeout > 0 && time.Duration(cfg.ConnTimeout)*time.Second < totalTimeout {
+			totalTimeout = time.Duration(cfg.ConnTimeout) * time.Second
+		}
+	}
+	primaryAddr, backupAddr := resolveTargetAddrDual(resolver, targetStr)
+	if serverTargetBlocked(cfg, primaryAddr) || (backupAddr != "" && serverTargetBlocked(cfg, backupAddr)) {
+		return nil, primaryAddr, errors.New("blocked local target")
+	}
+	if backupAddr == "" {
+		conn, err := net.DialTimeout("tcp", primaryAddr, totalTimeout)
+		return conn, primaryAddr, err
+	}
+	firstTimeout := 2500 * time.Millisecond
+	if firstTimeout > totalTimeout/2 {
+		firstTimeout = totalTimeout / 2
+	}
+	conn, err := net.DialTimeout("tcp", primaryAddr, firstTimeout)
+	if err == nil {
+		return conn, primaryAddr, nil
+	}
+	conn, err = net.DialTimeout("tcp", backupAddr, totalTimeout-firstTimeout)
+	return conn, backupAddr, err
 }
 
 // verifyAuthKey checks if input matches expectedKey (if key is set).
@@ -1295,8 +1455,12 @@ var browserProfiles = []BrowserProfile{
 	},
 }
 
+func pickBrowserProfileIndex() int {
+	return mrand.Intn(len(browserProfiles))
+}
+
 func pickBrowserProfile() BrowserProfile {
-	return browserProfiles[mrand.Intn(len(browserProfiles))]
+	return browserProfiles[pickBrowserProfileIndex()]
 }
 
 // Pre-built TLS configs for each browser profile (avoids per-connection clone)
@@ -1321,6 +1485,25 @@ func pickProfileTLSConfig() *tls.Config {
 		}
 	}
 	return profileTLSConfigs[mrand.Intn(len(profileTLSConfigs))]
+}
+
+// getProfileTLSConfigForHost returns a TLS config matching profileIdx and
+// serverName without cloning when serverName matches the pre-bound default.
+func getProfileTLSConfigForHost(profileIdx int, serverName string) *tls.Config {
+	if len(profileTLSConfigs) == 0 {
+		return &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			MaxVersion: tls.VersionTLS13,
+			ServerName: serverName,
+		}
+	}
+	base := profileTLSConfigs[profileIdx%len(profileTLSConfigs)]
+	if base.ServerName == serverName {
+		return base
+	}
+	cloned := base.Clone()
+	cloned.ServerName = serverName
+	return cloned
 }
 
 // --- Header Sanitization ---
@@ -1801,12 +1984,15 @@ func validateWSHandshakeResponse(respBytes []byte) error {
 
 // performWSHandshake sends a WebSocket handshake request and strictly validates the 101 response.
 func performWSHandshake(wsConn net.Conn, br *bufio.Reader, cfg *Config, wsHost, sniHostname string) error {
+	return performWSHandshakeWithProfile(wsConn, br, cfg, wsHost, sniHostname, pickBrowserProfile())
+}
+
+func performWSHandshakeWithProfile(wsConn net.Conn, br *bufio.Reader, cfg *Config, wsHost, sniHostname string, profile BrowserProfile) error {
 	wsURL := cfg.ParsedUpstream
 	path := "/"
 	if wsURL != nil && wsURL.Path != "" {
 		path = wsURL.Path
 	}
-	profile := pickBrowserProfile()
 	var wsKey [16]byte
 	if _, err := rand.Read(wsKey[:]); err != nil {
 		return err
@@ -1925,8 +2111,7 @@ func dialFallback(dialer *net.Dialer, wsHost, wsPort, sniHostname string, cfg *C
 		logInfo("[DNS] Trying fallback Cloudflare edge: %s (fakehost: %s)", fallbackAddr, sniHostname)
 		var conn net.Conn
 		if cfg.UpstreamIsWSS {
-			conf := pickProfileTLSConfig().Clone()
-			conf.ServerName = sniHostname
+			conf := getProfileTLSConfigForHost(pickBrowserProfileIndex(), sniHostname)
 			conn, err = tls.DialWithDialer(dialer, "tcp", fallbackAddr, conf)
 		} else {
 			conn, err = dialer.Dial("tcp", fallbackAddr)
@@ -2074,11 +2259,11 @@ func (p *ConnPool) createConn() *PooledConn {
 	}
 	p.mu.Unlock()
 
+	profileIdx := pickBrowserProfileIndex()
 	var wsConn net.Conn
 	var err error
 	if cfg.UpstreamIsWSS {
-		conf := pickProfileTLSConfig().Clone()
-		conf.ServerName = sniHostname
+		conf := getProfileTLSConfigForHost(profileIdx, sniHostname)
 		wsConn, err = tls.DialWithDialer(dialer, "tcp", dialAddr, conf)
 	} else {
 		wsConn, err = dialer.Dial("tcp", dialAddr)
@@ -2100,7 +2285,7 @@ func (p *ConnPool) createConn() *PooledConn {
 
 	optimizeSocket(wsConn, cfg)
 	br := bufio.NewReaderSize(wsConn, MaxHeaderSize)
-	if err := performWSHandshake(wsConn, br, cfg, wsHost, sniHostname); err != nil {
+	if err := performWSHandshakeWithProfile(wsConn, br, cfg, wsHost, sniHostname, browserProfiles[profileIdx]); err != nil {
 		wsConn.Close()
 		return nil
 	}
@@ -2596,6 +2781,9 @@ func main() {
 			os.Exit(1)
 		}
 		cfg.Resolver = NewRemoteResolver(dnsClean)
+	} else if cfg.Upstream == "" {
+		// Server mode default: in-memory SWR + Singleflight cache over system DNS
+		cfg.Resolver = NewRemoteResolver("")
 	}
 
 	var host string
@@ -2700,7 +2888,7 @@ func main() {
 			fmt.Printf(" [+] Mux:         %s\n", muxStr)
 		}
 
-		if cfg.Resolver != nil {
+		if cfg.Resolver != nil && cfg.Resolver.serverIP != "" {
 			fmt.Printf(" [+] DNS:         %sRemote: %s (UDP+TCP)%s\n", AnsiGreen, cfg.Resolver.serverIP, AnsiReset)
 		} else {
 			fmt.Printf(" [+] DNS:         %sSystem default%s\n", AnsiYellow, AnsiReset)
@@ -2735,8 +2923,13 @@ func main() {
 		ClientSessionCache: tls.NewLRUClientSessionCache(128), // TLS session resumption
 	}
 
-	// Pre-build TLS configs for each browser profile
+	// Pre-build TLS configs for each browser profile with pre-bound SNI
 	if cfg.Upstream != "" && cfg.UpstreamIsWSS {
+		sniDefault := sanitizeHeader(cfg.UpstreamHost)
+		if cfg.FakeHost != "" {
+			sniDefault = sanitizeHeader(strings.Split(cfg.FakeHost, ":")[0])
+		}
+		cfg.TLSBase.ServerName = sniDefault
 		initProfileTLSConfigs(cfg.TLSBase)
 	}
 
@@ -3132,20 +3325,20 @@ type MuxSessionInterface interface {
 
 // MuxStream represents an individual multiplexed stream on the client side.
 type MuxStream struct {
-	id          uint32
-	session     MuxSessionInterface
-	readChan    chan muxDataFrame
-	curFrame    muxDataFrame
-	readBuf     []byte
-	readPos     int
-	closeOnce   sync.Once
-	closed      chan struct{}
+	id        uint32
+	session   MuxSessionInterface
+	readChan  chan muxDataFrame
+	curFrame  muxDataFrame
+	readBuf   []byte
+	readPos   int
+	closeOnce sync.Once
+	closed    chan struct{}
 	// readClosed is set only once the FIN (nil) frame has actually been
 	// placed into readChan — never while it is still queued in ingress
 	// behind undelivered data (that caused premature EOF / tail truncation).
 	readClosed atomic.Bool
 	// eofSeen (guarded by readMu) makes EOF sticky after Read consumed FIN.
-	eofSeen bool
+	eofSeen     bool
 	bufMu       sync.Mutex
 	queuedBytes int64
 	hasSpace    chan struct{}
@@ -3563,6 +3756,11 @@ type muxOutboundWriter struct {
 	scratch []muxOutboundFrame
 	// scratchBufs is the loop goroutine's reused net.Buffers slice (zero heap alloc).
 	scratchBufs net.Buffers
+	// coalesceBuf merges multi-frame batches into a single TLS record when conn is *tls.Conn.
+	coalesceBuf []byte
+	isTLS       bool
+	// queuedFrames tracks total queued frames atomically for lock-free congestion scoring.
+	queuedFrames atomic.Int64
 	// batchMax caps the writev drain (1 = single-frame fast link, up to
 	// muxWritevMaxFrames on weak-net); set once from the handshake
 	// classification before loop() starts, read-only afterwards.
@@ -3606,6 +3804,7 @@ func newMuxOutboundWriter(conn net.Conn, prng *maskPRNG, crypto *Crypto, masked 
 // newMuxOutboundWriterBatched is newMuxOutboundWriter with an explicit
 // writev batch cap chosen by the caller's handshake classification.
 func newMuxOutboundWriterBatched(conn net.Conn, prng *maskPRNG, crypto *Crypto, masked bool, writeTimeout time.Duration, batchMax int) *muxOutboundWriter {
+	_, isTLS := conn.(*tls.Conn)
 	w := &muxOutboundWriter{
 		conn:         conn,
 		prng:         prng,
@@ -3620,6 +3819,7 @@ func newMuxOutboundWriterBatched(conn net.Conn, prng *maskPRNG, crypto *Crypto, 
 		batchMax:     batchMax,
 		scratch:      make([]muxOutboundFrame, 0, muxWritevMaxFrames),
 		scratchBufs:  make(net.Buffers, 0, muxWritevMaxFrames),
+		isTLS:        isTLS,
 	}
 	w.cond = sync.NewCond(&w.mu)
 	go w.loop()
@@ -3698,6 +3898,7 @@ func (w *muxOutboundWriter) dropAllLocked() {
 	w.rotation = w.rotation[:0]
 	w.pos = 0
 	w.total = 0
+	w.queuedFrames.Store(0)
 }
 
 // removeLocked deletes one stream's queue. Caller must hold w.mu; it
@@ -3796,6 +3997,23 @@ func (w *muxOutboundWriter) writeBatch(batch []muxOutboundFrame) error {
 	if len(w.scratchBufs) == 0 {
 		return nil
 	}
+	if w.isTLS && len(w.scratchBufs) > 1 {
+		totalBytes := 0
+		for _, s := range w.scratchBufs {
+			totalBytes += len(s)
+		}
+		if cap(w.coalesceBuf) < totalBytes {
+			w.coalesceBuf = make([]byte, totalBytes)
+		}
+		out := w.coalesceBuf[:totalBytes]
+		off := 0
+		for _, s := range w.scratchBufs {
+			off += copy(out[off:], s)
+		}
+		w.scratchBufs = w.scratchBufs[:0]
+		_, err := w.conn.Write(out)
+		return err
+	}
 	_, err := w.scratchBufs.WriteTo(w.conn)
 	return err
 }
@@ -3850,6 +4068,7 @@ func (w *muxOutboundWriter) popLocked() (muxOutboundFrame, bool) {
 			w.priority[len(w.priority)-1] = muxOutboundFrame{}
 			w.priority = w.priority[:len(w.priority)-1]
 			w.total--
+			w.queuedFrames.Store(int64(w.total))
 			if w.waiters > 0 {
 				w.cond.Signal()
 			}
@@ -3858,6 +4077,7 @@ func (w *muxOutboundWriter) popLocked() (muxOutboundFrame, bool) {
 	}
 	if f, ok := w.nextDataLocked(); ok {
 		w.total--
+		w.queuedFrames.Store(int64(w.total))
 		if w.waiters > 0 {
 			w.cond.Signal()
 		}
@@ -3957,6 +4177,7 @@ func (w *muxOutboundWriter) enqueue(f muxOutboundFrame) bool {
 		q.frames = append(q.frames, f)
 	}
 	w.total++
+	w.queuedFrames.Store(int64(w.total))
 	if w.loopWaiting {
 		if w.waiters > 0 {
 			w.cond.Broadcast()
@@ -3978,6 +4199,7 @@ func (w *muxOutboundWriter) dropStream(id uint32) {
 	w.mu.Lock()
 	doomed := w.removeLocked(id)
 	w.total -= len(doomed)
+	w.queuedFrames.Store(int64(w.total))
 	if w.waiters > 0 {
 		w.cond.Broadcast()
 	}
@@ -4021,6 +4243,17 @@ func (s *MuxClientSession) ActiveStreams() int64 {
 		return 0
 	}
 	return cnt
+}
+
+func (s *MuxClientSession) QueuedFrames() int64 {
+	if s.writer == nil {
+		return 0
+	}
+	q := s.writer.queuedFrames.Load()
+	if q < 0 {
+		return 0
+	}
+	return q
 }
 
 func (s *MuxClientSession) decrementActiveStreams() {
@@ -4375,16 +4608,50 @@ type MuxClientPool struct {
 	maxSess  int
 	roundIdx uint32
 	dialing  int
+	initWait chan struct{} // singleflight barrier when pool is empty
 	closed   bool
 	lastFail time.Time
 }
 
 func NewMuxClientPool(cfg *Config, maxSessions int) *MuxClientPool {
-	return &MuxClientPool{
+	p := &MuxClientPool{
 		cfg:      cfg,
 		maxSess:  maxSessions,
 		sessions: make([]*MuxClientSession, 0, maxSessions),
 	}
+	if cfg != nil && cfg.Upstream != "" {
+		go p.prewarm()
+	}
+	return p
+}
+
+// prewarm establishes initial MUX session(s) at startup so the first browser
+// request hits a warm 0-RTT tunnel without waiting for TCP+TLS+WS handshake.
+func (p *MuxClientPool) prewarm() {
+	p.mu.Lock()
+	if p.closed || len(p.sessions) > 0 || p.dialing > 0 {
+		p.mu.Unlock()
+		return
+	}
+	p.dialing++
+	waitCh := make(chan struct{})
+	p.initWait = waitCh
+	p.mu.Unlock()
+
+	sess, err := p.dialNewSession()
+
+	p.mu.Lock()
+	p.dialing--
+	p.initWait = nil
+	if err == nil && !p.closed && len(p.sessions) < p.maxSess {
+		p.sessions = append(p.sessions, sess)
+	} else if sess != nil {
+		sess.Close()
+	} else if err != nil {
+		p.lastFail = time.Now()
+	}
+	close(waitCh)
+	p.mu.Unlock()
 }
 
 func (p *MuxClientPool) pickBestSessionLocked() *MuxClientSession {
@@ -4395,16 +4662,18 @@ func (p *MuxClientPool) pickBestSessionLocked() *MuxClientSession {
 		return p.sessions[0]
 	}
 
-	var minStreams int64 = -1
+	var minScore int64 = -1
 	var candidates []*MuxClientSession
 
 	for _, s := range p.sessions {
-		cnt := s.ActiveStreams()
-		if minStreams == -1 || cnt < minStreams {
-			minStreams = cnt
+		// Weight outbound writer queue depth 4x so interactive web streams
+		// automatically bypass sessions saturated by bulk transfers.
+		score := s.ActiveStreams() + s.QueuedFrames()*4
+		if minScore == -1 || score < minScore {
+			minScore = score
 			candidates = candidates[:0]
 			candidates = append(candidates, s)
-		} else if cnt == minStreams {
+		} else if score == minScore {
 			candidates = append(candidates, s)
 		}
 	}
@@ -4418,68 +4687,98 @@ func (p *MuxClientPool) pickBestSessionLocked() *MuxClientSession {
 }
 
 func (p *MuxClientPool) GetSession() (*MuxClientSession, error) {
-	p.mu.Lock()
+	for {
+		p.mu.Lock()
 
-	// Filter out dead sessions
-	valid := p.sessions[:0]
-	for _, s := range p.sessions {
-		if s.IsAlive() {
-			valid = append(valid, s)
+		// Filter out dead sessions
+		valid := p.sessions[:0]
+		for _, s := range p.sessions {
+			if s.IsAlive() {
+				valid = append(valid, s)
+			}
 		}
-	}
-	p.sessions = valid
+		p.sessions = valid
 
-	// If at least one session is active, select the least loaded (least active streams, with round-robin tie-breaking)
-	if len(p.sessions) > 0 {
-		sess := p.pickBestSessionLocked()
+		// If at least one session is active, select the least loaded
+		if len(p.sessions) > 0 {
+			sess := p.pickBestSessionLocked()
+			sess.activeStreams.Add(1)
+
+			// Scale up in background if pool capacity is not yet reached
+			if !p.closed && len(p.sessions)+p.dialing < p.maxSess && time.Since(p.lastFail) >= time.Second {
+				p.dialing++
+				go p.dialBackgroundSession()
+			}
+
+			p.mu.Unlock()
+			return sess, nil
+		}
+
+		if p.closed {
+			p.mu.Unlock()
+			return nil, errors.New("mux client pool closed")
+		}
+
+		// Singleflight barrier: if an initial dial is already in progress, wait
+		// for it instead of triggering a thundering herd of 20+ handshakes.
+		if p.initWait != nil {
+			waitCh := p.initWait
+			p.mu.Unlock()
+			<-waitCh
+			p.mu.Lock()
+			if len(p.sessions) > 0 {
+				sess := p.pickBestSessionLocked()
+				sess.activeStreams.Add(1)
+				if !p.closed && len(p.sessions)+p.dialing < p.maxSess && time.Since(p.lastFail) >= time.Second {
+					p.dialing++
+					go p.dialBackgroundSession()
+				}
+				p.mu.Unlock()
+				return sess, nil
+			}
+			p.mu.Unlock()
+			return nil, errors.New("mux initial dial failed")
+		}
+
+		// Elected primary dialer for cold pool
+		waitCh := make(chan struct{})
+		p.initWait = waitCh
+		p.dialing++
+		p.mu.Unlock()
+
+		sess, err := p.dialNewSession()
+
+		p.mu.Lock()
+		p.dialing--
+		p.initWait = nil
+		if err != nil {
+			p.lastFail = time.Now()
+			close(waitCh)
+			if len(p.sessions) > 0 {
+				s := p.pickBestSessionLocked()
+				s.activeStreams.Add(1)
+				p.mu.Unlock()
+				return s, nil
+			}
+			p.mu.Unlock()
+			return nil, err
+		}
+
+		if p.closed {
+			close(waitCh)
+			p.mu.Unlock()
+			sess.Close()
+			return nil, errors.New("mux client pool closed")
+		}
+
+		if len(p.sessions) < p.maxSess {
+			p.sessions = append(p.sessions, sess)
+		}
 		sess.activeStreams.Add(1)
-
-		// If pool capacity is not yet reached, trigger background dial to scale up (with 1s cooldown on failure)
-		if !p.closed && len(p.sessions)+p.dialing < p.maxSess && time.Since(p.lastFail) >= time.Second {
-			p.dialing++
-			go p.dialBackgroundSession()
-		}
-
+		close(waitCh)
 		p.mu.Unlock()
 		return sess, nil
 	}
-
-	if p.closed {
-		p.mu.Unlock()
-		return nil, errors.New("mux client pool closed")
-	}
-
-	// No sessions alive. Dial synchronously, releasing lock during network I/O
-	p.dialing++
-	p.mu.Unlock()
-
-	sess, err := p.dialNewSession()
-
-	p.mu.Lock()
-	p.dialing--
-	if err != nil {
-		p.lastFail = time.Now()
-		// If another goroutine succeeded while we were dialing, use that
-		if len(p.sessions) > 0 {
-			s := p.pickBestSessionLocked()
-			s.activeStreams.Add(1)
-			p.mu.Unlock()
-			return s, nil
-		}
-		p.mu.Unlock()
-		return nil, err
-	}
-
-	if p.closed {
-		p.mu.Unlock()
-		sess.Close()
-		return nil, errors.New("mux client pool closed")
-	}
-
-	p.sessions = append(p.sessions, sess)
-	sess.activeStreams.Add(1)
-	p.mu.Unlock()
-	return sess, nil
 }
 
 func (p *MuxClientPool) dialBackgroundSession() {
@@ -5354,14 +5653,13 @@ func (s *MuxServerSession) handleNewStream(st *MuxServerStream, targetStr string
 		s.streamsMu.Unlock()
 	}()
 
-	targetAddr := resolveTargetAddr(s.cfg.Resolver, targetStr)
-	if serverTargetBlocked(s.cfg, targetAddr) {
-		logWarn("[SERVER-MUX] Blocked local target (server-block-local): %s", targetAddr)
+	if serverTargetBlocked(s.cfg, targetStr) {
+		logWarn("[SERVER-MUX] Blocked local target (server-block-local): %s", targetStr)
 		s.SendFrame(st.id, MuxCmdRST, nil)
 		return
 	}
 
-	targetConn, err := net.DialTimeout("tcp", targetAddr, time.Duration(s.cfg.ConnTimeout)*time.Second)
+	targetConn, targetAddr, err := dialTargetFast(s.cfg, targetStr)
 	if err != nil {
 		logDebug("[SERVER-MUX] Dial %s failed: %v", targetAddr, err)
 		s.SendFrame(st.id, MuxCmdRST, nil)
@@ -5563,16 +5861,14 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 		return
 	}
 
-	// Remote DNS resolution for target address
-	targetStr = resolveTargetAddr(cfg.Resolver, targetStr)
 	if serverTargetBlocked(cfg, targetStr) {
 		logWarn("[SERVER] Blocked local target (server-block-local): %s", targetStr)
 		return
 	}
 
-	targetConn, err := net.DialTimeout("tcp", targetStr, time.Duration(cfg.ConnTimeout)*time.Second)
+	targetConn, targetStr, err := dialTargetFast(cfg, targetStr)
 	if err != nil {
-		logError("handleServer net.DialTimeout err: %v", err)
+		logError("handleServer dialTargetFast err: %v", err)
 		return
 	}
 	defer targetConn.Close()
@@ -6131,12 +6427,12 @@ func dialUpstreamPooledWS(cfg *Config) (*PooledConn, *net.TCPConn, error) {
 		sniHostname = sanitizeHeader(strings.Split(cfg.FakeHost, ":")[0])
 	}
 
+	profileIdx := pickBrowserProfileIndex()
 	dialer := &net.Dialer{Timeout: time.Duration(cfg.ConnTimeout) * time.Second}
 	var wsConn net.Conn
 	var err error
 	if cfg.UpstreamIsWSS {
-		conf := pickProfileTLSConfig().Clone()
-		conf.ServerName = sniHostname
+		conf := getProfileTLSConfigForHost(profileIdx, sniHostname)
 		wsConn, err = tls.DialWithDialer(dialer, "tcp", dialAddr, conf)
 	} else {
 		wsConn, err = dialer.Dial("tcp", dialAddr)
@@ -6160,7 +6456,7 @@ func dialUpstreamPooledWS(cfg *Config) (*PooledConn, *net.TCPConn, error) {
 	wsTCPConn := extractTCPConn(wsConn)
 	br := bufio.NewReaderSize(wsConn, MaxHeaderSize)
 
-	if err := performWSHandshake(wsConn, br, cfg, wsHost, sniHostname); err != nil {
+	if err := performWSHandshakeWithProfile(wsConn, br, cfg, wsHost, sniHostname, browserProfiles[profileIdx]); err != nil {
 		wsConn.Close()
 		return nil, nil, err
 	}
@@ -7072,15 +7368,13 @@ func handleQUICStream(stream quic.Stream, cfg *Config) {
 		return
 	}
 
-	// Remote DNS resolution for target address
-	targetAddr := resolveTargetAddr(cfg.Resolver, targetStr)
-	if serverTargetBlocked(cfg, targetAddr) {
-		logWarn("[QUIC-SERVER] Blocked local target (server-block-local): %s", targetAddr)
+	if serverTargetBlocked(cfg, targetStr) {
+		logWarn("[QUIC-SERVER] Blocked local target (server-block-local): %s", targetStr)
 		stream.Write([]byte("ERR: BLOCKED_LOCAL\n"))
 		return
 	}
 
-	targetConn, err := net.DialTimeout("tcp", targetAddr, time.Duration(cfg.ConnTimeout)*time.Second)
+	targetConn, targetAddr, err := dialTargetFast(cfg, targetStr)
 	if err != nil {
 		logDebug("[QUIC-SERVER] Dial %s failed: %v", targetAddr, err)
 		stream.Write([]byte("ERR: DIAL_FAILED\n"))
@@ -7371,12 +7665,16 @@ func NewQUICClientPool(cfg *Config) (*QUICClientPool, error) {
 		maxConns = 16
 	}
 
-	return &QUICClientPool{
+	qp := &QUICClientPool{
 		cfg:      cfg,
 		dialAddr: dialAddr,
 		tlsConf:  tlsConf,
 		maxConns: maxConns,
-	}, nil
+	}
+	if cfg.Upstream != "" {
+		go qp.maybeTopUp()
+	}
+	return qp, nil
 }
 
 func (p *QUICClientPool) removeConnLocked(conn quic.Connection) {
@@ -7578,11 +7876,22 @@ func relayQUICClient(localConn net.Conn, ver byte, initialPayload []byte, target
 	}
 	header += "\n"
 
-	if _, err := stream.Write([]byte(header)); err != nil {
-		return false
+	if len(initialPayload) > 0 {
+		combined := make([]byte, len(header)+len(initialPayload))
+		copy(combined, header)
+		copy(combined[len(header):], initialPayload)
+		if _, err := stream.Write(combined); err != nil {
+			return false
+		}
+		stats.AddBytes(int64(len(initialPayload)), 0)
+	} else {
+		if _, err := stream.Write([]byte(header)); err != nil {
+			return false
+		}
 	}
 
-	br := bufio.NewReader(stream)
+	br := getBufioReader(stream)
+	defer putBufioReader(br)
 	resp, err := br.ReadString('\n')
 	if err != nil || !strings.HasPrefix(resp, "OK") {
 		logError("[CLIENT-QUIC] Upstream rejected target: %v, resp: %s", err, resp)
@@ -7597,13 +7906,6 @@ func relayQUICClient(localConn net.Conn, ver byte, initialPayload []byte, target
 		if _, err := localConn.Write(http200Resp); err != nil {
 			return true
 		}
-	}
-
-	if len(initialPayload) > 0 {
-		if _, err := stream.Write(initialPayload); err != nil {
-			return true
-		}
-		stats.AddBytes(int64(len(initialPayload)), 0)
 	}
 
 	errCh := make(chan error, 2)
@@ -7679,7 +7981,8 @@ func handleClientUDPQUIC(localConn net.Conn, boundAddr *net.UDPAddr, udpListener
 		return
 	}
 
-	br := bufio.NewReader(stream)
+	br := getBufioReader(stream)
+	defer putBufioReader(br)
 	resp, err := br.ReadString('\n')
 	if err != nil || !strings.HasPrefix(resp, "OK") {
 		logError("[CLIENT-QUIC-UDP] Auth rejected by server: %s", resp)
