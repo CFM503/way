@@ -12,6 +12,17 @@
 - User mandate, 2026-09-23. 违反此规则的改动一律不得合入：只允许正向优化，永远禁止反向优化。
 
 
+## v1.8.26 cycle: Half-Close Dead-Hang Protection & QUIC Stream Dual-Direction Teardown (2026-10-18)
+
+### Status & Release Summary
+- **Version**: Bumped to `1.8.26` in `goway.go` (`Version = "1.8.26"`).
+- **Core Vectors Shipped**:
+  - **MUX 半关闭客户端死挂防护**：`relayMuxClient` 下行读到 EOF 向本地触发 `CloseWrite` 后，对 `localConn` 追加 `SetReadDeadline(ConnTimeout)` 保护，彻底杜绝本地假死或半开连接导致的上行协程与流对象永久泄漏。
+  - **QUIC 双向流销毁与资源彻底回收**：在 `handleQUICStream` 与 `relayQUICClient` 的退出 defer 中组合调用 `_ = stream.Close()` 与 `stream.CancelRead(0)`，关闭写端 FIN 的同时取消未尽读端（发送 `STOP_SENDING`），通知底层协议栈全量回收流控窗口与物理资源。
+- **Standing Rule & Compatibility**:
+  - 全套自动化测试套件通过（`ok goway 76.107s`），无回归。
+
+
 ## v1.8.25 cycle: MUX StreamID Collision Guard, Full Bidirectional Half-Close Sync & QUIC EOF Clean FIN (2026-10-18)
 
 ### Status & Release Summary

@@ -1,4 +1,4 @@
-# GOWAY v1.8.25
+# GOWAY v1.8.26
 
 GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具，支持 HTTP 和完整 SOCKS5 (TCP + UDP) 协议，具备浏览器指纹伪装、0-RTT 多路复用 (Mux)、QUIC 弱网抗丢包传输、Cloudflare CDN 边缘接入与 PGO 机器码级性能优化。
 
@@ -7,6 +7,17 @@ GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具�
 > 接手本项目的 AI 必须先读 `goway/AI_HANDOFF.md` 顶部同名规则并原样保留；每个性能改动必须在 `AI_HANDOFF.md` 记录前后数据，**没有数据不算完成**。
 
 ## 版本历史
+
+### v1.8.26 (2026-10-18) - MUX 半关闭死挂防护与 QUIC 双向流销毁资源彻底回收
+
+#### 核心优化与协议加固
+
+| 优化/修复项 | 说明 | 收益与特性 |
+|---|---|---|
+| **MUX 半关闭客户端死挂防护** | `relayMuxClient` 下行读到 EOF 向本地触发 `CloseWrite` 后，对 `localConn` 追加 `SetReadDeadline` 超时保护 | **彻底根除下行完毕后本地客户端假死或恶意挂起导致的协程与内存永久泄漏** |
+| **QUIC 双向流资源彻底回收** | `handleQUICStream` 与 `relayQUICClient` 的退出 defer 中组合调用 `_ = stream.Close()` 与 `stream.CancelRead(0)` | **关闭写端 FIN 的同时取消未尽读端，通知底层协议栈立即全量回收该流所有控制窗口与物理资源** |
+
+---
 
 ### v1.8.25 (2026-10-18) - MUX StreamID 碰撞保护、双向半关闭完整同步与 QUIC 优雅 FIN 修复
 

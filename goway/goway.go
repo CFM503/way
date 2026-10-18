@@ -58,7 +58,7 @@ import (
 // ============================================================================
 // GOWAY 版本号定义 (发布新版本时在此修改)
 // ============================================================================
-const Version = "1.8.25"
+const Version = "1.8.26"
 
 const (
 	// MaxWSFrameSize matches the largest frame the sender side can build
@@ -4985,6 +4985,9 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 					if tc, ok := localConn.(*net.TCPConn); ok {
 						_ = tc.CloseWrite()
 					}
+					if cfg.ConnTimeout > 0 {
+						_ = localConn.SetReadDeadline(time.Now().Add(time.Duration(cfg.ConnTimeout) * time.Second))
+					}
 					errCh <- nil
 				} else {
 					errCh <- errRead
@@ -7363,7 +7366,10 @@ func putBufioReader(br *bufio.Reader) {
 }
 
 func handleQUICStream(stream quic.Stream, cfg *Config) {
-	defer stream.Close()
+	defer func() {
+		_ = stream.Close()
+		stream.CancelRead(0)
+	}()
 
 	br := getBufioReader(stream)
 	brReleased := false
@@ -7905,7 +7911,10 @@ func relayQUICClient(localConn net.Conn, ver byte, initialPayload []byte, target
 		logError("[CLIENT-QUIC] GetStream failed: %v", err)
 		return false
 	}
-	defer stream.Close()
+	defer func() {
+		_ = stream.Close()
+		stream.CancelRead(0)
+	}()
 
 	header := targetAddr
 	if cfg.Key != "" {
