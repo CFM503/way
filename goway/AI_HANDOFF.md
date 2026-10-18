@@ -12,6 +12,19 @@
 - User mandate, 2026-09-23. 违反此规则的改动一律不得合入：只允许正向优化，永远禁止反向优化。
 
 
+## v1.8.22 cycle: MUX Server-side Stream Buffer Alignment & Invariant Enforcement (2026-10-18)
+
+### Status & Release Summary
+- **Version**: Bumped to `1.8.22` in `goway.go` (`Version = "1.8.22"`).
+- **Core Vector Shipped**:
+  - `muxServerStreamBufferLimit` 提升至 `36 * 1024 * 1024` (36MiB，原 18MiB)。
+  - 彻底对齐客户端与服务端流缓冲区规模（均为 36MiB）。
+  - 服务端缓冲区容量现已完全满足 $\ge \text{Window (32MiB)} + \text{Refresh (2MiB)} = \mathbf{34MiB}$ 的流控不变量要求。
+  - 根除了高 BDP / 大流量下服务端缓冲区被发送信用额度打满而导致的虚假背压超时与流异常重置（Spurious RST）隐患。
+- **Standing Rule & Compatibility**:
+  - 全面兼容既有协议线格式，代码编译无误，运行稳定。
+
+
 ## v1.8.21 cycle: MUX Large-Window Flow Control Tuning & Stream Capacity Expansion (2026-10-18)
 
 ### Status & Release Summary

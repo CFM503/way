@@ -56,7 +56,7 @@ import (
 )
 
 const (
-	Version = "1.8.21"
+	Version = "1.8.22"
 	// MaxWSFrameSize matches the largest frame the sender side can build
 	// (BufPool caps at 12MB + MUX header + AEAD overhead) — the old 64MB
 	// ceiling was pure memory-flood attack surface: a claimed-but-unsent
@@ -3151,7 +3151,7 @@ const (
 
 	// Server-side Mux stream buffer limit.
 	// Same window+refresh invariant as the client side.
-	muxServerStreamBufferLimit = 18 * 1024 * 1024
+	muxServerStreamBufferLimit = 36 * 1024 * 1024
 	// Frame-count queue depths. PushDataFrame budgets bytes (buffer limits
 	// above, 9MiB), so the frame depths must not bind first: at maximum
 	// frame size (65535B) a 9MiB budget needs 144 frames; 768 slots keep

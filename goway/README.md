@@ -1,4 +1,4 @@
-# GOWAY v1.8.21
+# GOWAY v1.8.22
 
 GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具，支持 HTTP 和完整 SOCKS5 (TCP + UDP) 协议，具备浏览器指纹伪装、0-RTT 多路复用 (Mux)、QUIC 弱网抗丢包传输、Cloudflare CDN 边缘接入与 PGO 机器码级性能优化。
 
@@ -7,6 +7,16 @@ GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具�
 > 接手本项目的 AI 必须先读 `goway/AI_HANDOFF.md` 顶部同名规则并原样保留；每个性能改动必须在 `AI_HANDOFF.md` 记录前后数据，**没有数据不算完成**。
 
 ## 版本历史
+
+### v1.8.22 (2026-10-18) - MUX 服务端流缓冲对齐与流控加固
+
+#### 核心优化与架构加固
+
+| 优化项 | 说明 | 收益与特性 |
+|---|---|---|
+| **服务端 Mux 流缓冲对称扩容 (`muxServerStreamBufferLimit`)** | 将 `muxServerStreamBufferLimit` 从 18MiB 提升至 36MiB，对齐客户端缓冲规模 | **彻底修复缓冲区小于滑动窗口（34MiB）的隐患，杜绝高速大流量下服务端背压超时与流异常重置（Spurious RST）** |
+
+---
 
 ### v1.8.21 (2026-10-18) - MUX 大窗口流控与吞吐队列扩容调优
 
