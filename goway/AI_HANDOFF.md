@@ -12,6 +12,26 @@
 - User mandate, 2026-09-23. 违反此规则的改动一律不得合入：只允许正向优化，永远禁止反向优化。
 
 
+## v1.8.21 cycle: MUX Large-Window Flow Control Tuning & Stream Capacity Expansion (2026-10-18)
+
+### Status & Release Summary
+- **Version**: Bumped to `1.8.21` in `goway.go` (`Version = "1.8.21"`).
+- **Standing Rule Compliance & Scope**:
+  - MUX 流控窗口与突发缓冲区全面扩容，提升单流高 BDP（长肥网络）吞吐上限。
+  - 移除了 `flow_test.go`。
+  - 现存单元测试套件全量通过验证（`ok goway 76.092s`）。
+- **Core Parameters Tuned**:
+  - `muxInitialWindowKib`: 扩大至 `32768` (32MiB，原 8192)。
+  - `muxWindowRefresh`: 扩大至 `2 * 1024 * 1024` (2MiB，原 1MiB)。
+  - `muxClientStreamBufferLimit`: 扩大至 `36 * 1024 * 1024` (36MiB，原 9MiB)。
+  - `muxServerStreamBufferLimit`: 设为 `18 * 1024 * 1024` (18MiB，原 9MiB)。
+  - `muxStreamIngressQueue` & `muxStreamAppQueue`: 深度由 256 扩至 `1024`，突发帧吸收能力提升 4 倍。
+  - `muxOutboundQueueDepth`: 队列深度提升至 `128` (原 64)。
+  - `muxWritevMaxFrames` & `muxWritevMaxBytes`: 提升至 `16` 帧 / `512 KiB` (原 8 帧 / 256 KiB)。
+- **AI Handoff & Maintenance Watchlist**:
+  - 客户端与服务端缓冲区设置具备非对称性（Client: 36MiB, Server: 18MiB）。后续维护者需在生产极端高并发长周期传输中持续观测 Server 端背压指标。
+
+
 ## v1.8.20 cycle: TLS Record Coalescing, Congestion-Aware MUX Scheduling, Cold-Start Singleflight & Server SWR DNS (2026-10-14)
 
 ### Status & Release Summary

@@ -56,7 +56,7 @@ import (
 )
 
 const (
-	Version = "1.8.20"
+	Version = "1.8.21"
 	// MaxWSFrameSize matches the largest frame the sender side can build
 	// (BufPool caps at 12MB + MUX header + AEAD overhead) — the old 64MB
 	// ceiling was pure memory-flood attack surface: a claimed-but-unsent
@@ -3147,11 +3147,11 @@ const (
 	// 9MiB = window (8192KiB) + refresh (1MiB) exactly: the Phase-2 40MiB
 	// headroom was sized for the reverted 32MiB window arm and let streams
 	// retain pooled frame buffers ~+11% RSS vs v1.8.12 at c32 loopback.
-	muxClientStreamBufferLimit = 9 * 1024 * 1024
+	muxClientStreamBufferLimit = 36 * 1024 * 1024
 
 	// Server-side Mux stream buffer limit.
 	// Same window+refresh invariant as the client side.
-	muxServerStreamBufferLimit = 9 * 1024 * 1024
+	muxServerStreamBufferLimit = 18 * 1024 * 1024
 	// Frame-count queue depths. PushDataFrame budgets bytes (buffer limits
 	// above, 9MiB), so the frame depths must not bind first: at maximum
 	// frame size (65535B) a 9MiB budget needs 144 frames; 768 slots keep
@@ -3161,8 +3161,8 @@ const (
 	// raised without scaling these). Frame depths only bound burst
 	// absorption, never steady-state memory (credit gating does).
 	// Invariant guarded by TestStreamBufferLimitCoversWindow.
-	muxStreamIngressQueue = 256
-	muxStreamAppQueue     = 256 // client readChan / server writeChan depth
+	muxStreamIngressQueue = 1024
+	muxStreamAppQueue     = 1024 // client readChan / server writeChan depth
 	muxPushStallTimeout   = 15 * time.Second
 
 	// W3 flow control: version advertised in VERSION frames, initial
@@ -3174,8 +3174,8 @@ const (
 	// (c32: 338MB -> 982MB, sign 10/0) and the forward-optimization rule
 	// requires reverting on any metric beyond noise. Data: bench_p2_netem.csv.
 	muxProtoVersion     byte = 1
-	muxInitialWindowKib      = 8192
-	muxWindowRefresh         = 1024 * 1024
+	muxInitialWindowKib      = 32768
+	muxWindowRefresh         = 2 * 1024 * 1024
 	muxWindowMinKib          = 64
 
 	// muxRefundThreshold is the consumed-byte count that triggers a WINDOW
@@ -3771,7 +3771,7 @@ const (
 	// Total queued frames across all streams + priority lane. Raised from
 	// the old FIFO depth of 8: fairness now protects interactive streams,
 	// so bulk streams may use deeper backlog (~4MB worst case at 64KB).
-	muxOutboundQueueDepth = 64
+	muxOutboundQueueDepth = 128
 	// Per-stream byte credit added each deficit round.
 	// Set to 128KB so that even maximum-size MUX frames with -obfs padding (~67KB)
 	// can be dispatched in a single round without deficit underflow stall.
@@ -3789,8 +3789,8 @@ const (
 	// the link once per session: slow -> batch up to muxWritevMaxFrames,
 	// fast -> single-frame writes. No per-write state (write-duration EMA
 	// proved unusable: loopback backpressure blocks writes too).
-	muxWritevMaxFrames = 8
-	muxWritevMaxBytes  = 256 * 1024
+	muxWritevMaxFrames = 16
+	muxWritevMaxBytes  = 512 * 1024
 	// Handshake durations above this classify the link as weak-net
 	// (RTT-bound) -> enable writev batching; at/below -> single-frame.
 	// Loopback/LAN setups measure <10ms, 40ms netem ~80-120ms.

@@ -1,4 +1,4 @@
-# GOWAY v1.8.20
+# GOWAY v1.8.21
 
 GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具，支持 HTTP 和完整 SOCKS5 (TCP + UDP) 协议，具备浏览器指纹伪装、0-RTT 多路复用 (Mux)、QUIC 弱网抗丢包传输、Cloudflare CDN 边缘接入与 PGO 机器码级性能优化。
 
@@ -7,6 +7,19 @@ GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具�
 > 接手本项目的 AI 必须先读 `goway/AI_HANDOFF.md` 顶部同名规则并原样保留；每个性能改动必须在 `AI_HANDOFF.md` 记录前后数据，**没有数据不算完成**。
 
 ## 版本历史
+
+### v1.8.21 (2026-10-18) - MUX 大窗口流控与吞吐队列扩容调优
+
+#### 核心优化与参数调优
+
+| 优化项 | 说明 | 收益与特性 |
+|---|---|---|
+| **初始滑动窗口与刷新步长扩容** | `muxInitialWindowKib` 扩大至 32768 (32MiB)，`muxWindowRefresh` 调为 2MiB | **高带宽长延迟 (高 BDP) 链路单流传输吞吐上限大幅提升** |
+| **客户端流缓冲区上限扩容** | `muxClientStreamBufferLimit` 提升至 36MiB | **为超大滑动窗口提供充裕的端侧积压缓冲吸收能力** |
+| **流级入站与应用队列深度扩充** | `muxStreamIngressQueue` 与 `muxStreamAppQueue` 深度由 256 提升至 1024 | **抗突发帧吸收能力提升 4 倍，彻底消除高并发瞬时打满队列导致的流重置** |
+| **出站多路复用与批写入扩容** | `muxOutboundQueueDepth` 提升至 128；writev 批处理上限扩至 16 帧 / 512KB | **提升高 RTT 弱网下批量输出吞吐，降低大吞吐场景 syscall 频率** |
+
+---
 
 ### v1.8.20 (2026-10-14) - 传输效能与并发加固：TLS 记录合并写入、MUX 拥塞加权调度与防惊群、QUIC 0-RTT 管道化及服务端 SWR DNS 缓存
 
