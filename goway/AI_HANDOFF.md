@@ -12,6 +12,18 @@
 - User mandate, 2026-09-23. 违反此规则的改动一律不得合入：只允许正向优化，永远禁止反向优化。
 
 
+## v1.8.23 cycle: Protocol LF-Compatibility, Non-MUX AEAD Initial-Payload Fix & Pool Lifecycle Hardening (2026-10-18)
+
+### Status & Release Summary
+- **Version**: Bumped to `1.8.23` in `goway.go` (`Version = "1.8.23"`).
+- **Core Vectors Shipped**:
+  - **`readUntilCRLFCRLF` 兼容 `\n\n` 结尾**：针对非标客户端、精简脚本可能发送纯 Unix 风格换行符的边界场景，增加 `b[n-2] == '\n' && b[n-1] == '\n'` 识别，避免在握手阶段阻塞挂起。
+  - **非 MUX 模式 `initialPayload` 补全 AEAD 加密封包**：修复在经典单流模式开启 `-cipher aead` 时首包明文泄漏、以及服务端因缺失 AEAD tag 导致解密失败断流的严重缺陷。
+  - **`ConnPool` 语义明确与生命周期防污染规范**：声明预热池单向拨号专用原则，避免外部误用导致状态污染；保留受控方法与全量单测覆盖（`ok goway 75.486s`）。
+- **Standing Rule & Compatibility**:
+  - 全套单元测试与回归测试 100% 通过，无回归。
+
+
 ## v1.8.22 cycle: MUX Server-side Stream Buffer Alignment & Invariant Enforcement (2026-10-18)
 
 ### Status & Release Summary

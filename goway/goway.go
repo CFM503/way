@@ -56,7 +56,7 @@ import (
 )
 
 const (
-	Version = "1.8.22"
+	Version = "1.8.23"
 	// MaxWSFrameSize matches the largest frame the sender side can build
 	// (BufPool caps at 12MB + MUX header + AEAD overhead) — the old 64MB
 	// ceiling was pure memory-flood attack surface: a claimed-but-unsent
@@ -1922,7 +1922,8 @@ func readUntilCRLFCRLF(br *bufio.Reader) ([]byte, error) {
 		buf.Write(line)
 		b := buf.Bytes()
 		n := len(b)
-		if n >= 4 && b[n-4] == '\r' && b[n-3] == '\n' && b[n-2] == '\r' && b[n-1] == '\n' {
+		if (n >= 4 && b[n-4] == '\r' && b[n-3] == '\n' && b[n-2] == '\r' && b[n-1] == '\n') ||
+			(n >= 2 && b[n-2] == '\n' && b[n-1] == '\n') {
 			return b, nil
 		}
 		if n >= MaxHeaderSize {
@@ -2347,6 +2348,9 @@ func (p *ConnPool) Get() *PooledConn {
 	return conn
 }
 
+// Put adds a connection into the pool (used during pre-warming and testing).
+// Note: In active relay paths, once a connection sends its target header
+// it is dedicated to that relay and closed on exit (must never be re-Put).
 func (p *ConnPool) Put(conn *PooledConn) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -6990,7 +6994,11 @@ func handleClient(localConn net.Conn, cfg *Config) {
 	}
 
 	if initialPayload != nil {
-		if err := writeWSFrame(wsConn, initialPayload, 0x2, true); err != nil {
+		outInitial := initialPayload
+		if rc := relayCrypto(cfg); rc != nil {
+			outInitial = rc.sealFrame( append([]byte(nil), initialPayload...) )
+		}
+		if err := writeWSFrame(wsConn, outInitial, 0x2, true); err != nil {
 			return
 		}
 	}
