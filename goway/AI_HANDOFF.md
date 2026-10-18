@@ -12,6 +12,18 @@
 - User mandate, 2026-09-23. 违反此规则的改动一律不得合入：只允许正向优化，永远禁止反向优化。
 
 
+## v1.8.28 cycle: MUX Ping/Pong Data Race Elimination, Sticky EOF & SYN Fail Cleanup (2026-10-18)
+
+### Status & Release Summary
+- **Version**: Bumped to `1.8.28` in `goway.go` (`Version = "1.8.28"`).
+- **Core Vectors Shipped**:
+  - **MUX 底层 Ping/Pong 并发写竞态彻底消除**：将收到 WebSocket Ping 触发的 Pong 应答封装为 `muxOutboundFrame` 并通过 `muxOutboundWriter` 优先级队列串行化发送，彻底解决读写协程并发调用 `wsConn.Write` 的数据竞争。
+  - **`ReadFrame` 消费 FIN 帧置位粘性 EOF**：当读到 `!ok || frame.data == nil` 时加锁记录 `s.eofSeen = true`，确保混合读与后续调用的 EOF 状态严格粘性与协议一致。
+  - **`relayMuxClient` SYN 发送失败清理加固**：握手 SYN 发送失败时改调 `stream.ResetLocal()`，确保会话内部 `decrementActiveStreams()` 必定触发，彻底阻断活跃流计数泄漏。
+- **Standing Rule & Compatibility**:
+  - 全套自动化测试套件通过（`ok goway 75.800s`），无回归。
+
+
 ## v1.8.27 cycle: MUX Residual Frame Drain, BufPool Race Elimination, PRNG Lock Removal & IPv6 Fix (2026-10-18)
 
 ### Status & Release Summary

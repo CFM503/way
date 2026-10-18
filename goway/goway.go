@@ -58,7 +58,7 @@ import (
 // ============================================================================
 // GOWAY 版本号定义 (发布新版本时在此修改)
 // ============================================================================
-const Version = "1.8.27"
+const Version = "1.8.28"
 
 const (
 	// MaxWSFrameSize matches the largest frame the sender side can build
@@ -2556,7 +2556,10 @@ func readWSFrameIntoFused(r io.Reader, w io.Writer, buf []byte, crypto *Crypto) 
 			return nil, io.EOF
 		case 0x9: // Ping
 			if w != nil {
-				if err := writeWSFrame(w, payload, 0xA, !masked); err != nil {
+				if mw, ok := w.(*muxOutboundWriter); ok {
+					cp := append([]byte(nil), payload...)
+					_ = mw.enqueue(muxOutboundFrame{pong: true, pongData: cp})
+				} else if err := writeWSFrame(w, payload, 0xA, !masked); err != nil {
 					return nil, err
 				}
 			}
@@ -3616,6 +3619,9 @@ func (s *MuxStream) ReadFrame() (muxDataFrame, error) {
 		default:
 		}
 		if !ok || frame.data == nil {
+			s.readMu.Lock()
+			s.eofSeen = true
+			s.readMu.Unlock()
 			return muxDataFrame{}, io.EOF
 		}
 		s.consumedBytes(len(frame.data))
@@ -3722,6 +3728,8 @@ type muxOutboundFrame struct {
 	payloadLen int
 	opcode     byte
 	ping       bool
+	pong       bool
+	pongData   []byte
 	// MUX routing identity for fair scheduling. streamID selects the
 	// per-stream queue; cmd selects the priority lane (everything except
 	// MuxCmdDATA is latency-sensitive control traffic).
@@ -3876,6 +3884,9 @@ func (w *muxOutboundWriter) writeFrame(f muxOutboundFrame) error {
 	if f.ping {
 		return writeWSFrame(w.conn, nil, 0x9, w.masked)
 	}
+	if f.pong {
+		return writeWSFrame(w.conn, f.pongData, 0xA, w.masked)
+	}
 	slice, err := w.encodeFrame(f)
 	if err != nil {
 		return err
@@ -3997,7 +4008,7 @@ func (w *muxOutboundWriter) writeBatch(batch []muxOutboundFrame) error {
 	w.scratchBufs = w.scratchBufs[:0]
 	for i := range batch {
 		f := batch[i]
-		if f.ping {
+		if f.ping || f.pong {
 			if len(w.scratchBufs) > 0 {
 				if _, err := w.scratchBufs.WriteTo(w.conn); err != nil {
 					return err
@@ -4079,7 +4090,7 @@ func (w *muxOutboundWriter) popLocked() (muxOutboundFrame, bool) {
 	for i := 0; i < len(w.priority); i++ {
 		f := w.priority[i]
 		blocked := false
-		if !f.ping && f.streamID != 0 && (f.cmd == MuxCmdFIN || f.cmd == MuxCmdRST) {
+		if !f.ping && !f.pong && f.streamID != 0 && (f.cmd == MuxCmdFIN || f.cmd == MuxCmdRST) {
 			if q := w.streams[f.streamID]; q != nil && q.head < len(q.frames) {
 				blocked = true
 			}
@@ -4157,7 +4168,7 @@ func (w *muxOutboundWriter) nextDataLocked() (muxOutboundFrame, bool) {
 }
 
 func (w *muxOutboundWriter) enqueue(f muxOutboundFrame) bool {
-	isPriority := f.ping || (f.cmd != 0 && f.cmd != MuxCmdDATA)
+	isPriority := f.ping || f.pong || (f.cmd != 0 && f.cmd != MuxCmdDATA)
 	w.mu.Lock()
 	if !isPriority {
 		for w.total >= muxOutboundQueueDepth && !w.closed {
@@ -4212,6 +4223,14 @@ func (w *muxOutboundWriter) enqueue(f muxOutboundFrame) bool {
 
 func (w *muxOutboundWriter) enqueuePing() bool {
 	return w.enqueue(muxOutboundFrame{ping: true})
+}
+
+// muxPongAdapter intercepts raw Pong frames produced by readWSFrameIntoFused
+// when a Ping control frame arrives, and routes them safely through muxOutboundWriter
+// instead of calling wsConn.Write concurrently from the read goroutine.
+// Write implements io.Writer on muxOutboundWriter as a safety fallback.
+func (w *muxOutboundWriter) Write(p []byte) (int, error) {
+	return len(p), nil
 }
 
 // dropStream discards a dead stream's queued frames so they neither block
@@ -4548,7 +4567,7 @@ func (s *MuxClientSession) readLoop() {
 		if deadlineThrottle(&lastDeadline) {
 			setTCPReadDeadline(s.wsTCPConn, s.cfg.ConnTimeout)
 		}
-		data, err := readWSFrameIntoFused(s.br, s.wsConn, buf[14:], s.cfg.Crypto.xorOnly())
+		data, err := readWSFrameIntoFused(s.br, s.writer, buf[14:], s.cfg.Crypto.xorOnly())
 		if err != nil {
 			return
 		}
@@ -4919,7 +4938,7 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 
 	if err := session.SendFrame(streamID, MuxCmdSYN, synPayload); err != nil {
 		logDebug("[CLIENT-MUX] Send SYN failed: %v", err)
-		session.RemoveStream(streamID)
+		stream.ResetLocal()
 		return false
 	}
 
@@ -5551,7 +5570,7 @@ func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 		if deadlineThrottle(&lastDeadline) {
 			setTCPReadDeadline(wsTCPConn, cfg.ConnTimeout)
 		}
-		data, err := readWSFrameIntoFused(br, wsConn, buf[14:], cfg.Crypto.xorOnly())
+		data, err := readWSFrameIntoFused(br, session.writer, buf[14:], cfg.Crypto.xorOnly())
 		if err != nil {
 			return
 		}

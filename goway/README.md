@@ -1,4 +1,4 @@
-# GOWAY v1.8.27
+# GOWAY v1.8.28
 
 GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具，支持 HTTP 和完整 SOCKS5 (TCP + UDP) 协议，具备浏览器指纹伪装、0-RTT 多路复用 (Mux)、QUIC 弱网抗丢包传输、Cloudflare CDN 边缘接入与 PGO 机器码级性能优化。
 
@@ -7,6 +7,18 @@ GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具�
 > 接手本项目的 AI 必须先读 `goway/AI_HANDOFF.md` 顶部同名规则并原样保留；每个性能改动必须在 `AI_HANDOFF.md` 记录前后数据，**没有数据不算完成**。
 
 ## 版本历史
+
+### v1.8.28 (2026-10-18) - MUX Ping/Pong 并发写竞态消除、粘性 EOF 与 SYN 计数防泄漏
+
+#### 核心优化与协议加固
+
+| 优化/修复项 | 说明 | 收益与特性 |
+|---|---|---|
+| **MUX 底层 Ping/Pong 并发写竞态彻底消除** | `readWSFrameIntoFused` 检测到 Ping 时将 Pong 封包送入 `muxOutboundWriter` 优先级队列 | **杜绝读取协程与输出协程同时并发调用 `wsConn.Write` 导致的数据损坏与底层竞态** |
+| **`ReadFrame` 消费 FIN 帧置位粘性 EOF** | 在收到对端 FIN 帧时加锁记录 `s.eofSeen = true` | **保证在混合读与边界调用时 EOF 状态严格粘性与协议一致** |
+| **`relayMuxClient` SYN 发送失败清理加固** | 握手 SYN 发送失败时改调 `stream.ResetLocal()` | **确保会话内部 `decrementActiveStreams()` 必定触发，彻底阻断活跃流计数泄漏** |
+
+---
 
 ### v1.8.27 (2026-10-18) - MUX 残留数据排空、内存池竞态根除、PRNG 全局锁消除与 IPv6 修复
 
