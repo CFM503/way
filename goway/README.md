@@ -1,4 +1,4 @@
-# GOWAY v1.8.24
+# GOWAY v1.8.25
 
 GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具，支持 HTTP 和完整 SOCKS5 (TCP + UDP) 协议，具备浏览器指纹伪装、0-RTT 多路复用 (Mux)、QUIC 弱网抗丢包传输、Cloudflare CDN 边缘接入与 PGO 机器码级性能优化。
 
@@ -7,6 +7,19 @@ GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具�
 > 接手本项目的 AI 必须先读 `goway/AI_HANDOFF.md` 顶部同名规则并原样保留；每个性能改动必须在 `AI_HANDOFF.md` 记录前后数据，**没有数据不算完成**。
 
 ## 版本历史
+
+### v1.8.25 (2026-10-18) - MUX StreamID 碰撞保护、双向半关闭完整同步与 QUIC 优雅 FIN 修复
+
+#### 核心优化与协议加固
+
+| 优化/修复项 | 说明 | 收益与特性 |
+|---|---|---|
+| **MUX StreamID 锁内防碰撞与回绕保护** | `relayMuxClient` 在 `streamsMu` 锁内分配 `streamID`，循环探查避免占用存量长连接 ID | **彻底杜绝极端高并发或 uint32 回绕时覆盖已有活跃流的隐患** |
+| **MUX 客户端双向半关闭完整同步** | `relayMuxClient` 引入双向通道退出同步（`if err1 := <-errCh; err1 == nil { <-errCh }`） | **单向 EOF 时向对端触发半关闭并持续等待对向流传输完成，防死锁且防提前截断** |
+| **QUIC 客户端上传 EOF 优雅关闭** | `relayQUICClient` 上传读到 `io.EOF` 时调用 `stream.Close()` 发送正常 FIN，弃用 `CancelWrite(0)` | **消除 QUIC 客户端上传完毕时因错误发送 RESET_STREAM 导致流被异常重置的缺陷** |
+| **QUIC 服务端双向半关闭完整等待** | `handleQUICStream` 完善双向流状态等待机制，上传 EOF 与下载 EOF 均协同退出 | **确保双向数据均完整落盘交付后再彻底销毁物理资源** |
+
+---
 
 ### v1.8.24 (2026-10-18) - 协议半关闭语义修复、会话断连静默清理与版本置顶
 

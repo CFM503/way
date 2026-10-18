@@ -12,6 +12,19 @@
 - User mandate, 2026-09-23. 违反此规则的改动一律不得合入：只允许正向优化，永远禁止反向优化。
 
 
+## v1.8.25 cycle: MUX StreamID Collision Guard, Full Bidirectional Half-Close Sync & QUIC EOF Clean FIN (2026-10-18)
+
+### Status & Release Summary
+- **Version**: Bumped to `1.8.25` in `goway.go` (`Version = "1.8.25"`).
+- **Core Vectors Shipped**:
+  - **MUX StreamID 锁内防碰撞与回绕保护**：在 `streamsMu` 互斥保护下分配 StreamID，并通过循环检查确保不与活跃长连接的现有 ID 冲突，消除极端流量下 uint32 溢出回绕覆盖流映射的风险。
+  - **MUX 客户端双向半关闭完整状态同步**：优化 `relayMuxClient` 的通道等待机制，单向 EOF 时向对端触发半关闭并发送 `nil` 信号，主协程等待双方均完成或发生致命异常时再彻底销毁连接，防死锁且防提前截断。
+  - **QUIC 客户端上传 EOF 优雅关闭**：`relayQUICClient` 上传 EOF 时改调 `stream.Close()` 发送正常 FIN，弃用原先会向对端发送 `RESET_STREAM` 错误重置帧的 `stream.CancelWrite(0)`。
+  - **QUIC 服务端双向半关闭完整等待**：`handleQUICStream` 协同管理上下行 EOF 状态退出，确保响应完整落盘交付。
+- **Standing Rule & Compatibility**:
+  - 全套自动化测试套件通过（`ok goway 75.496s`），无回归。
+
+
 ## v1.8.24 cycle: Half-Close Semantic Enforcement, Silent Reset Local & Version Header Promoted (2026-10-18)
 
 ### Status & Release Summary

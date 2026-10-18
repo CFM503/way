@@ -58,7 +58,7 @@ import (
 // ============================================================================
 // GOWAY 版本号定义 (发布新版本时在此修改)
 // ============================================================================
-const Version = "1.8.24"
+const Version = "1.8.25"
 
 const (
 	// MaxWSFrameSize matches the largest frame the sender side can build
@@ -4851,16 +4851,15 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 		return false
 	}
 
+	session.streamsMu.Lock()
 	streamID := atomic.AddUint32(&session.nextStreamID, 1)
-	if streamID == 0 {
+	for streamID == 0 || session.streams[streamID] != nil {
 		streamID = atomic.AddUint32(&session.nextStreamID, 1)
 	}
 	stream := newMuxStream(streamID, session)
 	stream.onClose = func() {
 		session.decrementActiveStreams()
 	}
-
-	session.streamsMu.Lock()
 	session.streams[streamID] = stream
 	// W3: start bounded if the server already advertised its window. The
 	// load MUST happen after insertion and under streamsMu: applyPeerVersion
@@ -4962,6 +4961,7 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 			if errRead != nil {
 				if errRead == io.EOF {
 					_ = session.SendFrame(streamID, MuxCmdFIN, nil)
+					errCh <- nil
 				} else {
 					stream.Close()
 					errCh <- errRead
@@ -4981,7 +4981,14 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 		for {
 			frame, errRead := stream.ReadFrame()
 			if errRead != nil {
-				errCh <- errRead
+				if errRead == io.EOF {
+					if tc, ok := localConn.(*net.TCPConn); ok {
+						_ = tc.CloseWrite()
+					}
+					errCh <- nil
+				} else {
+					errCh <- errRead
+				}
 				return
 			}
 			nr := len(frame.data)
@@ -5012,7 +5019,10 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 		}
 	}()
 
-	<-errCh
+	// Wait for both directions on clean half-close (nil), or exit immediately on first error.
+	if err1 := <-errCh; err1 == nil {
+		<-errCh
+	}
 	localConn.Close()
 	stream.Close()
 	return true
@@ -7430,9 +7440,11 @@ func handleQUICStream(stream quic.Stream, cfg *Config) {
 			}
 			if errRead != nil {
 				if tc, ok := targetConn.(*net.TCPConn); ok {
-					tc.CloseWrite()
+					_ = tc.CloseWrite()
 				}
-				if errRead != io.EOF {
+				if errRead == io.EOF {
+					errCh <- nil
+				} else {
 					errCh <- errRead
 				}
 				return
@@ -7457,14 +7469,21 @@ func handleQUICStream(stream quic.Stream, cfg *Config) {
 				stats.AddBytes(0, int64(nr))
 			}
 			if errRead != nil {
-				stream.CancelRead(0)
-				errCh <- errRead
+				if errRead == io.EOF {
+					_ = stream.Close()
+					errCh <- nil
+				} else {
+					stream.CancelRead(0)
+					errCh <- errRead
+				}
 				return
 			}
 		}
 	}()
 
-	<-errCh
+	if err1 := <-errCh; err1 == nil {
+		<-errCh
+	}
 }
 
 func handleQUICServerUDP(stream quic.Stream, br *bufio.Reader, cfg *Config) {
@@ -7947,8 +7966,13 @@ func relayQUICClient(localConn net.Conn, ver byte, initialPayload []byte, target
 				stats.AddBytes(int64(nr), 0)
 			}
 			if errRead != nil {
-				stream.CancelWrite(0)
-				errCh <- errRead
+				if errRead == io.EOF {
+					_ = stream.Close()
+					errCh <- nil
+				} else {
+					stream.CancelWrite(0)
+					errCh <- errRead
+				}
 				return
 			}
 		}
@@ -7970,13 +7994,22 @@ func relayQUICClient(localConn net.Conn, ver byte, initialPayload []byte, target
 				stats.AddBytes(0, int64(nr))
 			}
 			if errRead != nil {
-				errCh <- errRead
+				if errRead == io.EOF {
+					if tc, ok := localConn.(*net.TCPConn); ok {
+						_ = tc.CloseWrite()
+					}
+					errCh <- nil
+				} else {
+					errCh <- errRead
+				}
 				return
 			}
 		}
 	}()
 
-	<-errCh
+	if err1 := <-errCh; err1 == nil {
+		<-errCh
+	}
 	localConn.Close()
 	return true
 }
