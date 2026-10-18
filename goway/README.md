@@ -1,4 +1,4 @@
-# GOWAY v1.8.26
+# GOWAY v1.8.27
 
 GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具，支持 HTTP 和完整 SOCKS5 (TCP + UDP) 协议，具备浏览器指纹伪装、0-RTT 多路复用 (Mux)、QUIC 弱网抗丢包传输、Cloudflare CDN 边缘接入与 PGO 机器码级性能优化。
 
@@ -7,6 +7,20 @@ GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具�
 > 接手本项目的 AI 必须先读 `goway/AI_HANDOFF.md` 顶部同名规则并原样保留；每个性能改动必须在 `AI_HANDOFF.md` 记录前后数据，**没有数据不算完成**。
 
 ## 版本历史
+
+### v1.8.27 (2026-10-18) - MUX 残留数据排空、内存池竞态根除、PRNG 全局锁消除与 IPv6 修复
+
+#### 核心优化与协议加固
+
+| 优化/修复项 | 说明 | 收益与特性 |
+|---|---|---|
+| **`ReadFrame` 残留缓冲区优先排空** | `MuxStream.ReadFrame` 优先将残留在 `readBuf` 中的分片封装交付并扣减配额 | **彻底消除业务流在流式 `Read` 与零拷贝 `ReadFrame` 混用时的数据丢失隐患** |
+| **`BufPool` Double-Put 竞态彻底根除** | `readLoop` 与 `handleServerMux` 在构造帧前先行取出 `nextBPtr` 切换所有权 | **杜绝队列溢出就地 Reset 释放时当前上下文持有失效指针导致的二次归还（Double-Put）** |
+| **混淆填充移除全局 `math/rand` 锁** | `sendFrameInline` 混淆长度与随机填充改用池化 `maskPRNG` | **彻底消除高并发 `-obfs` 下因全局互斥锁引起的 CPU 自旋瓶颈，吞吐大幅跃升** |
+| **服务端半关闭单向超时保护** | `handleNewStream` 在客户端触发 FIN 后对 `targetConn` 设置 `SetReadDeadline` | **防止无响应的僵尸目标服务器造成服务端读协程与流对象永久悬挂** |
+| **非 MUX 模式下 IPv6 目标地址格式修复** | `handleClient` 废弃手写拼接，直接采用标准化 `targetAddr` 封包 | **修复 IPv6 目标缺失方括号 `[]` 导致服务端解析失败无法建连的缺陷** |
+
+---
 
 ### v1.8.26 (2026-10-18) - MUX 半关闭死挂防护与 QUIC 双向流销毁资源彻底回收
 

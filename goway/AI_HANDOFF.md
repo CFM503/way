@@ -12,6 +12,20 @@
 - User mandate, 2026-09-23. 违反此规则的改动一律不得合入：只允许正向优化，永远禁止反向优化。
 
 
+## v1.8.27 cycle: MUX Residual Frame Drain, BufPool Race Elimination, PRNG Lock Removal & IPv6 Fix (2026-10-18)
+
+### Status & Release Summary
+- **Version**: Bumped to `1.8.27` in `goway.go` (`Version = "1.8.27"`).
+- **Core Vectors Shipped**:
+  - **`ReadFrame` 残留缓冲区优先排空**：`MuxStream.ReadFrame` 优先将残留在 `readBuf` 中的分片封装交付并扣减配额，修复流式 `Read` 与 `ReadFrame` 混合使用时的数据静默丢失缺陷。
+  - **`BufPool` Double-Put 竞态彻底根除**：在 `readLoop` 与 `handleServerMux` 中先取出 `nextBPtr` 切换本地所有权，再向流队列投递帧，彻底杜绝下游流 Reset 释放时产生的二次归还与内存损坏。
+  - **混淆填充移除全局 `math/rand` 锁**：`sendFrameInline` 混淆长度与随机填充改用池化的 `maskPRNG`，消除高并发 `-obfs` 下因全局互斥锁引起的 CPU 竞争。
+  - **服务端半关闭单向超时保护**：`handleNewStream` 收到客户端 FIN 后对 `targetConn` 设置 `SetReadDeadline`，防止僵死目标服务器造成服务端读协程悬挂。
+  - **非 MUX 模式下 IPv6 目标地址格式修复**：`handleClient` 改用规范化 `targetAddr` 封包，修复缺少中括号导致的建连失败。
+- **Standing Rule & Compatibility**:
+  - 全套自动化测试套件通过（`ok goway 75.032s`），无回归。
+
+
 ## v1.8.26 cycle: Half-Close Dead-Hang Protection & QUIC Stream Dual-Direction Teardown (2026-10-18)
 
 ### Status & Release Summary

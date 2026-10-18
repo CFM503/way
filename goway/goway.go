@@ -58,7 +58,7 @@ import (
 // ============================================================================
 // GOWAY 版本号定义 (发布新版本时在此修改)
 // ============================================================================
-const Version = "1.8.26"
+const Version = "1.8.27"
 
 const (
 	// MaxWSFrameSize matches the largest frame the sender side can build
@@ -3583,9 +3583,22 @@ func (s *MuxStream) Read(p []byte) (n int, err error) {
 // intermediate buffer. The caller owns the returned frame and must call
 // frame.release() after writing.
 func (s *MuxStream) ReadFrame() (muxDataFrame, error) {
-	if s.readClosed.Load() && len(s.readChan) == 0 {
+	s.readMu.Lock()
+	if s.readPos < len(s.readBuf) {
+		rem := s.readBuf[s.readPos:]
+		f := muxDataFrame{data: rem, bPtr: s.curFrame.bPtr, pool: s.curFrame.pool}
+		s.curFrame = muxDataFrame{}
+		s.readBuf = nil
+		s.readPos = 0
+		s.readMu.Unlock()
+		s.consumedBytes(len(rem))
+		return f, nil
+	}
+	if s.eofSeen || (s.readClosed.Load() && len(s.readChan) == 0) {
+		s.readMu.Unlock()
 		return muxDataFrame{}, io.EOF
 	}
+	s.readMu.Unlock()
 	select {
 	case <-s.closed:
 		if s.readClosed.Load() {
@@ -4591,12 +4604,13 @@ func (s *MuxClientSession) readLoop() {
 		switch cmd {
 		case MuxCmdDATA:
 			if len(payload) > 0 {
+				nextBPtr := s.cfg.BufPool.Get().(*[]byte)
 				frame := muxDataFrame{
 					data: payload,
 					bPtr: bPtr,
 					pool: s.cfg.BufPool,
 				}
-				bPtr = s.cfg.BufPool.Get().(*[]byte)
+				bPtr = nextBPtr
 				buf = *bPtr
 				st.enqueueDataFrame(frame)
 			}
@@ -5485,8 +5499,10 @@ func (s *MuxServerSession) sendFrameInline(streamID uint32, cmd byte, payload []
 			if room > obfsPadMax {
 				room = obfsPadMax
 			}
-			padLen := mrand.Intn(room + 1)
-			mrand.Read(buf[frameStart+frameLen : frameStart+frameLen+padLen])
+			prng := maskPool.Get().(*maskPRNG)
+			padLen := prng.randIntn(room + 1)
+			prng.fillRandom(buf[frameStart+frameLen : frameStart+frameLen+padLen])
+			maskPool.Put(prng)
 			writeLen = frameLen + padLen
 		}
 	}
@@ -5638,12 +5654,13 @@ func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 			st, ok := session.streams[streamID]
 			session.streamsMu.RUnlock()
 			if ok && len(payload) > 0 {
+				nextBPtr := cfg.BufPool.Get().(*[]byte)
 				frame := muxDataFrame{
 					data: payload,
 					bPtr: bPtr,
 					pool: cfg.BufPool,
 				}
-				bPtr = cfg.BufPool.Get().(*[]byte)
+				bPtr = nextBPtr
 				buf = *bPtr
 				st.enqueueDataFrame(frame)
 			}
@@ -5720,7 +5737,10 @@ func (s *MuxServerSession) handleNewStream(st *MuxServerStream, targetStr string
 			case frame, ok := <-st.writeChan:
 				if !ok || frame.data == nil {
 					if tc, ok := targetConn.(*net.TCPConn); ok {
-						tc.CloseWrite()
+						_ = tc.CloseWrite()
+					}
+					if s.cfg.ConnTimeout > 0 {
+						_ = targetConn.SetReadDeadline(time.Now().Add(time.Duration(s.cfg.ConnTimeout) * time.Second))
 					}
 					return
 				}
@@ -6987,7 +7007,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 	optimizeSocket(localConn, cfg)
 	localTCPConn := extractTCPConn(localConn)
 
-	targetPayload := []byte(targetHost + ":" + targetPort + "\n")
+	targetPayload := []byte(targetAddr + "\n")
 	targetPayload = cfg.Crypto.sealFrame(targetPayload)
 	if err := writeWSFrame(wsConn, targetPayload, 0x2, true); err != nil {
 		return
