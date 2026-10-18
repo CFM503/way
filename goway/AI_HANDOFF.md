@@ -12,6 +12,19 @@
 - User mandate, 2026-09-23. 违反此规则的改动一律不得合入：只允许正向优化，永远禁止反向优化。
 
 
+## v1.8.24 cycle: Half-Close Semantic Enforcement, Silent Reset Local & Version Header Promoted (2026-10-18)
+
+### Status & Release Summary
+- **Version**: Bumped to `1.8.24` in `goway.go` (`Version = "1.8.24"`).
+- **Core Vectors Shipped**:
+  - **MUX 客户端半关闭（Half-Close）协议完善**：`relayMuxClient` 上行读到 `io.EOF` 时仅向服务端发送 `MuxCmdFIN`，不关闭流或报错退出，允许客户端完整读取服务端下行应答，根除下行响应被过早截断问题。
+  - **QUIC 服务端上行半关闭支持**：`handleQUICStream` 上行读到 `io.EOF` 时仅执行 `tc.CloseWrite()` 发送 TCP FIN，不向 `errCh` 报错退出，防止会话过早销毁截断响应。
+  - **会话销毁静默清理 (`ResetLocal`)**：`MuxClientSession.Close` 对活跃流统一调用 `st.ResetLocal()`，杜绝底层物理连接断开时向死连接刷发无效 RST 帧引起的阻塞与日志噪音。
+  - **版本号位置独立置顶**：将 `Version` 抽离置于 `goway.go` 紧随 `import` 的最顶端，添加醒目标识，提升工程维护效率。
+- **Standing Rule & Compatibility**:
+  - 全套单元测试与回归测试 100% 通过（`ok goway 77.921s`），无回归。
+
+
 ## v1.8.23 cycle: Protocol LF-Compatibility, Non-MUX AEAD Initial-Payload Fix & Pool Lifecycle Hardening (2026-10-18)
 
 ### Status & Release Summary

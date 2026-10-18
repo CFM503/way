@@ -55,8 +55,12 @@ import (
 	"golang.org/x/net/ipv4"
 )
 
+// ============================================================================
+// GOWAY 版本号定义 (发布新版本时在此修改)
+// ============================================================================
+const Version = "1.8.24"
+
 const (
-	Version = "1.8.23"
 	// MaxWSFrameSize matches the largest frame the sender side can build
 	// (BufPool caps at 12MB + MUX header + AEAD overhead) — the old 64MB
 	// ceiling was pure memory-flood attack surface: a claimed-but-unsent
@@ -4376,7 +4380,7 @@ func (s *MuxClientSession) Close() {
 		s.streams = make(map[uint32]*MuxStream)
 		s.streamsMu.Unlock()
 		for _, st := range activeStreams {
-			st.Reset()
+			st.ResetLocal()
 		}
 		if s.prng != nil {
 			maskPool.Put(s.prng)
@@ -4956,8 +4960,12 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 				cfg.BufPool.Put(bPtr)
 			}
 			if errRead != nil {
-				stream.Close()
-				errCh <- errRead
+				if errRead == io.EOF {
+					_ = session.SendFrame(streamID, MuxCmdFIN, nil)
+				} else {
+					stream.Close()
+					errCh <- errRead
+				}
 				return
 			}
 		}
@@ -7424,7 +7432,9 @@ func handleQUICStream(stream quic.Stream, cfg *Config) {
 				if tc, ok := targetConn.(*net.TCPConn); ok {
 					tc.CloseWrite()
 				}
-				errCh <- errRead
+				if errRead != io.EOF {
+					errCh <- errRead
+				}
 				return
 			}
 		}
