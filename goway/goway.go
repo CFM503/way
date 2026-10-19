@@ -59,7 +59,7 @@ import (
 // ============================================================================
 // GOWAY 版本号定义 (发布新版本时在此修改)
 // ============================================================================
-const Version = "1.8.29"
+const Version = "1.8.30"
 
 const (
 	// MaxWSFrameSize matches the largest frame the sender side can build
@@ -458,7 +458,7 @@ func drawTUI(cfg *Config) {
 	}
 	blockLocalVal := "Disabled"
 	blockLocalCol := AnsiRed + blockLocalVal + AnsiReset
-	if cfg.BlockLocal {
+	if (cfg.Upstream != "" && cfg.BlockLocal) || (cfg.Upstream == "" && cfg.ServerBlockLocal) {
 		blockLocalVal = "Enabled"
 		blockLocalCol = AnsiGreen + blockLocalVal + AnsiReset
 	}
@@ -2597,12 +2597,13 @@ func main() {
 	noDelayFlag := flag.Bool("no-tcp-nodelay", false, "Disable TCP_NODELAY (disable Nagle bypass)")
 	keepAliveFlag := flag.Bool("no-tcp-keepalive", false, "Disable TCP KeepAlive probes")
 	dnsFlag := flag.String("dns", "", "Remote DNS server IP for target host resolution (e.g. 8.8.8.8)")
-	blockLocalFlag := flag.Bool("block-local", true, "Drop local/LAN loopback traffic in Client mode (default true)")
-	noBlockLocalFlag := flag.Bool("no-block-local", false, "Allow local/LAN loopback traffic in Client mode")
+	blockLocalFlag := flag.Bool("block-local", true, "Drop local/LAN loopback traffic in Client and Server mode (default true)")
+	noBlockLocalFlag := flag.Bool("no-block-local", false, "Allow local/LAN loopback traffic in Client and Server mode")
 	verifySSLFlag := flag.Bool("verify-ssl", false, "Enable strict SSL certificate verification for wss:// upstream")
 	verifyQUICFlag := flag.Bool("verify-quic", false, "Verify the QUIC server certificate against the key-derived pinned cert (both ends this version+, same -k)")
 	quicConnsFlag := flag.Int("quic-conns", 1, "Number of parallel QUIC connections (default 1, max 16)")
-	serverBlockLocalFlag := flag.Bool("server-block-local", false, "Server mode: reject target hosts on local/LAN addresses (default false)")
+	serverBlockLocalFlag := flag.Bool("server-block-local", true, "Server mode: reject target hosts on local/LAN addresses (default true)")
+	noServerBlockLocalFlag := flag.Bool("no-server-block-local", false, "Server mode: allow target hosts on local/LAN addresses")
 	cipherFlag := flag.String("cipher", "", "Application-layer cipher mode: \"aead\" = AES-256-GCM per frame (BOTH ends must match; default \"\" = legacy XOR stream)")
 	allowOpenFlag := flag.Bool("allow-open", false, "Allow server mode without authentication key (open proxy risk)")
 	maxConnFlag := flag.Int("max-conn", 1500, "Max Concurrent Connections (default 1500)")
@@ -2782,7 +2783,7 @@ func main() {
 		MuxSessions:      *muxSessionsFlag,
 		Obfs:             *obfsFlag,
 		QUICConns:        *quicConnsFlag,
-		ServerBlockLocal: *serverBlockLocalFlag,
+		ServerBlockLocal: *serverBlockLocalFlag && !*noBlockLocalFlag && !*noServerBlockLocalFlag,
 		Cipher:           strings.ToLower(strings.TrimSpace(*cipherFlag)),
 	}
 
@@ -2927,6 +2928,12 @@ func main() {
 		fmt.Printf(" [+] Memory:      %d MiB (%s profile, Window: %d MiB, Queue: %d)\n", adaptiveMemMiB, adaptiveTierName, muxInitialWindowKib/1024, muxStreamIngressQueue)
 		fmt.Printf(" [+] Buffer:      %s\n", bufInfo)
 		fmt.Printf(" [+] Max Conns:   %d\n", cfg.MaxConns)
+		blockLocalActive := (cfg.Upstream != "" && cfg.BlockLocal) || (cfg.Upstream == "" && cfg.ServerBlockLocal)
+		if blockLocalActive {
+			fmt.Printf(" [+] Block Local: %sEnabled (Client & Server)%s\n", AnsiGreen, AnsiReset)
+		} else {
+			fmt.Printf(" [+] Block Local: %sDisabled%s\n", AnsiRed, AnsiReset)
+		}
 	}
 
 	cfg.TLSBase = &tls.Config{
@@ -6452,6 +6459,10 @@ func handleServerUDP(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 				logDebug("[SERVER-UDP] ResolveUDPAddr %s:%d failed", host, port)
 				continue
 			}
+			if cfg.ServerBlockLocal && raddr.IP != nil && isLocalTarget(raddr.IP.String()) {
+				logWarn("[SERVER-UDP] Blocked local resolved IP: %s", raddr.IP.String())
+				continue
+			}
 
 			if errWrite := wb.queueWrite(payload, raddr); errWrite != nil {
 				logDebug("[SERVER-UDP] WriteToUDP failed: %v", errWrite)
@@ -6529,14 +6540,46 @@ func handleServerUDP(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 }
 
 func isLocalTarget(host string) bool {
-	if strings.EqualFold(host, "localhost") {
+	clean := strings.TrimSuffix(strings.Trim( strings.TrimSpace(host), "[]" ), ".")
+	if strings.EqualFold(clean, "localhost") || (len(clean) > 10 && strings.EqualFold(clean[len(clean)-10:], ".localhost")) {
 		return true
 	}
-	ip := net.ParseIP(strings.Trim(host, "[]"))
+	ip := net.ParseIP(clean)
 	if ip == nil {
 		return false
 	}
 	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified()
+}
+
+// clientUDPDatagramBlocked parses the target host from a SOCKS5 UDP header and
+// enforces cfg.BlockLocal on the client upload path.
+func clientUDPDatagramBlocked(cfg *Config, pkt []byte) bool {
+	if cfg == nil || !cfg.BlockLocal {
+		return false
+	}
+	if len(pkt) < 7 {
+		return true
+	}
+	switch pkt[3] {
+	case 0x01:
+		if len(pkt) < 10 {
+			return true
+		}
+		return isLocalTarget(net.IP(pkt[4:8]).String())
+	case 0x03:
+		dlen := int(pkt[4])
+		if len(pkt) < 5+dlen+2 {
+			return true
+		}
+		return isLocalTarget(string(pkt[5 : 5+dlen]))
+	case 0x04:
+		if len(pkt) < 22 {
+			return true
+		}
+		return isLocalTarget(net.IP(pkt[4:20]).String())
+	default:
+		return true
+	}
 }
 
 // serverTargetBlocked enforces -server-block-local on server-mode dial
@@ -6718,6 +6761,10 @@ func handleClientUDP(localConn net.Conn, cfg *Config) {
 			for i := 0; i < count; i++ {
 				n := batch.msgs[i].N
 				pkt := batch.msgs[i].Buffers[0][:n]
+				if clientUDPDatagramBlocked(cfg, pkt) {
+					logWarn("[CLIENT-UDP] Blocked local UDP datagram")
+					continue
+				}
 				clientUDPAddr.Store(cloneUDPAddr(batch.msgs[i].Addr.(*net.UDPAddr)))
 				copy(buf[14:], pkt)
 				wireLen := n
@@ -7711,6 +7758,10 @@ func handleQUICServerUDP(stream quic.Stream, br *bufio.Reader, cfg *Config) {
 			if raddr == nil {
 				continue
 			}
+			if cfg.ServerBlockLocal && raddr.IP != nil && isLocalTarget(raddr.IP.String()) {
+				logWarn("[QUIC-UDP] Blocked local resolved IP: %s", raddr.IP.String())
+				continue
+			}
 			if errWrite := wb.queueWrite(payload, raddr); errWrite != nil {
 				logDebug("[QUIC-UDP] WriteToUDP failed: %v", errWrite)
 			}
@@ -8198,6 +8249,10 @@ func handleClientUDPQUIC(localConn net.Conn, boundAddr *net.UDPAddr, udpListener
 			for i := 0; i < count; i++ {
 				n := batch.msgs[i].N
 				pkt := batch.msgs[i].Buffers[0][:n]
+				if clientUDPDatagramBlocked(cfg, pkt) {
+					logWarn("[CLIENT-QUIC-UDP] Blocked local UDP datagram")
+					continue
+				}
 				clientUDPAddr.Store(cloneUDPAddr(batch.msgs[i].Addr.(*net.UDPAddr)))
 				// [2B len | payload] in one buffer — one stream Write per
 				// datagram instead of the old len-prefix + payload pair.

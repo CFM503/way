@@ -6,6 +6,19 @@ All notable changes to the **Way Proxy** project (Goway & Pyway) are documented 
 
 ---
 
+## [v1.8.30] - 2026-10-19
+
+### 服务端默认开启内网与回环拦截、UDP 全链路本地防御强化与 DNS 重绑定根除
+
+- **服务端内网与回环拦截默认开启**: `-server-block-local` 默认值提升为 `true`，防止代理服务端被利用为内网 SSRF 渗透跳板；支持 `-no-server-block-local` 或 `-no-block-local` 显式解禁。
+- **启动 Banner 与 TUI 双端状态联动**: 智能判定客户端（`cfg.BlockLocal`）与服务端（`cfg.ServerBlockLocal`）状态，启动明确输出 `[+] Block Local: Enabled (Client & Server)`。
+- **本地目标识别规则强化（`isLocalTarget`）**: 标准化处理末尾点号，并扩展新增 `.localhost` 顶级域名后缀全面阻断。
+- **客户端 UDP 前置拦截（`clientUDPDatagramBlocked`）**: WS（`handleClientUDP`）与 QUIC（`handleClientUDPQUIC`）在进入隧道前直接解析 SOCKS5 UDP 数据报内部目标（IPv4/域名/IPv6）并过滤，节约隧道开销。
+- **服务端 UDP 出口二次防御（根除 DNS 重绑定）**: WS（`handleServerUDP`）与 QUIC（`handleQUICServerUDP`）在 DNS 解析出实际目标 IP 后二次校验 `isLocalTarget(raddr.IP.String())`，彻底封死 DNS Rebinding 内网渗透。
+- **测试套件参数对齐**: `goway_test.go` 与 `goway_2000_test.go` 中端到端本地 Echo 回环测试添加 `-no-server-block-local` 参数，全量单元测试 100% PASS。
+
+---
+
 ## [v1.8.29] - 2026-10-19
 
 ### 自适应版本重大升级：VPS 动态内存分级、运行时软上限保护与小帧零锁留优化

@@ -232,6 +232,7 @@ func TestEndToEndSubprocessIntegration(t *testing.T) {
 	serverCmd := exec.Command(testBinaryForSubprocess(t),
 		"-p", fmt.Sprintf("127.0.0.1:%d", serverPort),
 		"-k", "testKey2026",
+		"-no-server-block-local",
 		"-log", "ERROR",
 	)
 	if err := serverCmd.Start(); err != nil {
@@ -441,6 +442,7 @@ func TestViolentStressSimulation(t *testing.T) {
 	serverCmd := exec.Command(testBinaryForSubprocess(t),
 		"-p", fmt.Sprintf("127.0.0.1:%d", serverPort),
 		"-k", "violentStressKey999",
+		"-no-server-block-local",
 		"-log", "ERROR",
 	)
 	if err := serverCmd.Start(); err != nil {

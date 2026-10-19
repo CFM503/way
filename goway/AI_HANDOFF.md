@@ -12,6 +12,21 @@
 - User mandate, 2026-09-23. 违反此规则的改动一律不得合入：只允许正向优化，永远禁止反向优化。
 
 
+## v1.8.30 cycle: Default Server Block Local, End-to-End UDP Loopback Defense & DNS Rebinding Elimination (2026-10-19)
+
+### Status & Release Summary
+- **Version**: Bumped to `1.8.30` in `goway.go` (`Version = "1.8.30"`).
+- **Core Vectors Shipped**:
+  - **服务端内网与回环拦截默认开启**：命令行标志 `-server-block-local` 默认值提升为 `true`，防止反向代理被滥用为 SSRF 内网扫描跳板。支持 `-no-server-block-local` 或 `-no-block-local` 显式解禁。
+  - **双端状态联动与启动 Banner 升级**：根据客户端（`cfg.BlockLocal`）与服务端（`cfg.ServerBlockLocal`）模式智能计算 `blockLocalActive`，启动明确打印 `[+] Block Local: Enabled (Client & Server)`，TUI 同步联动。
+  - **本地目标识别规则强化（`isLocalTarget`）**：标准化处理末尾点号，并扩展新增对 `.localhost` 顶级域名后缀的全面防御。
+  - **客户端 UDP 前置拦截（`clientUDPDatagramBlocked`）**：在 WS 与 QUIC 客户端上传阶段直接解析 SOCKS5 UDP 数据报头，拦截本地/回环目标，节省隧道带宽。
+  - **服务端 UDP 出口二次防御（根除 DNS 重绑定）**：WS 与 QUIC 服务端在解析出 `raddr.IP` 后追加二次校验，彻底根除恶意公网域名解析至 `127.0.0.1` 的 DNS Rebinding 攻击。
+  - **自动化测试套件适配**：更新端到端子进程回归测试（`TestEndToEndSubprocessIntegration` 与 `TestViolentStressSimulation`）传入 `-no-server-block-local` 参数，保证本地 Echo 回环测试 100% PASS。
+- **Standing Rule & Compatibility**:
+  - 全套自动化测试套件通过（`ok goway 63.899s`），全量单元测试与流控测试 100% PASS，无回归。
+
+
 ## v1.8.29 cycle: Adaptive VPS Memory Profile, GC Soft-Limit & Small-Frame Zero-Pin Optimization (2026-10-19)
 
 ### Status & Release Summary

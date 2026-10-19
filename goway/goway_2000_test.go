@@ -184,6 +184,7 @@ func Test2000ConcurrentEndToEndSOCKS5(t *testing.T) {
 		"-p", fmt.Sprintf("127.0.0.1:%d", serverPort),
 		"-k", "stressKey2000",
 		"-max-conn", "5000",
+		"-no-server-block-local",
 		"-log", "WARN",
 	)
 	var serverStderr syncBuffer

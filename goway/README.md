@@ -1,4 +1,4 @@
-# GOWAY v1.8.29
+# GOWAY v1.8.30
 
 GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具，支持 HTTP 和完整 SOCKS5 (TCP + UDP) 协议，具备浏览器指纹伪装、0-RTT 多路复用 (Mux)、QUIC 弱网抗丢包传输、Cloudflare CDN 边缘接入与 PGO 机器码级性能优化。
 
@@ -7,6 +7,21 @@ GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具�
 > 接手本项目的 AI 必须先读 `goway/AI_HANDOFF.md` 顶部同名规则并原样保留；每个性能改动必须在 `AI_HANDOFF.md` 记录前后数据，**没有数据不算完成**。
 
 ## 版本历史
+
+### v1.8.30 (2026-10-19) - 服务端默认开启内网与回环拦截、UDP 全链路本地防御强化与 DNS 重绑定根除
+
+#### 核心优化与协议加固
+
+| 优化/修复项 | 说明 | 收益与特性 |
+|---|---|---|
+| **服务端内网与回环拦截默认开启** | `-server-block-local` 默认值提升为 `true`，同时支持 `-no-server-block-local` 与 `-no-block-local` 显式解禁 | **从根本上杜绝代理服务端被恶意用作跳板实施内网 SSRF 探测与回环服务渗透** |
+| **启动 Banner 与 TUI 状态联动展示** | 根据当前生效模式智能计算 `blockLocalActive`，启动明确输出 `[+] Block Local: Enabled (Client & Server)` | **双端防护状态一目了然，运维与排错更直观透明** |
+| **本地目标识别规则强化（`isLocalTarget`）** | 标准化清洗 FQDN 末尾点号，并扩展新增 `.localhost` 顶级域名后缀全面识别 | **封堵利用特异性主机名规避内网检测的漏洞** |
+| **客户端 UDP 前置本地拦截（`clientUDPDatagramBlocked`）** | WS（`handleClientUDP`）与 QUIC（`handleClientUDPQUIC`）在进入隧道前解析 SOCKS5 UDP 数据报内部目标（IPv4/域名/IPv6）并过滤 | **在客户端源头直接阻断本地 UDP 报文，节省隧道开销与带宽** |
+| **服务端 UDP 出口二次防御（根除 DNS 重绑定）** | WS（`handleServerUDP`）与 QUIC（`handleQUICServerUDP`）在 DNS 解析得到实际 IP 后二次校验 `isLocalTarget(raddr.IP.String())` | **彻底消除伪造公网域名解析至 `127.0.0.1` 或内网 IP 的 DNS Rebinding 攻击隐患** |
+| **自动化测试套件参数对齐** | 端到端子进程回归测试显式传入 `-no-server-block-local` 匹配本地 Echo 测试场景 | **保证自动化测试套件 100% PASS，基准与功能持续无回归验证** |
+
+---
 
 ### v1.8.29 (2026-10-19) - 自适应版本重大升级：VPS 动态内存分级配置、运行时软上限保护与小包零锁留优化
 
