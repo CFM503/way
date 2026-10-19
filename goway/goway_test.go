@@ -1283,7 +1283,7 @@ func TestMuxStream_ByteLimitBackpressure(t *testing.T) {
 	defer st.Close()
 
 	chunk := make([]byte, 1024*1024)
-	fitChunks := muxClientStreamBufferLimit / (1024 * 1024)
+	fitChunks := int(muxClientStreamBufferLimit / (1024 * 1024))
 	for i := 0; i < fitChunks; i++ {
 		if !st.PushData(chunk) {
 			t.Fatalf("Failed to push chunk %d within limit", i)

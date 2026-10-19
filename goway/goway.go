@@ -43,6 +43,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"runtime/debug"
 	"runtime/pprof"
 	"strconv"
 	"strings"
@@ -58,7 +59,7 @@ import (
 // ============================================================================
 // GOWAY 版本号定义 (发布新版本时在此修改)
 // ============================================================================
-const Version = "1.8.28"
+const Version = "1.8.29"
 
 const (
 	// MaxWSFrameSize matches the largest frame the sender side can build
@@ -2923,6 +2924,7 @@ func main() {
 		if cfg.SocketBuffer > 0 {
 			bufInfo += fmt.Sprintf(" (Socket: %d KB)", cfg.SocketBuffer)
 		}
+		fmt.Printf(" [+] Memory:      %d MiB (%s profile, Window: %d MiB, Queue: %d)\n", adaptiveMemMiB, adaptiveTierName, muxInitialWindowKib/1024, muxStreamIngressQueue)
 		fmt.Printf(" [+] Buffer:      %s\n", bufInfo)
 		fmt.Printf(" [+] Max Conns:   %d\n", cfg.MaxConns)
 	}
@@ -2982,7 +2984,7 @@ func main() {
 			if cfg.Mux {
 				cfg.MuxPool = NewMuxClientPool(&cfg, cfg.MuxSessions)
 			} else {
-				connPool = NewConnPool(&cfg, 16) // Pool of 16 pre-established connections for non-Mux mode
+				connPool = NewConnPool(&cfg, adaptiveNonMuxPoolSize) // Adaptive pre-established connections for non-Mux mode
 			}
 		}
 
@@ -3151,52 +3153,127 @@ const (
 	MuxCmdWINDOW  byte = 0x06 // W3: [CreditBytes uint32 BE]
 	MuxHeaderLen       = 7    // 4B StreamID + 1B Cmd + 2B PayloadLen
 
-	// Client-side Mux stream buffer limit.
-	// Invariant: >= muxInitialWindowKib*1024 + muxWindowRefresh, else the
-	// ingress queue fills before credit can drain -> spurious RST under
-	// high-BDP load (guarded by TestStreamBufferLimitCoversWindow).
-	// 9MiB = window (8192KiB) + refresh (1MiB) exactly: the Phase-2 40MiB
-	// headroom was sized for the reverted 32MiB window arm and let streams
-	// retain pooled frame buffers ~+11% RSS vs v1.8.12 at c32 loopback.
-	muxClientStreamBufferLimit = 36 * 1024 * 1024
-
-	// Server-side Mux stream buffer limit.
-	// Same window+refresh invariant as the client side.
-	muxServerStreamBufferLimit = 36 * 1024 * 1024
-	// Frame-count queue depths. PushDataFrame budgets bytes (buffer limits
-	// above, 9MiB), so the frame depths must not bind first: at maximum
-	// frame size (65535B) a 9MiB budget needs 144 frames; 768 slots keep
-	// burst absorption far above the budget (small-frame bursts bind the
-	// byte budget before depth, and 768 still bounds the "ingress queue
-	// full" reset risk observed under 40ms netem when the window was
-	// raised without scaling these). Frame depths only bound burst
-	// absorption, never steady-state memory (credit gating does).
-	// Invariant guarded by TestStreamBufferLimitCoversWindow.
-	muxStreamIngressQueue = 1024
-	muxStreamAppQueue     = 1024 // client readChan / server writeChan depth
-	muxPushStallTimeout   = 15 * time.Second
-
-	// W3 flow control: version advertised in VERSION frames, initial
-	// per-stream receive window (KiB), and the consumed-byte threshold
-	// that triggers a WINDOW refund. Probe-negotiated: peers predating
-	// these commands skip them silently, keeping v1 behavior.
-	// v1.8.13 Phase 2 tried 32768/8MiB here: 40ms-netem throughput improved
-	// (c8/c32 download +10%/+16%) but RSS regressed to concurrency x window
-	// (c32: 338MB -> 982MB, sign 10/0) and the forward-optimization rule
-	// requires reverting on any metric beyond noise. Data: bench_p2_netem.csv.
+	muxPushStallTimeout      = 15 * time.Second
 	muxProtoVersion     byte = 1
-	muxInitialWindowKib      = 32768
-	muxWindowRefresh         = 2 * 1024 * 1024
 	muxWindowMinKib          = 64
-
-	// muxRefundThreshold is the consumed-byte count that triggers a WINDOW
-	// refund, clamped to half the advertised window. Without the clamp, a
-	// future window smaller than muxWindowRefresh could exhaust the peer's
-	// send credit before any refund fires (refundPending never reaches the
-	// threshold -> permanent silent stall). Invariant guarded by
-	// TestRefundThresholdNeverExceedsHalfWindow.
-	muxRefundThreshold = min(muxWindowRefresh, muxInitialWindowKib*1024/2)
+	// Small MUX frames (<= 8 KiB) copy into exact-sized slices so they never
+	// pin a 128 KiB+ BufPool buffer inside stream queues on low-RAM VPS.
+	muxSmallPayloadCopyLimit = 8192
 )
+
+var (
+	adaptiveMemMiB             int    = 4096
+	adaptiveTierName           string = "High-BDP"
+	adaptiveNonMuxPoolSize     int    = 16
+	muxClientStreamBufferLimit int64  = 36 * 1024 * 1024
+	muxServerStreamBufferLimit int64  = 36 * 1024 * 1024
+	muxStreamIngressQueue      int    = 1024
+	muxStreamAppQueue          int    = 1024
+	muxInitialWindowKib        int    = 32768
+	muxWindowRefresh           int64  = 2 * 1024 * 1024
+	muxRefundThreshold         int64  = 2 * 1024 * 1024
+)
+
+func init() {
+	initAdaptiveMemoryProfile()
+}
+
+func initAdaptiveMemoryProfile() {
+	mib := detectSystemMemoryMiB()
+	adaptiveMemMiB = mib
+	if mib <= 640 {
+		adaptiveTierName = "Low-RAM"
+		muxInitialWindowKib = 4096
+		muxWindowRefresh = 512 * 1024
+		muxClientStreamBufferLimit = 6 * 1024 * 1024
+		muxServerStreamBufferLimit = 6 * 1024 * 1024
+		muxStreamIngressQueue = 512
+		muxStreamAppQueue = 512
+		adaptiveNonMuxPoolSize = 4
+		limitBytes := int64(mib) * 1024 * 1024 * 70 / 100
+		if limitBytes < 96*1024*1024 {
+			limitBytes = 96 * 1024 * 1024
+		}
+		debug.SetMemoryLimit(limitBytes)
+	} else if mib <= 2048 {
+		adaptiveTierName = "Balanced"
+		muxInitialWindowKib = 8192
+		muxWindowRefresh = 1024 * 1024
+		muxClientStreamBufferLimit = 10 * 1024 * 1024
+		muxServerStreamBufferLimit = 10 * 1024 * 1024
+		muxStreamIngressQueue = 768
+		muxStreamAppQueue = 768
+		adaptiveNonMuxPoolSize = 8
+		limitBytes := int64(mib) * 1024 * 1024 * 75 / 100
+		debug.SetMemoryLimit(limitBytes)
+	} else {
+		adaptiveTierName = "High-BDP"
+		muxInitialWindowKib = 32768
+		muxWindowRefresh = 2 * 1024 * 1024
+		muxClientStreamBufferLimit = 36 * 1024 * 1024
+		muxServerStreamBufferLimit = 36 * 1024 * 1024
+		muxStreamIngressQueue = 1024
+		muxStreamAppQueue = 1024
+		adaptiveNonMuxPoolSize = 16
+	}
+	halfWin := int64(muxInitialWindowKib) * 1024 / 2
+	if muxWindowRefresh < halfWin {
+		muxRefundThreshold = muxWindowRefresh
+	} else {
+		muxRefundThreshold = halfWin
+	}
+}
+
+func detectSystemMemoryMiB() int {
+	for _, envName := range []string{"GOWAY_MEM_MIB", "RUSHWAY_MEM_MIB"} {
+		if val := strings.TrimSpace(os.Getenv(envName)); val != "" {
+			if n, err := strconv.Atoi(val); err == nil && n > 0 {
+				return n
+			}
+		}
+	}
+	hostBytes := uint64(0)
+	if data, err := os.ReadFile("/proc/meminfo"); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "MemTotal:") {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					if kib, err := strconv.ParseUint(fields[1], 10, 64); err == nil {
+						hostBytes = kib * 1024
+					}
+				}
+				break
+			}
+		}
+	}
+	cgroupBytes := uint64(math.MaxUint64)
+	for _, p := range []string{
+		"/sys/fs/cgroup/memory.max",
+		"/sys/fs/cgroup/memory/memory.limit_in_bytes",
+	} {
+		if raw, err := os.ReadFile(p); err == nil {
+			if v, err := strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 64); err == nil {
+				if v > 0 && v < (1<<50) && v < cgroupBytes {
+					cgroupBytes = v
+				}
+			}
+		}
+	}
+	effective := hostBytes
+	if effective == 0 || cgroupBytes < effective {
+		if cgroupBytes < math.MaxUint64 {
+			effective = cgroupBytes
+		}
+	}
+	if effective == 0 {
+		return 4096
+	}
+	mib := int(effective / (1024 * 1024))
+	if mib < 64 {
+		mib = 64
+	}
+	return mib
+}
 
 // muxDataChunkLimit caps one MUX DATA frame's PLAINTEXT payload. Legacy
 // mode allows the full uint16 range (65535); AEAD mode must leave room for
@@ -4623,15 +4700,21 @@ func (s *MuxClientSession) readLoop() {
 		switch cmd {
 		case MuxCmdDATA:
 			if len(payload) > 0 {
-				nextBPtr := s.cfg.BufPool.Get().(*[]byte)
-				frame := muxDataFrame{
-					data: payload,
-					bPtr: bPtr,
-					pool: s.cfg.BufPool,
+				if len(payload) <= muxSmallPayloadCopyLimit {
+					cp := make([]byte, len(payload))
+					copy(cp, payload)
+					st.enqueueDataFrame(muxDataFrame{data: cp})
+				} else {
+					nextBPtr := s.cfg.BufPool.Get().(*[]byte)
+					frame := muxDataFrame{
+						data: payload,
+						bPtr: bPtr,
+						pool: s.cfg.BufPool,
+					}
+					bPtr = nextBPtr
+					buf = *bPtr
+					st.enqueueDataFrame(frame)
 				}
-				bPtr = nextBPtr
-				buf = *bPtr
-				st.enqueueDataFrame(frame)
 			}
 		case MuxCmdFIN:
 			st.enqueueDataFrame(muxDataFrame{data: nil})
@@ -5673,15 +5756,21 @@ func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 			st, ok := session.streams[streamID]
 			session.streamsMu.RUnlock()
 			if ok && len(payload) > 0 {
-				nextBPtr := cfg.BufPool.Get().(*[]byte)
-				frame := muxDataFrame{
-					data: payload,
-					bPtr: bPtr,
-					pool: cfg.BufPool,
+				if len(payload) <= muxSmallPayloadCopyLimit {
+					cp := make([]byte, len(payload))
+					copy(cp, payload)
+					st.enqueueDataFrame(muxDataFrame{data: cp})
+				} else {
+					nextBPtr := cfg.BufPool.Get().(*[]byte)
+					frame := muxDataFrame{
+						data: payload,
+						bPtr: bPtr,
+						pool: cfg.BufPool,
+					}
+					bPtr = nextBPtr
+					buf = *bPtr
+					st.enqueueDataFrame(frame)
 				}
-				bPtr = nextBPtr
-				buf = *bPtr
-				st.enqueueDataFrame(frame)
 			}
 
 		case MuxCmdFIN:

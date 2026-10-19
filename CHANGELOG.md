@@ -6,6 +6,21 @@ All notable changes to the **Way Proxy** project (Goway & Pyway) are documented 
 
 ---
 
+## [v1.8.29] - 2026-10-19
+
+### 自适应版本重大升级：VPS 动态内存分级、运行时软上限保护与小帧零锁留优化
+
+- **自适应系统内存感知（Host & Cgroup Detection）**: 自动探测宿主机 `/proc/meminfo` 及 cgroup v1/v2 内存上限（支持 `GOWAY_MEM_MIB` / `RUSHWAY_MEM_MIB` 覆盖），自适应识别低配 VPS、云主机与容器环境。
+- **动态三档流控与资源规格（Low-RAM / Balanced / High-BDP）**:
+  - **Low-RAM (≤ 640 MiB)**: 初始窗口 4MiB、刷新 512KiB、流限额 6MiB、队列深度 512、预热池 4；自动启用 `debug.SetMemoryLimit(70% RAM)`，杜绝小内存 VPS 爆内存与 cgroup OOM 杀进程。
+  - **Balanced (≤ 2048 MiB)**: 初始窗口 8MiB、刷新 1MiB、流限额 10MiB、队列深度 768、预热池 8；启用 `debug.SetMemoryLimit(75% RAM)`。
+  - **High-BDP (> 2048 MiB)**: 初始窗口 32MiB、刷新 2MiB、流限额 36MiB、队列深度 1024、预热池 16，满血发挥网络带宽。
+- **MUX 小帧零锁留优化（Small-Frame Zero-Pinning）**: 客户端与服务端对 `<= 8 KiB` 的 MUX DATA 帧改用精确切片拷贝交付，彻底杜绝小包在流队列中长期独占并钉死 128 KiB+ `BufPool` 大块内存，显著降低常驻 RSS。
+- **启动 Banner 升级**: 启动明确输出当前主机物理/容器内存容量、所匹配的自适应 Profile 档位、窗口与队列配置。
+- **测试套件与类型适配**: `goway_test.go` 修正动态 `int64` 类型测试匹配，全套单元测试通过。
+
+---
+
 ## [v1.8.16] - 2026-10-03
 
 ### 正确性修复 + 安全加固 + 默认关闭的新能力（P0 乱序 / AEAD / QUIC 证书钉扎 / QUIC 多连接）

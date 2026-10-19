@@ -12,6 +12,24 @@
 - User mandate, 2026-09-23. 违反此规则的改动一律不得合入：只允许正向优化，永远禁止反向优化。
 
 
+## v1.8.29 cycle: Adaptive VPS Memory Profile, GC Soft-Limit & Small-Frame Zero-Pin Optimization (2026-10-19)
+
+### Status & Release Summary
+- **Version**: Bumped to `1.8.29` in `goway.go` (`Version = "1.8.29"`).
+- **Core Vectors Shipped (自适应版本重大升级)**:
+  - **自适应环境探测（Host & Cgroup Memory Detection）**：启动阶段依次探测 `GOWAY_MEM_MIB` / `RUSHWAY_MEM_MIB` 环境变量、`/proc/meminfo` 以及 cgroup v1/v2 (`memory.max` / `memory.limit_in_bytes`)，精准感知宿主机及容器环境的实际可用物理内存配额。
+  - **三档自适应流控窗口与队列深度（Low-RAM / Balanced / High-BDP）**：
+    - `Low-RAM (<= 640 MiB)`：专为 512MB/640MB VPS 打造，初始窗口调谐至 4MiB，刷新 512KiB，流缓冲上限 6MiB，队列深度 512，Non-MUX 预热池收敛为 4，并设置 70% RAM（兜底 96MiB）的 `debug.SetMemoryLimit` 软上限保护，引导 Go GC 提前回收，彻底免疫低配机 Linux cgroup OOM Killer。
+    - `Balanced (641 MiB ~ 2048 MiB)`：适配 1GB~2GB VPS，初始窗口 8MiB，刷新 1MiB，流缓冲上限 10MiB，队列 768，预热池 8，设置 75% RAM 软上限。
+    - `High-BDP (> 2048 MiB)`：高端大内存服务器/PC，维持 32MiB 满血窗口与 36MiB 缓冲限额，预热池 16，充分跑满大吞吐与高延时网络。
+    - 退款阈值 `muxRefundThreshold` 动态严格锁死至 `min(muxWindowRefresh, halfWin)`，满足全部流控断言。
+  - **MUX 小数据帧精确拷贝（Small-Frame Zero-Pinning）**：双端（客户端 `readLoop` 与服务端 `handleServerMux`）对 `<= 8 KiB` 数据帧采用精确切片拷贝交付，避免小包长时间“钉死”128 KiB+ 大尺寸 `BufPool` 内存指针，极大降低队列驻留常驻 RSS。
+  - **Banner 档位透明展示**：启动时清晰打印 `[+] Memory: %d MiB (%s profile, Window: %d MiB, Queue: %d)`。
+  - **测试修复与类型对齐**：更新 `goway_test.go` 中 `TestMuxStream_ByteLimitBackpressure` 适配动态 `int64` 流限额。
+- **Standing Rule & Compatibility**:
+  - 全套自动化测试套件通过（`ok goway 75.370s`），全量单元测试与流控测试 100% PASS，无回归。
+
+
 ## v1.8.28 cycle: MUX Ping/Pong Data Race Elimination, Sticky EOF & SYN Fail Cleanup (2026-10-18)
 
 ### Status & Release Summary
