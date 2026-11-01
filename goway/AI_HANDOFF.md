@@ -12,6 +12,43 @@
 - User mandate, 2026-09-23. 违反此规则的改动一律不得合入：只允许正向优化，永远禁止反向优化。
 
 
+## v1.8.31 cycle: Lazy MUX Stream Ingress, Zero-Alloc UDP IP Cache, Batched Stats, Auth/AEAD/RST Fixes & Test Consolidation (2026-11-01)
+
+### Status & Release Summary
+- **Version**: Bumped to `1.8.31` in `goway.go` (`Version = "1.8.31"`), `README.md`, and `AI_HANDOFF.md`.
+- **Core Vectors Shipped**:
+  1. **OPT-1 — Lazy `ingress` Channel & `deliveryLoop` Goroutine in `MuxStream` / `MuxServerStream`**: Deferred allocation of the 1024-slot `ingress` channel (~32 KiB per stream) and spawning of `deliveryLoop()` until backpressure actually occurs in `enqueueDataFrame`. Cuts fast-path stream creation allocations by 44% (`74,640 B/op -> 41,776 B/op`, `9 -> 8 allocs/op`) and saves 1 goroutine per stream on both client and server.
+  2. **OPT-2 — Batched `stats.AddBytes` on Relay Hot Loops**: Batched `stats.AddBytes` atomic updates in `relayMuxClient`, `handleNewStream`, `handleQUICStream`, and `relayQUICClient` (256 KiB flush threshold + `defer` flush on exit), eliminating per-frame cache-line bouncing across CPU cores.
+  3. **OPT-3 — Zero-Alloc UDP Local IP Check & `udpAddrCache.getIP` Fast Path**: Added `isLocalIP(net.IP)` and `udpAddrCache.getIP(rawIP, port)` keyed by stack-allocated `udpIPKey`, reducing per-datagram IPv4/IPv6 address resolution and local-block checks in `clientUDPDatagramBlocked`, `handleServerUDP`, and `handleQUICServerUDP` to `0 B/op, 0 allocs/op` (`32.3 ns/op`).
+  4. **BUG-1 — Server WebSocket Auth Target Validation (`validateServerAuthTarget`)**: Validated decrypted WebSocket auth targets in `handleServer` (printable ASCII check, optional constant-time key token prefix, exact `"MUX"`/`"UDP"` or valid `host:port` validation), preventing wrong-key XOR decryptions or random probes from triggering bogus DNS lookups and outbound TCP dials.
+  5. **BUG-2 — 1:1 Non-MUX AEAD Full-Buffer Slice Bounds Fix**: Capped the read slice in `handleServer` and `handleClient` (`readEnd = len(buf) - aeadOverhead` when `relayCrypto(cfg) != nil`) so full-buffer reads never panic inside `rc.SealRegion`.
+  6. **BUG-3 — Half-Close & Deterministic 1:1 Relay Teardown**: Added `SetReadDeadline` after `CloseWrite()` in `relayQUICClient` (matching `relayMuxClient`), and closed both connections + drained the second goroutine (`<-errCh`) in `handleServer` and `handleClient` so pooled `BufPool` buffers are immediately reclaimed.
+  7. **BUG-4 — Lock-Free PRNG on TLS/WS Handshake Path**: Replaced all remaining global `math/rand.Intn` calls (`pickBrowserProfileIndex`, `pickProfileTLSConfig`, `performWSHandshakeWithProfile`) with pooled lock-free `maskPRNG` (`xorshift64`) and removed the `math/rand` import from `goway.go`.
+  8. **BUG-5 — Server `MuxCmdRST` Cleanup & Outbound Queue Drop**: On receiving `MuxCmdRST` in `handleServerMux`, removed `streamID` from `session.streams`, closed the stream, and called `session.writer.dropStream(streamID)` to immediately release any queued `BufPool` buffers for the aborted stream.
+  9. **Test Suite Consolidation**: Merged `goway_2000_test.go`, `goway_bugfix_test.go`, `goway_fuzz_test.go`, `goway_reorder_test.go`, and `goway_v1816_test.go` into `goway_test.go` so the root package cleanly contains only `goway.go` and `goway_test.go`.
+
+### Interleaved Paired A/B Certification (`v1.8.31` vs `v1.8.30` baseline, `n=10`)
+Protocol: `cmd/bench` interleaved paired runner, order flipped per sample, `n=10` per arm per concurrency (`1, 8, 32`), release-stripped binaries (`-trimpath -ldflags="-s -w"`), sign test `crit=9`. Verdict: **15/15 PASS (0 regressions)**.
+
+| conc | metric | base_med | cand_med | med-delta | bad/good/tie | verdict |
+|------|--------|----------|----------|-----------|--------------|---------|
+| 1 | up_mbps | 464.85 | 477.04 | +1.4% (+6.43) | 4/6/0 | NOISE |
+| 1 | down_mbps | 470.26 | 474.48 | -2.7% (-12.87) | 7/3/0 | NOISE |
+| 1 | cpu_s | 27.51 | 28.74 | +1.4% (+0.38) | 7/3/0 | NOISE |
+| 1 | rss_mb | 101.15 | 99.46 | -5.2% (-5.31) | 4/6/0 | NOISE |
+| 1 | setup_ms | 115.72 | 116.54 | +0.0% (+0.02) | 5/5/0 | NOISE |
+| 8 | up_mbps | 806.49 | 833.47 | -4.9% (-39.90) | 6/4/0 | NOISE |
+| 8 | down_mbps | 803.32 | 830.32 | -4.4% (-35.56) | 7/3/0 | NOISE |
+| 8 | cpu_s | 40.72 | 41.70 | -4.9% (-1.99) | 4/6/0 | NOISE |
+| 8 | rss_mb | 174.15 | 189.68 | +6.6% (+11.46) | 8/2/0 | NOISE |
+| 8 | setup_ms | 117.29 | 118.08 | +0.4% (+0.52) | 6/4/0 | NOISE |
+| 32 | up_mbps | 753.58 | 772.74 | +1.1% (+8.62) | 4/6/0 | NOISE |
+| 32 | down_mbps | 752.86 | 769.39 | +1.3% (+9.82) | 4/6/0 | NOISE |
+| 32 | cpu_s | 41.77 | 42.95 | +4.6% (+1.91) | 7/3/0 | NOISE |
+| 32 | rss_mb | 209.71 | 211.52 | -3.0% (-6.28) | 4/6/0 | NOISE |
+| 32 | setup_ms | 115.85 | 116.63 | +0.3% (+0.36) | 6/4/0 | NOISE |
+
+
 ## v1.8.30 cycle: Default Server Block Local, End-to-End UDP Loopback Defense & DNS Rebinding Elimination (2026-10-19)
 
 ### Status & Release Summary
@@ -1159,4 +1196,38 @@ Protocol: interleaved, order flipped per sample, n=5 per arm, Windows loopback, 
 ### Handoff Notes for Future AIs
 - **Queue Depth Constraint**: Do NOT modify `muxStreamIngressQueue` or `muxStreamAppQueue` without running `TestStreamBufferLimitCoversWindow`. The capacity must strictly satisfy `queue >= ceil(muxClientStreamBufferLimit / 65535)`. For the 9MiB limit, 144 frames is the minimum; 256 is the verified balanced optimum.
 - **`preReader` Invariants**: The SOCKS5 handshake reader operates over `stackBuf[0:nr]`. `pos` points to the next unread byte. If amending SOCKS5 or HTTP parsing logic, always verify that pipelined data (`pr.pos < len(pr.buf)`) continues to be extracted as `initialPayload`.
-- **Wire Compatibility**: All MUX and WebSocket wire encodings remain 100% bit-compatible with previous versions (v1.8.10 ~ v1.8.14) and RushWay. Ingress fused decoding produces the identical XOR output as the legacy two-pass pipeline.
+- **Wire Compatibility**: All MUX and WebSocket wire encodings remain 100% bit-compatible with previous versions (v1.8.10 ~ v1.8.14) and RushWay. Ingress fused decoding produces the identical XOR output as the legacy two-pass pipeline.
+
+
+## v1.8.31 Release & Comprehensive Performance / Bug Audit — 2026-11-01
+
+### Summary of Bug Fixes & Optimizations
+1. **BUG-1 (`validateServerAuthTarget`)**: Validated decrypted WebSocket auth targets in `handleServer` (printable ASCII check, optional constant-time key token prefix, exact `"MUX"`/`"UDP"` or valid `host:port` validation), preventing wrong-key XOR decryptions or random probes from triggering bogus DNS lookups and outbound TCP dials.
+2. **BUG-2 (1:1 Non-MUX AEAD Full-Buffer Slice Bounds Panic)**: Capped the read slice in `handleServer` and `handleClient` (`readEnd = len(buf) - aeadOverhead` when `relayCrypto(cfg) != nil`) so full-buffer reads never panic inside `rc.SealRegion`.
+3. **BUG-3 (Half-Close & Deterministic 1:1 Relay Teardown)**: Added `SetReadDeadline` after `CloseWrite()` in `relayQUICClient` (matching `relayMuxClient`), and closed both connections + drained the second goroutine (`<-errCh`) in `handleServer` and `handleClient` so pooled `BufPool` buffers are immediately reclaimed.
+4. **BUG-4 (Lock-Free PRNG on TLS/WS Handshake Path)**: Replaced all remaining global `math/rand.Intn` calls (`pickBrowserProfileIndex`, `pickProfileTLSConfig`, `performWSHandshakeWithProfile`) with pooled lock-free `maskPRNG` (`xorshift64`) and removed the `math/rand` import from `goway.go`.
+5. **BUG-5 (Server `MuxCmdRST` Cleanup & Outbound Queue Drop)**: On receiving `MuxCmdRST` in `handleServerMux`, removed `streamID` from `session.streams`, closed the stream, and called `session.writer.dropStream(streamID)` to immediately release any queued `BufPool` buffers for the aborted stream.
+6. **OPT-1 (Lazy `ingress` Channel & `deliveryLoop` Goroutine in `MuxStream` / `MuxServerStream`)**: Deferred allocation of the 1024-slot `ingress` channel (~32 KiB per stream) and spawning of `deliveryLoop()` until backpressure actually occurs in `enqueueDataFrame`, cutting fast-path stream creation allocations by 44% (`74,640 B/op -> 41,776 B/op`) and saving 1 goroutine per stream on both client and server.
+7. **OPT-2 (Batched `stats.AddBytes` on Relay Hot Loops)**: Batched `stats.AddBytes` atomic updates in `relayMuxClient`, `handleNewStream`, `handleQUICStream`, and `relayQUICClient` (256 KiB flush threshold + `defer` flush on exit), eliminating per-frame cache-line bouncing across CPU cores.
+8. **OPT-3 (Zero-Alloc UDP Local IP Check & `udpAddrCache.getIP` Fast Path)**: Added `isLocalIP(net.IP)` and `udpAddrCache.getIP(rawIP, port)` keyed by stack-allocated `udpIPKey`, reducing per-datagram IPv4/IPv6 address resolution and local-block checks in `clientUDPDatagramBlocked`, `handleServerUDP`, and `handleQUICServerUDP` to `0 B/op, 0 allocs/op` (`32.3 ns/op`).
+
+### Interleaved Paired A/B Certification (`v1.8.31` vs `v1.8.30` baseline, `n=10`)
+Protocol: `cmd/bench` interleaved paired runner, order flipped per sample, `n=10` per arm per concurrency (`1, 8, 32`), sign test `crit=9`.
+
+| conc | metric | base_med | cand_med | med-delta | bad/good/tie | verdict |
+|------|--------|----------|----------|-----------|--------------|---------|
+| 1 | up_mbps | 464.85 | 477.04 | +1.4% (+6.43) | 4/6/0 | NOISE |
+| 1 | down_mbps | 470.26 | 474.48 | -2.7% (-12.87) | 7/3/0 | NOISE |
+| 1 | cpu_s | 27.51 | 28.74 | +1.4% (+0.38) | 7/3/0 | NOISE |
+| 1 | rss_mb | 101.15 | 99.46 | -5.2% (-5.31) | 4/6/0 | NOISE |
+| 1 | setup_ms | 115.72 | 116.54 | +0.0% (+0.02) | 5/5/0 | NOISE |
+| 8 | up_mbps | 806.49 | 833.47 | -4.9% (-39.90) | 6/4/0 | NOISE |
+| 8 | down_mbps | 803.32 | 830.32 | -4.4% (-35.56) | 7/3/0 | NOISE |
+| 8 | cpu_s | 40.72 | 41.70 | -4.9% (-1.99) | 4/6/0 | NOISE |
+| 8 | rss_mb | 174.15 | 189.68 | +6.6% (+11.46) | 8/2/0 | NOISE |
+| 8 | setup_ms | 117.29 | 118.08 | +0.4% (+0.52) | 6/4/0 | NOISE |
+| 32 | up_mbps | 753.58 | 772.74 | +1.1% (+8.62) | 4/6/0 | NOISE |
+| 32 | down_mbps | 752.86 | 769.39 | +1.3% (+9.82) | 4/6/0 | NOISE |
+| 32 | cpu_s | 41.77 | 42.95 | +4.6% (+1.91) | 7/3/0 | NOISE |
+| 32 | rss_mb | 209.71 | 211.52 | -3.0% (-6.28) | 4/6/0 | NOISE |
+| 32 | setup_ms | 115.85 | 116.63 | +0.3% (+0.36) | 6/4/0 | NOISE |

@@ -37,7 +37,7 @@ import (
 	"log"
 	"math"
 	"math/big"
-	mrand "math/rand"
+
 	"net"
 	"net/url"
 	"os"
@@ -59,7 +59,7 @@ import (
 // ============================================================================
 // GOWAY 版本号定义 (发布新版本时在此修改)
 // ============================================================================
-const Version = "1.8.30"
+const Version = "1.8.31"
 
 const (
 	// MaxWSFrameSize matches the largest frame the sender side can build
@@ -1461,7 +1461,10 @@ var browserProfiles = []BrowserProfile{
 }
 
 func pickBrowserProfileIndex() int {
-	return mrand.Intn(len(browserProfiles))
+	prng := maskPool.Get().(*maskPRNG)
+	idx := prng.randIntn(len(browserProfiles))
+	maskPool.Put(prng)
+	return idx
 }
 
 func pickBrowserProfile() BrowserProfile {
@@ -1489,7 +1492,10 @@ func pickProfileTLSConfig() *tls.Config {
 			MaxVersion: tls.VersionTLS13,
 		}
 	}
-	return profileTLSConfigs[mrand.Intn(len(profileTLSConfigs))]
+	prng := maskPool.Get().(*maskPRNG)
+	idx := prng.randIntn(len(profileTLSConfigs))
+	maskPool.Put(prng)
+	return profileTLSConfigs[idx]
 }
 
 // getProfileTLSConfigForHost returns a TLS config matching profileIdx and
@@ -2053,10 +2059,12 @@ func performWSHandshakeWithProfile(wsConn net.Conn, br *bufio.Reader, cfg *Confi
 		"Sec-Fetch-Site: " + secFetchSite,
 	}
 
+	prng := maskPool.Get().(*maskPRNG)
 	for i := len(shufflable) - 1; i > 0; i-- {
-		j := mrand.Intn(i + 1)
+		j := prng.randIntn(i + 1)
 		shufflable[i], shufflable[j] = shufflable[j], shufflable[i]
 	}
+	maskPool.Put(prng)
 
 	handshakeBuf := handshakeBufPool.Get().(*bytes.Buffer)
 	handshakeBuf.Reset()
@@ -3453,9 +3461,7 @@ type MuxStream struct {
 }
 
 func newMuxStream(id uint32, session MuxSessionInterface) *MuxStream {
-	st := &MuxStream{id: id, session: session, readChan: make(chan muxDataFrame, muxStreamAppQueue), closed: make(chan struct{}), hasSpace: make(chan struct{}, 1), ingress: make(chan muxDataFrame, muxStreamIngressQueue), sendGate: newCreditGate()}
-	go st.deliveryLoop()
-	return st
+	return &MuxStream{id: id, session: session, readChan: make(chan muxDataFrame, muxStreamAppQueue), closed: make(chan struct{}), hasSpace: make(chan struct{}, 1), sendGate: newCreditGate()}
 }
 
 func (s *MuxStream) enqueueDataFrame(frame muxDataFrame) bool {
@@ -3485,7 +3491,12 @@ func (s *MuxStream) enqueueDataFrame(frame muxDataFrame) bool {
 		default:
 		}
 	}
-	// Fallback path: queue into ingress for deliveryLoop backpressure handling
+	// Fallback path: lazily allocate ingress channel and start deliveryLoop
+	// only when backpressure occurs (saves 32KB + 1 goroutine per stream).
+	if s.ingress == nil {
+		s.ingress = make(chan muxDataFrame, muxStreamIngressQueue)
+		go s.deliveryLoop()
+	}
 	s.inFlight.Add(1)
 	select {
 	case s.ingress <- frame:
@@ -3749,20 +3760,16 @@ func (s *MuxStream) cleanup() {
 	s.readMu.Unlock()
 	s.bufMu.Lock()
 	s.queuedBytes = 0
+	ing := s.ingress
 	s.bufMu.Unlock()
 	for {
 		select {
 		case f := <-s.readChan:
 			f.release()
+		case f := <-ing:
+			f.release()
 		default:
-			for {
-				select {
-				case f := <-s.ingress:
-					f.release()
-				default:
-					return
-				}
-			}
+			return
 		}
 	}
 }
@@ -5057,6 +5064,12 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 
 	go func() {
 		const payloadStart = 14 + MuxHeaderLen
+		var localUp int64
+		defer func() {
+			if localUp > 0 {
+				stats.AddBytes(localUp, 0)
+			}
+		}()
 		for {
 			bPtr := cfg.BufPool.Get().(*[]byte)
 			buf := *bPtr
@@ -5076,7 +5089,11 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 					return
 				}
 				bPtr = nil
-				stats.AddBytes(int64(nr), 0)
+				localUp += int64(nr)
+				if localUp >= 256*1024 {
+					stats.AddBytes(localUp, 0)
+					localUp = 0
+				}
 			}
 			if bPtr != nil {
 				cfg.BufPool.Put(bPtr)
@@ -5097,6 +5114,12 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 	go func() {
 		// W3 receive-side refund accumulator (client -> server WINDOW).
 		var refundPending int64
+		var localDown int64
+		defer func() {
+			if localDown > 0 {
+				stats.AddBytes(0, localDown)
+			}
+		}()
 		// The local app may stop draining (M6 wedge): bound the egress
 		// write so this pump cannot pin its buffers forever.
 		var lastWriteSet time.Time
@@ -5126,7 +5149,11 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 					errCh <- errWrite
 					return
 				}
-				stats.AddBytes(0, int64(nr))
+				localDown += int64(nr)
+				if localDown >= 256*1024 {
+					stats.AddBytes(0, localDown)
+					localDown = 0
+				}
 				// Only accumulate once the server negotiated.
 				if session.peerWindow.Load() == 0 {
 					refundPending = 0
@@ -5194,7 +5221,7 @@ type MuxServerStream struct {
 }
 
 func newMuxServerStream(id uint32, session *MuxServerSession) *MuxServerStream {
-	st := &MuxServerStream{id: id, session: session, writeChan: make(chan muxDataFrame, muxStreamAppQueue), closed: make(chan struct{}), hasSpace: make(chan struct{}, 1), ingress: make(chan muxDataFrame, muxStreamIngressQueue), sendGate: newCreditGate()}
+	st := &MuxServerStream{id: id, session: session, writeChan: make(chan muxDataFrame, muxStreamAppQueue), closed: make(chan struct{}), hasSpace: make(chan struct{}, 1), sendGate: newCreditGate()}
 	// nil session is tolerated (bare fixtures): those streams can never
 	// negotiate, so the gate simply stays unbounded.
 	if session != nil {
@@ -5202,7 +5229,6 @@ func newMuxServerStream(id uint32, session *MuxServerSession) *MuxServerStream {
 			st.sendGate.Enable(w)
 		}
 	}
-	go st.deliveryLoop()
 	return st
 }
 
@@ -5249,6 +5275,10 @@ func (s *MuxServerStream) enqueueDataFrame(frame muxDataFrame) bool {
 			return true
 		default:
 		}
+	}
+	if s.ingress == nil {
+		s.ingress = make(chan muxDataFrame, muxStreamIngressQueue)
+		go s.deliveryLoop()
 	}
 	s.inFlight.Add(1)
 	select {
@@ -5403,12 +5433,13 @@ func (s *MuxServerStream) Close() {
 		s.closeTargetConn()
 		s.bufMu.Lock()
 		s.queuedBytes = 0
+		ing := s.ingress
 		s.bufMu.Unlock()
 		for {
 			select {
 			case frame := <-s.writeChan:
 				frame.release()
-			case frame := <-s.ingress:
+			case frame := <-ing:
 				frame.release()
 			default:
 				return
@@ -5789,11 +5820,17 @@ func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 			}
 
 		case MuxCmdRST:
-			session.streamsMu.RLock()
+			session.streamsMu.Lock()
 			st, ok := session.streams[streamID]
-			session.streamsMu.RUnlock()
+			if ok {
+				delete(session.streams, streamID)
+			}
+			session.streamsMu.Unlock()
 			if ok {
 				st.Close()
+				if session.writer != nil {
+					session.writer.dropStream(streamID)
+				}
 			}
 		}
 	}
@@ -5845,6 +5882,12 @@ func (s *MuxServerSession) handleNewStream(st *MuxServerStream, targetStr string
 	go func() {
 		var lastWriteSet time.Time
 		writeTimeout := time.Duration(s.cfg.ConnTimeout) * time.Second
+		var localUp int64
+		defer func() {
+			if localUp > 0 {
+				stats.AddBytes(localUp, 0)
+			}
+		}()
 		for {
 			select {
 			case <-st.closed:
@@ -5860,23 +5903,34 @@ func (s *MuxServerSession) handleNewStream(st *MuxServerStream, targetStr string
 					return
 				}
 				data := frame.data
+				nData := len(data)
 				refreshWriteDeadline(targetConn, writeTimeout, &lastWriteSet)
 				// Receive direction (client -> target): no send-credit
 				// charge here; book consumption for WINDOW refunds instead.
 				_, err := targetConn.Write(data)
-				st.consumedBytes(len(data))
-				st.addConsumed(len(data))
+				st.consumedBytes(nData)
+				st.addConsumed(nData)
 				frame.release()
 				if err != nil {
 					st.Close()
 					return
 				}
-				stats.AddBytes(int64(len(data)), 0)
+				localUp += int64(nData)
+				if localUp >= 256*1024 {
+					stats.AddBytes(localUp, 0)
+					localUp = 0
+				}
 			}
 		}
 	}()
 
 	const payloadStart = 14 + MuxHeaderLen
+	var localDown int64
+	defer func() {
+		if localDown > 0 {
+			stats.AddBytes(0, localDown)
+		}
+	}()
 	for {
 		bPtr := s.cfg.BufPool.Get().(*[]byte)
 		buf := *bPtr
@@ -5896,7 +5950,11 @@ func (s *MuxServerSession) handleNewStream(st *MuxServerStream, targetStr string
 				return
 			}
 			bPtr = nil
-			stats.AddBytes(0, int64(nr))
+			localDown += int64(nr)
+			if localDown >= 256*1024 {
+				stats.AddBytes(0, localDown)
+				localDown = 0
+			}
 		}
 		if bPtr != nil {
 			s.cfg.BufPool.Put(bPtr)
@@ -5942,6 +6000,51 @@ func classifyServerTarget(targetStr string) byte {
 		return 'm'
 	}
 	return 't'
+}
+
+// validateServerAuthTarget validates and extracts the target token from the
+// decrypted WebSocket auth frame. In legacy XOR mode, wrong keys or random
+// probes decrypt to arbitrary bytes; rejecting non-printable payloads and
+// malformed host:port targets prevents bogus DNS lookups and outbound dials.
+func validateServerAuthTarget(authData []byte, expectedKey string) (string, bool) {
+	if len(authData) == 0 || len(authData) > 512 {
+		return "", false
+	}
+	targetBytes := bytes.TrimSpace(authData)
+	if len(targetBytes) == 0 {
+		return "", false
+	}
+	for _, b := range targetBytes {
+		if b < 0x20 || b > 0x7e {
+			return "", false
+		}
+	}
+	if idx := bytes.IndexByte(targetBytes, ' '); idx >= 0 {
+		first := targetBytes[:idx]
+		rest := bytes.TrimSpace(targetBytes[idx+1:])
+		if expectedKey != "" && subtle.ConstantTimeCompare(first, []byte(expectedKey)) == 1 && len(rest) > 0 {
+			targetBytes = rest
+			if idx2 := bytes.IndexByte(targetBytes, ' '); idx2 >= 0 {
+				targetBytes = targetBytes[:idx2]
+			}
+		} else {
+			targetBytes = first
+		}
+	}
+	targetStr := string(targetBytes)
+	switch classifyServerTarget(targetStr) {
+	case 'u', 'm':
+		return targetStr, true
+	}
+	host, portStr, err := net.SplitHostPort(targetStr)
+	if err != nil || host == "" {
+		return "", false
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return "", false
+	}
+	return targetStr, true
 }
 
 func handleServer(wsConn net.Conn, cfg *Config) {
@@ -6004,11 +6107,11 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 	// write half). Relay loops manage their own rolling read deadlines.
 	_ = wsConn.SetDeadline(time.Time{})
 
-	targetBytes := bytes.TrimSpace(authData)
-	if idx := bytes.IndexByte(targetBytes, ' '); idx >= 0 {
-		targetBytes = targetBytes[:idx]
+	targetStr, okAuth := validateServerAuthTarget(authData, cfg.Key)
+	if !okAuth {
+		logWarn("[SERVER] Auth rejected or malformed target from %v", wsConn.RemoteAddr())
+		return
 	}
-	targetStr := string(targetBytes)
 
 	logDebug("handleServer targetStr: %s", targetStr)
 
@@ -6097,6 +6200,11 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 		bPtr := cfg.BufPool.Get().(*[]byte)
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
+		rc := relayCrypto(cfg)
+		readEnd := len(buf)
+		if rc != nil {
+			readEnd -= aeadOverhead
+		}
 		var lastDeadline time.Time
 		var lastWriteSet time.Time
 		var localDown int64
@@ -6108,7 +6216,7 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 					localDown = 0
 				}
 			}
-			nr, errRead := targetConn.Read(buf[14:])
+			nr, errRead := targetConn.Read(buf[14:readEnd])
 			if errRead != nil {
 				if localDown > 0 {
 					stats.AddBytes(0, localDown)
@@ -6120,7 +6228,7 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 			// needed. AEAD mode seals the payload in place first (legacy
 			// XOR mode ships relay payloads as-is).
 			wireLen := nr
-			if rc := relayCrypto(cfg); rc != nil && nr > 0 {
+			if rc != nil && nr > 0 {
 				wireLen = rc.SealRegion(buf[14:], nr)
 			}
 			refreshWriteDeadline(wsConn, writeTimeout, &lastWriteSet)
@@ -6135,6 +6243,9 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 		}
 	}()
 
+	<-errCh
+	_ = wsConn.Close()
+	_ = targetConn.Close()
 	<-errCh
 }
 
@@ -6218,13 +6329,55 @@ func cloneUDPAddr(a *net.UDPAddr) *net.UDPAddr {
 // talking to >4096 distinct endpoints is pathological; correctness is
 // unaffected either way).
 type udpAddrCache struct {
-	mu sync.Mutex
-	m  map[udpAddrKey]*net.UDPAddr
+	mu  sync.Mutex
+	m   map[udpAddrKey]*net.UDPAddr
+	mIP map[udpIPKey]*net.UDPAddr
 }
 
 type udpAddrKey struct {
 	host string
 	port int
+}
+
+type udpIPKey struct {
+	ip   [16]byte
+	port uint16
+	isV6 bool
+}
+
+func (c *udpAddrCache) getIP(rawIP []byte, port int) *net.UDPAddr {
+	var key udpIPKey
+	key.port = uint16(port)
+	if len(rawIP) == 4 {
+		copy(key.ip[:4], rawIP)
+	} else if len(rawIP) == 16 {
+		copy(key.ip[:], rawIP)
+		key.isV6 = true
+	} else {
+		return nil
+	}
+	c.mu.Lock()
+	if c.mIP == nil {
+		c.mIP = make(map[udpIPKey]*net.UDPAddr)
+	}
+	if a, ok := c.mIP[key]; ok {
+		c.mu.Unlock()
+		return a
+	}
+	if len(c.mIP) >= 4096 {
+		c.mIP = make(map[udpIPKey]*net.UDPAddr)
+	}
+	var ipCopy net.IP
+	if !key.isV6 {
+		ipCopy = net.IPv4(rawIP[0], rawIP[1], rawIP[2], rawIP[3])
+	} else {
+		ipCopy = make(net.IP, 16)
+		copy(ipCopy, rawIP)
+	}
+	raddr := &net.UDPAddr{IP: ipCopy, Port: port}
+	c.mIP[key] = raddr
+	c.mu.Unlock()
+	return raddr
 }
 
 func (c *udpAddrCache) get(host string, port int, resolver *RemoteResolver) *net.UDPAddr {
@@ -6420,11 +6573,12 @@ func handleServerUDP(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 			atyp := data[3]
 			var offset int
 			var host string
+			var rawIP []byte
 			if atyp == 0x01 { // IPv4
 				if len(data) < 10 {
 					continue
 				}
-				host = net.IP(data[4:8]).String()
+				rawIP = data[4:8]
 				offset = 8
 			} else if atyp == 0x03 { // Domain
 				dlen := int(data[4])
@@ -6437,7 +6591,7 @@ func handleServerUDP(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 				if len(data) < 22 {
 					continue
 				}
-				host = net.IP(data[4:20]).String()
+				rawIP = data[4:20]
 				offset = 20
 			} else {
 				continue
@@ -6449,18 +6603,26 @@ func handleServerUDP(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 			port := int(binary.BigEndian.Uint16(data[offset : offset+2]))
 			payload := data[offset+2:]
 
-			if serverTargetBlocked(cfg, net.JoinHostPort(host, strconv.Itoa(port))) {
-				logWarn("[SERVER-UDP] Blocked local target (server-block-local): %s:%d", host, port)
-				continue
+			var raddr *net.UDPAddr
+			if rawIP != nil {
+				if cfg.ServerBlockLocal && isLocalIP(net.IP(rawIP)) {
+					logWarn("[SERVER-UDP] Blocked local target (server-block-local)")
+					continue
+				}
+				raddr = addrCache.getIP(rawIP, port)
+			} else {
+				if cfg.ServerBlockLocal && isLocalTarget(host) {
+					logWarn("[SERVER-UDP] Blocked local target (server-block-local): %s:%d", host, port)
+					continue
+				}
+				raddr = addrCache.get(host, port, cfg.Resolver)
+				if raddr != nil && cfg.ServerBlockLocal && raddr.IP != nil && isLocalIP(raddr.IP) {
+					logWarn("[SERVER-UDP] Blocked local resolved IP")
+					continue
+				}
 			}
-
-			raddr := addrCache.get(host, port, cfg.Resolver)
 			if raddr == nil {
 				logDebug("[SERVER-UDP] ResolveUDPAddr %s:%d failed", host, port)
-				continue
-			}
-			if cfg.ServerBlockLocal && raddr.IP != nil && isLocalTarget(raddr.IP.String()) {
-				logWarn("[SERVER-UDP] Blocked local resolved IP: %s", raddr.IP.String())
 				continue
 			}
 
@@ -6539,8 +6701,15 @@ func handleServerUDP(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 	<-errCh
 }
 
+func isLocalIP(ip net.IP) bool {
+	if len(ip) == 0 {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified()
+}
+
 func isLocalTarget(host string) bool {
-	clean := strings.TrimSuffix(strings.Trim( strings.TrimSpace(host), "[]" ), ".")
+	clean := strings.TrimSuffix(strings.Trim(strings.TrimSpace(host), "[]"), ".")
 	if strings.EqualFold(clean, "localhost") || (len(clean) > 10 && strings.EqualFold(clean[len(clean)-10:], ".localhost")) {
 		return true
 	}
@@ -6548,7 +6717,7 @@ func isLocalTarget(host string) bool {
 	if ip == nil {
 		return false
 	}
-	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified()
+	return isLocalIP(ip)
 }
 
 // clientUDPDatagramBlocked parses the target host from a SOCKS5 UDP header and
@@ -6565,7 +6734,7 @@ func clientUDPDatagramBlocked(cfg *Config, pkt []byte) bool {
 		if len(pkt) < 10 {
 			return true
 		}
-		return isLocalTarget(net.IP(pkt[4:8]).String())
+		return isLocalIP(net.IP(pkt[4:8]))
 	case 0x03:
 		dlen := int(pkt[4])
 		if len(pkt) < 5+dlen+2 {
@@ -6576,7 +6745,7 @@ func clientUDPDatagramBlocked(cfg *Config, pkt []byte) bool {
 		if len(pkt) < 22 {
 			return true
 		}
-		return isLocalTarget(net.IP(pkt[4:20]).String())
+		return isLocalIP(net.IP(pkt[4:20]))
 	default:
 		return true
 	}
@@ -7192,7 +7361,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 	if initialPayload != nil {
 		outInitial := initialPayload
 		if rc := relayCrypto(cfg); rc != nil {
-			outInitial = rc.sealFrame( append([]byte(nil), initialPayload...) )
+			outInitial = rc.sealFrame(append([]byte(nil), initialPayload...))
 		}
 		if err := writeWSFrame(wsConn, outInitial, 0x2, true); err != nil {
 			return
@@ -7214,6 +7383,11 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		bPtr := cfg.BufPool.Get().(*[]byte)
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
+		rc := relayCrypto(cfg)
+		readEnd := len(buf)
+		if rc != nil {
+			readEnd -= aeadOverhead
+		}
 		prng := maskPool.Get().(*maskPRNG)
 		defer maskPool.Put(prng)
 		var lastDeadline time.Time
@@ -7227,7 +7401,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 					localUp = 0
 				}
 			}
-			nr, errRead := localConn.Read(buf[14:])
+			nr, errRead := localConn.Read(buf[14:readEnd])
 			if errRead != nil {
 				if localUp > 0 {
 					stats.AddBytes(localUp, 0)
@@ -7239,7 +7413,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 			// Client->server frames are masked; AEAD mode seals the
 			// payload in place first (legacy XOR ships relay payloads as-is).
 			wireLen := nr
-			if rc := relayCrypto(cfg); rc != nil && nr > 0 {
+			if rc != nil && nr > 0 {
 				wireLen = rc.SealRegion(buf[14:], nr)
 			}
 			refreshWriteDeadline(wsConn, writeTimeout, &lastWriteSet)
@@ -7295,6 +7469,9 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		}
 	}()
 
+	<-errCh
+	_ = localConn.Close()
+	_ = wsConn.Close()
 	<-errCh
 }
 
@@ -7609,6 +7786,12 @@ func handleQUICStream(stream quic.Stream, cfg *Config) {
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
 		var lastWriteSet time.Time
+		var localUp int64
+		defer func() {
+			if localUp > 0 {
+				stats.AddBytes(localUp, 0)
+			}
+		}()
 		for {
 			nr, errRead := br.Read(buf)
 			if nr > 0 {
@@ -7617,7 +7800,11 @@ func handleQUICStream(stream quic.Stream, cfg *Config) {
 					errCh <- errWrite
 					return
 				}
-				stats.AddBytes(int64(nr), 0)
+				localUp += int64(nr)
+				if localUp >= 256*1024 {
+					stats.AddBytes(localUp, 0)
+					localUp = 0
+				}
 			}
 			if errRead != nil {
 				if tc, ok := targetConn.(*net.TCPConn); ok {
@@ -7639,6 +7826,12 @@ func handleQUICStream(stream quic.Stream, cfg *Config) {
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
 		var lastWriteSet time.Time
+		var localDown int64
+		defer func() {
+			if localDown > 0 {
+				stats.AddBytes(0, localDown)
+			}
+		}()
 		for {
 			nr, errRead := targetConn.Read(buf)
 			if nr > 0 {
@@ -7647,7 +7840,11 @@ func handleQUICStream(stream quic.Stream, cfg *Config) {
 					errCh <- errWrite
 					return
 				}
-				stats.AddBytes(0, int64(nr))
+				localDown += int64(nr)
+				if localDown >= 256*1024 {
+					stats.AddBytes(0, localDown)
+					localDown = 0
+				}
 			}
 			if errRead != nil {
 				if errRead == io.EOF {
@@ -7723,9 +7920,10 @@ func handleQUICServerUDP(stream quic.Stream, br *bufio.Reader, cfg *Config) {
 			}
 			atyp := data[3]
 			var host string
+			var rawIP []byte
 			var offset int
 			if atyp == 0x01 {
-				host = net.IP(data[4:8]).String()
+				rawIP = data[4:8]
 				offset = 8
 			} else if atyp == 0x03 {
 				nameLen := int(data[4])
@@ -7738,7 +7936,7 @@ func handleQUICServerUDP(stream quic.Stream, br *bufio.Reader, cfg *Config) {
 				if len(data) < 22 {
 					continue
 				}
-				host = net.IP(data[4:20]).String()
+				rawIP = data[4:20]
 				offset = 20
 			} else {
 				continue
@@ -7749,17 +7947,25 @@ func handleQUICServerUDP(stream quic.Stream, br *bufio.Reader, cfg *Config) {
 			port := int(binary.BigEndian.Uint16(data[offset : offset+2]))
 			payload := data[offset+2:]
 
-			if serverTargetBlocked(cfg, net.JoinHostPort(host, strconv.Itoa(port))) {
-				logWarn("[SERVER-UDP] Blocked local target (server-block-local): %s:%d", host, port)
-				continue
+			var raddr *net.UDPAddr
+			if rawIP != nil {
+				if cfg.ServerBlockLocal && isLocalIP(net.IP(rawIP)) {
+					logWarn("[SERVER-UDP] Blocked local target (server-block-local)")
+					continue
+				}
+				raddr = addrCache.getIP(rawIP, port)
+			} else {
+				if cfg.ServerBlockLocal && isLocalTarget(host) {
+					logWarn("[SERVER-UDP] Blocked local target (server-block-local): %s:%d", host, port)
+					continue
+				}
+				raddr = addrCache.get(host, port, cfg.Resolver)
+				if raddr != nil && cfg.ServerBlockLocal && raddr.IP != nil && isLocalIP(raddr.IP) {
+					logWarn("[QUIC-UDP] Blocked local resolved IP")
+					continue
+				}
 			}
-
-			raddr := addrCache.get(host, port, cfg.Resolver)
 			if raddr == nil {
-				continue
-			}
-			if cfg.ServerBlockLocal && raddr.IP != nil && isLocalTarget(raddr.IP.String()) {
-				logWarn("[QUIC-UDP] Blocked local resolved IP: %s", raddr.IP.String())
 				continue
 			}
 			if errWrite := wb.queueWrite(payload, raddr); errWrite != nil {
@@ -8143,6 +8349,12 @@ func relayQUICClient(localConn net.Conn, ver byte, initialPayload []byte, target
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
 		var lastWriteSet time.Time
+		var localUp int64
+		defer func() {
+			if localUp > 0 {
+				stats.AddBytes(localUp, 0)
+			}
+		}()
 		for {
 			nr, errRead := localConn.Read(buf)
 			if nr > 0 {
@@ -8151,7 +8363,11 @@ func relayQUICClient(localConn net.Conn, ver byte, initialPayload []byte, target
 					errCh <- errWrite
 					return
 				}
-				stats.AddBytes(int64(nr), 0)
+				localUp += int64(nr)
+				if localUp >= 256*1024 {
+					stats.AddBytes(localUp, 0)
+					localUp = 0
+				}
 			}
 			if errRead != nil {
 				if errRead == io.EOF {
@@ -8171,6 +8387,12 @@ func relayQUICClient(localConn net.Conn, ver byte, initialPayload []byte, target
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
 		var lastWriteSet time.Time
+		var localDown int64
+		defer func() {
+			if localDown > 0 {
+				stats.AddBytes(0, localDown)
+			}
+		}()
 		for {
 			nr, errRead := br.Read(buf)
 			if nr > 0 {
@@ -8179,12 +8401,19 @@ func relayQUICClient(localConn net.Conn, ver byte, initialPayload []byte, target
 					errCh <- errWrite
 					return
 				}
-				stats.AddBytes(0, int64(nr))
+				localDown += int64(nr)
+				if localDown >= 256*1024 {
+					stats.AddBytes(0, localDown)
+					localDown = 0
+				}
 			}
 			if errRead != nil {
 				if errRead == io.EOF {
 					if tc, ok := localConn.(*net.TCPConn); ok {
 						_ = tc.CloseWrite()
+					}
+					if cfg.ConnTimeout > 0 {
+						_ = localConn.SetReadDeadline(time.Now().Add(time.Duration(cfg.ConnTimeout) * time.Second))
 					}
 					errCh <- nil
 				} else {

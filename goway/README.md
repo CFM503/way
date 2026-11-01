@@ -1,4 +1,4 @@
-# GOWAY v1.8.30
+# GOWAY v1.8.31
 
 GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具，支持 HTTP 和完整 SOCKS5 (TCP + UDP) 协议，具备浏览器指纹伪装、0-RTT 多路复用 (Mux)、QUIC 弱网抗丢包传输、Cloudflare CDN 边缘接入与 PGO 机器码级性能优化。
 
@@ -7,6 +7,21 @@ GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具�
 > 接手本项目的 AI 必须先读 `goway/AI_HANDOFF.md` 顶部同名规则并原样保留；每个性能改动必须在 `AI_HANDOFF.md` 记录前后数据，**没有数据不算完成**。
 
 ## 版本历史
+
+### v1.8.31 (2026-11-01) - MUX 慢路径按需惰性分配、UDP 零分配缓存与本地检测、流量统计批量聚合及全链路健壮性加固
+
+#### 核心优化与协议加固
+
+| 优化/修复项 | 说明 | 收益与特性 |
+|---|---|---|
+| **MUX 慢路径队列与投递协程惰性按需初始化** | `MuxStream` 与 `MuxServerStream` 创建时不再预分配 1024 槽位 `ingress` 通道（~32KiB/流）及启动 `deliveryLoop` 协程，仅在流出现背压回退时按需初始化 | **常规快路径单流创建内存分配从 `74,640 B/op` 降至 `41,776 B/op`（下降 44%），双端每条流少启动 1 个常驻协程** |
+| **UDP IP 快路径零分配缓存与本地 IP 直接判定** | 新增 `isLocalIP(net.IP)` 与基于值类型键的 `udpAddrCache.getIP(rawIP, port)`，跳过 IPv4/IPv6 字面量的数据报 `fmt.Sprintf`/`net.JoinHostPort` 字符串拼接 | **客户端与服务端 UDP 数据报地址解析及内网拦截实现 `0 B/op, 0 allocs/op`（`32.3 ns/op`），彻底消除高频 UDP GC 压力** |
+| **转发热路径 `stats.AddBytes` 批量原子累加** | 在 `relayMuxClient`、`handleNewStream`、`handleQUICStream` 与 `relayQUICClient` 中按 256KiB 阈值及退出 `defer` 批量刷新流量统计 | **消除高并发转发下多核对全局 `Stats` 原子计数器的每帧 Cache-line 争用** |
+| **服务端 WebSocket 认证目标结构化校验（`validateServerAuthTarget`）** | 对解密后的首包目标执行 ASCII 可打印校验、可选密钥前缀常量时间比对及 `"MUX"`/`"UDP"`/`host:port` 合法性验证 | **彻底阻断错误密钥 XOR 解密乱码或恶意探测触发无效 DNS 解析与外网 TCP 拨号** |
+| **1:1 非 MUX AEAD 满缓冲边界保护与双端资源确定性回收** | 修正 `handleServer`/`handleClient` 在 `-cipher=aead` 下读取上界预留 `aeadOverhead`，并在单向结束时双端关闭排空协程；`relayQUICClient` 半关闭追加 `SetReadDeadline` | **根除 1:1 AEAD 满帧 `SealRegion` 越界 panic 与对端挂起导致的 `BufPool` 缓冲悬空** |
+| **服务端 `MuxCmdRST` 发送队列即时清理与无锁 PRNG 统一** | 服务端收到 `MuxCmdRST` 时同步调用 `writer.dropStream(streamID)` 释放待发缓冲；握手路径全面改用池化无锁 `maskPRNG` | **杜绝异常断流积压发送缓冲，彻底移除 `goway.go` 中残余全局 `math/rand` 锁竞争；合并全部测试文件至单一 `goway_test.go`** |
+
+---
 
 ### v1.8.30 (2026-10-19) - 服务端默认开启内网与回环拦截、UDP 全链路本地防御强化与 DNS 重绑定根除
 

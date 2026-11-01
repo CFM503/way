@@ -4,14 +4,18 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
 	"os/exec"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2812,4 +2816,1137 @@ func TestMuxOutboundWriterWriteDeadline(t *testing.T) {
 			time.Sleep(120 * time.Millisecond) // 15 * 120ms = 1.8s > 700ms timeout
 		}
 	})
+}
+
+// --- Consolidated from goway_2000_test.go ---
+
+// Test2000MuxClientPoolReservation tests 2,000 concurrent stream reservations
+// and releases across MuxClientPool sessions, verifying least-active scheduling,
+// atomic activeStreams consistency, and 100% clean recovery to zero.
+func Test2000MuxClientPoolReservation(t *testing.T) {
+	bufPool := &sync.Pool{
+		New: func() interface{} {
+			b := make([]byte, 32*1024)
+			return &b
+		},
+	}
+	cfg := &Config{ConnTimeout: 5, BufPool: bufPool}
+	numSessions := 8
+	pool := NewMuxClientPool(cfg, numSessions)
+	defer pool.Close()
+
+	sessions := make([]*MuxClientSession, numSessions)
+	for i := 0; i < numSessions; i++ {
+		pipeR, pipeW := net.Pipe()
+		go io.Copy(io.Discard, pipeR)
+		sessions[i] = &MuxClientSession{
+			wsConn:  pipeW,
+			closed:  make(chan struct{}),
+			streams: make(map[uint32]*MuxStream),
+			prng:    maskPool.Get().(*maskPRNG),
+			cfg:     cfg,
+		}
+	}
+	pool.sessions = sessions
+
+	const totalConcurrency = 2000
+	var wg sync.WaitGroup
+	wg.Add(totalConcurrency)
+
+	start := time.Now()
+	var successCount int64
+
+	for i := 0; i < totalConcurrency; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			sess, err := pool.GetSession()
+			if err != nil {
+				t.Errorf("GetSession failed for idx %d: %v", idx, err)
+				return
+			}
+			atomic.AddInt64(&successCount, 1)
+
+			st := newMuxStream(uint32(idx+1), sess)
+			st.onClose = func() {
+				sess.decrementActiveStreams()
+			}
+			sess.streamsMu.Lock()
+			sess.streams[st.id] = st
+			sess.streamsMu.Unlock()
+
+			// Jitter sleep 1-5ms to simulate concurrent in-flight streams
+			time.Sleep(time.Duration(mrand.Intn(4)+1) * time.Millisecond)
+
+			st.Close()
+		}(i)
+	}
+
+	wg.Wait()
+	duration := time.Since(start)
+
+	if successCount != totalConcurrency {
+		t.Fatalf("Expected %d successful reservations, got %d", totalConcurrency, successCount)
+	}
+
+	for i, s := range sessions {
+		active := s.ActiveStreams()
+		if active != 0 {
+			t.Fatalf("Session %d activeStreams did not return to 0, got %d", i, active)
+		}
+	}
+
+	t.Logf("[PASS] 2000 Concurrent MUX Stream Reservations completed in %v (QPS: %.0f/s)",
+		duration, float64(totalConcurrency)/duration.Seconds())
+}
+
+// Test2000MuxServerStreamsLifecycle tests 2,000 concurrent MuxServerStream
+// creations, targetConn associations, data pushes, and concurrent closes.
+func Test2000MuxServerStreamsLifecycle(t *testing.T) {
+	const totalStreams = 2000
+	streams := make([]*MuxServerStream, totalStreams)
+	for i := range streams {
+		streams[i] = newMuxServerStream(uint32(i+1), nil)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(totalStreams)
+
+	start := time.Now()
+	for _, st := range streams {
+		go func(s *MuxServerStream) {
+			defer wg.Done()
+
+			// Simulate target connection binding
+			pipeR, pipeW := net.Pipe()
+			defer pipeR.Close()
+
+			if s.setTargetConn(pipeW) {
+				_ = s.targetConnSnapshot()
+			}
+
+			// Simulate concurrency close
+			s.Close()
+		}(st)
+	}
+
+	wg.Wait()
+	duration := time.Since(start)
+
+	t.Logf("[PASS] 2000 Concurrent MuxServerStream Lifecycles completed in %v", duration)
+}
+
+// syncBuffer is a mutex-guarded bytes.Buffer safe for use as exec.Cmd Stderr:
+// Cmd.Start spawns an internal io.Copy goroutine that keeps writing to Stderr
+// until the child process exits, while the benchmark report below reads the
+// buffer via String() before the Kill/Wait defers run. A plain bytes.Buffer
+// races there (race detector failure in CI); all accesses take the lock.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// Test2000ConcurrentEndToEndSOCKS5 launches real Goway Server + Client subprocesses
+// and runs 2,000 concurrent SOCKS5 proxy connections with payload echo verification.
+func Test2000ConcurrentEndToEndSOCKS5(t *testing.T) {
+	// 1. Target Echo Server
+	targetListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Echo server fail: %v", err)
+	}
+	defer targetListener.Close()
+	targetPort := targetListener.Addr().(*net.TCPAddr).Port
+
+	go func() {
+		for {
+			c, err := targetListener.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+
+	binPath := testBinaryForSubprocess(t)
+
+	// 2. Start GOWAY Server (allow 5000 conns)
+	serverPort := 38980
+	serverCmd := exec.Command(binPath,
+		"-p", fmt.Sprintf("127.0.0.1:%d", serverPort),
+		"-k", "stressKey2000",
+		"-max-conn", "5000",
+		"-no-server-block-local",
+		"-log", "WARN",
+	)
+	var serverStderr syncBuffer
+	serverCmd.Stderr = &serverStderr
+	if err := serverCmd.Start(); err != nil {
+		t.Fatalf("Server start fail: %v", err)
+	}
+	defer func() {
+		_ = serverCmd.Process.Kill()
+		_ = serverCmd.Wait()
+	}()
+
+	time.Sleep(600 * time.Millisecond)
+
+	// 3. Start GOWAY Client (allow 5000 conns, 8 mux sessions)
+	clientPort := 31980
+	clientCmd := exec.Command(binPath,
+		"-p", fmt.Sprintf("127.0.0.1:%d", clientPort),
+		"-up", fmt.Sprintf("ws://127.0.0.1:%d", serverPort),
+		"-k", "stressKey2000",
+		"-max-conn", "5000",
+		"-mux=true",
+		"-mux-sessions", "8",
+		"-block-local=false",
+		"-log", "WARN",
+	)
+	var clientStderr syncBuffer
+	clientCmd.Stderr = &clientStderr
+	if err := clientCmd.Start(); err != nil {
+		t.Fatalf("Client start fail: %v", err)
+	}
+	defer func() {
+		_ = clientCmd.Process.Kill()
+		_ = clientCmd.Wait()
+	}()
+
+	time.Sleep(1000 * time.Millisecond)
+
+	// --- Warmup: send 5 sequential requests to establish initial Mux sessions ---
+	for w := 0; w < 5; w++ {
+		wConn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", clientPort), 3*time.Second)
+		if err == nil {
+			_, _ = wConn.Write([]byte{0x05, 0x01, 0x00})
+			var hs [2]byte
+			_, _ = io.ReadFull(wConn, hs[:])
+			req := []byte{0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, byte(targetPort >> 8), byte(targetPort & 0xFF)}
+			_, _ = wConn.Write(req)
+			var cr [10]byte
+			_, _ = io.ReadFull(wConn, cr[:])
+			_, _ = wConn.Write([]byte("warmup"))
+			var echo [6]byte
+			_, _ = io.ReadFull(wConn, echo[:])
+			_ = wConn.Close()
+		}
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	const totalConns = 2000
+	t.Logf("[TEST-2000] Launching %d concurrent SOCKS5 connections through live Goway proxy...", totalConns)
+
+	var (
+		wg                 sync.WaitGroup
+		successCnt         int64
+		dialFailCnt        int64
+		handshakeFailCnt   int64
+		connectRespFailCnt int64
+		payloadFailCnt     int64
+		latencies          = make([]time.Duration, 0, totalConns)
+		latMu              sync.Mutex
+		lastErrStr         string
+		lastErrMu          sync.Mutex
+	)
+
+	setLastErr := func(msg string) {
+		lastErrMu.Lock()
+		if lastErrStr == "" {
+			lastErrStr = msg
+		}
+		lastErrMu.Unlock()
+	}
+
+	wg.Add(totalConns)
+	startAll := time.Now()
+
+	for i := 0; i < totalConns; i++ {
+		// Stagger connection start by 250 microseconds to avoid Windows backlog overflow
+		time.Sleep(250 * time.Microsecond)
+		go func(id int) {
+			defer wg.Done()
+			reqStart := time.Now()
+
+			var conn net.Conn
+			var dialErr error
+			for attempt := 0; attempt < 8; attempt++ {
+				conn, dialErr = net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", clientPort), 8*time.Second)
+				if dialErr == nil {
+					break
+				}
+				time.Sleep(time.Duration(15+attempt*20) * time.Millisecond)
+			}
+			if conn == nil {
+				atomic.AddInt64(&dialFailCnt, 1)
+				setLastErr(fmt.Sprintf("dial fail: %v", dialErr))
+				return
+			}
+			defer conn.Close()
+
+			_ = conn.SetDeadline(time.Now().Add(25 * time.Second))
+
+			// SOCKS5 handshake (NO AUTH)
+			if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+				atomic.AddInt64(&handshakeFailCnt, 1)
+				setLastErr(fmt.Sprintf("handshake write fail: %v", err))
+				return
+			}
+			var hs [2]byte
+			if _, err := io.ReadFull(conn, hs[:]); err != nil || hs[1] != 0x00 {
+				atomic.AddInt64(&handshakeFailCnt, 1)
+				setLastErr(fmt.Sprintf("handshake read fail: %v, resp: %v", err, hs))
+				return
+			}
+
+			// SOCKS5 CONNECT to targetPort
+			req := []byte{0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, byte(targetPort >> 8), byte(targetPort & 0xFF)}
+			if _, err := conn.Write(req); err != nil {
+				atomic.AddInt64(&connectRespFailCnt, 1)
+				setLastErr(fmt.Sprintf("connect write fail: %v", err))
+				return
+			}
+			var cr [10]byte
+			if _, err := io.ReadFull(conn, cr[:]); err != nil || cr[1] != 0x00 {
+				atomic.AddInt64(&connectRespFailCnt, 1)
+				setLastErr(fmt.Sprintf("connect resp fail: %v, rep: %v", err, cr))
+				return
+			}
+
+			// Send distinct 2KB payload with ID header
+			payload := bytes.Repeat([]byte{byte(id%251 + 1)}, 2048)
+			if _, err := conn.Write(payload); err != nil {
+				atomic.AddInt64(&payloadFailCnt, 1)
+				setLastErr(fmt.Sprintf("payload write fail: %v", err))
+				return
+			}
+
+			echo := make([]byte, len(payload))
+			if _, err := io.ReadFull(conn, echo); err != nil || !bytes.Equal(echo, payload) {
+				atomic.AddInt64(&payloadFailCnt, 1)
+				setLastErr(fmt.Sprintf("echo read fail: %v", err))
+				return
+			}
+
+			reqDuration := time.Since(reqStart)
+			atomic.AddInt64(&successCnt, 1)
+
+			latMu.Lock()
+			latencies = append(latencies, reqDuration)
+			latMu.Unlock()
+		}(i)
+	}
+
+	wg.Wait()
+	totalDuration := time.Since(startAll)
+
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	latMu.Lock()
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	n := len(latencies)
+
+	var minLat, maxLat, avgLat, p50, p90, p95, p99 time.Duration
+	if n > 0 {
+		minLat = latencies[0]
+		maxLat = latencies[n-1]
+		p50 = latencies[int(float64(n)*0.50)]
+		p90 = latencies[int(float64(n)*0.90)]
+		p95 = latencies[int(float64(n)*0.95)]
+		p99 = latencies[int(float64(n)*0.99)]
+
+		var sum time.Duration
+		for _, d := range latencies {
+			sum += d
+		}
+		avgLat = sum / time.Duration(n)
+	}
+	latMu.Unlock()
+
+	qps := float64(successCnt) / totalDuration.Seconds()
+	successRate := float64(successCnt) / float64(totalConns) * 100
+	totalFails := dialFailCnt + handshakeFailCnt + connectRespFailCnt + payloadFailCnt
+
+	t.Logf("\n================ 2000 CONCURRENCY BENCHMARK REPORT ================\n"+
+		"Total Requests:       %d\n"+
+		"Successful:           %d (%.2f%%)\n"+
+		"Failed:               %d (Dial: %d, Handshake: %d, Connect: %d, Payload: %d)\n"+
+		"Last Error:           %s\n"+
+		"Server Stderr:        %s\n"+
+		"Client Stderr:        %s\n"+
+		"Total Duration:       %v\n"+
+		"Throughput (QPS):     %.2f req/s\n"+
+		"Latency Min:          %v\n"+
+		"Latency Avg:          %v\n"+
+		"Latency P50:          %v\n"+
+		"Latency P90:          %v\n"+
+		"Latency P95:          %v\n"+
+		"Latency P99:          %v\n"+
+		"Latency Max:          %v\n"+
+		"Memory Alloc:         %.2f MB\n"+
+		"Total Alloc:          %.2f MB\n"+
+		"Heap Inuse:           %.2f MB\n"+
+		"GC Cycles:            %d\n"+
+		"===================================================================",
+		totalConns, successCnt, successRate, totalFails,
+		dialFailCnt, handshakeFailCnt, connectRespFailCnt, payloadFailCnt,
+		lastErrStr, serverStderr.String(), clientStderr.String(),
+		totalDuration, qps,
+		minLat, avgLat, p50, p90, p95, p99, maxLat,
+		float64(m.Alloc)/1024/1024, float64(m.TotalAlloc)/1024/1024,
+		float64(m.HeapInuse)/1024/1024, m.NumGC,
+	)
+
+	if successRate < 95.0 {
+		t.Fatalf("Success rate %.2f%% below threshold 95.0%% under 2000 concurrency", successRate)
+	}
+}
+
+// --- Consolidated from goway_bugfix_test.go ---
+
+// runWithin fails the test if fn does not return within d (deadlock guard).
+func runWithin(t *testing.T, d time.Duration, what string, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fn()
+	}()
+	select {
+	case <-done:
+	case <-time.After(d):
+		t.Fatalf("%s: did not return within %v (deadlock)", what, d)
+	}
+}
+
+func TestMuxStreamIngressOverflowDoesNotDeadlock(t *testing.T) {
+	s := newMuxStream(11, &reorderMockSession{})
+	defer s.Close()
+
+	rejected := false
+	runWithin(t, 5*time.Second, "client enqueueDataFrame overflow", func() {
+		// readChan (AppQueue) + ingress (IngressQueue) + 1 stalled in
+		// PushDataFrame; the next frame must overflow and Reset.
+		for i := 0; i < muxStreamAppQueue+muxStreamIngressQueue+16; i++ {
+			if !s.enqueueDataFrame(muxDataFrame{data: []byte{byte(i)}}) {
+				rejected = true
+				return
+			}
+			if i == muxStreamAppQueue {
+				// let deliveryLoop pick a frame and stall on full readChan
+				time.Sleep(20 * time.Millisecond)
+			}
+		}
+	})
+	if !rejected {
+		t.Fatalf("expected ingress overflow to reject a frame")
+	}
+	select {
+	case <-s.closed:
+	default:
+		t.Fatalf("stream should be reset after ingress overflow")
+	}
+}
+
+func TestMuxServerStreamIngressOverflowDoesNotDeadlock(t *testing.T) {
+	sess := &MuxServerSession{streams: make(map[uint32]*MuxServerStream), closed: make(chan struct{})}
+	s := newMuxServerStream(13, sess)
+	defer s.Close()
+
+	rejected := false
+	runWithin(t, 5*time.Second, "server enqueueDataFrame overflow", func() {
+		for i := 0; i < muxStreamAppQueue+muxStreamIngressQueue+16; i++ {
+			if !s.enqueueDataFrame(muxDataFrame{data: []byte{byte(i)}}) {
+				rejected = true
+				return
+			}
+			if i == muxStreamAppQueue {
+				time.Sleep(20 * time.Millisecond)
+			}
+		}
+	})
+	if !rejected {
+		t.Fatalf("expected ingress overflow to reject a frame")
+	}
+	select {
+	case <-s.closed:
+	default:
+		t.Fatalf("stream should be closed after ingress overflow")
+	}
+}
+
+func TestMuxStreamQueuedFINDoesNotTruncateTail(t *testing.T) {
+	s := newMuxStream(15, &reorderMockSession{})
+	defer s.Close()
+
+	// Fill readChan so later frames take the ingress (slow) path.
+	for i := 0; i < muxStreamAppQueue; i++ {
+		if !s.enqueueDataFrame(muxDataFrame{data: []byte{0xCC}}) {
+			t.Fatalf("fill frame %d rejected", i)
+		}
+	}
+	if !s.enqueueDataFrame(muxDataFrame{data: []byte{0xDD}}) { // tail data
+		t.Fatalf("tail frame rejected")
+	}
+	if !s.enqueueDataFrame(muxDataFrame{data: nil}) { // FIN behind it
+		t.Fatalf("FIN rejected")
+	}
+	if s.readClosed.Load() {
+		t.Fatalf("readClosed set while FIN still queued behind undelivered data")
+	}
+
+	got := make([]byte, 0, muxStreamAppQueue+1)
+	buf := make([]byte, 64)
+	runWithin(t, 5*time.Second, "drain stream", func() {
+		for {
+			n, err := s.Read(buf)
+			got = append(got, buf[:n]...)
+			if err == io.EOF {
+				return
+			}
+			if err != nil {
+				t.Errorf("unexpected read error: %v", err)
+				return
+			}
+		}
+	})
+	if len(got) != muxStreamAppQueue+1 || got[len(got)-1] != 0xDD {
+		t.Fatalf("tail truncated: got %d bytes (want %d), last=0x%X", len(got), muxStreamAppQueue+1, got[len(got)-1])
+	}
+	// EOF must be sticky.
+	if n, err := s.Read(buf); n != 0 || err != io.EOF {
+		t.Fatalf("second Read after EOF: n=%d err=%v", n, err)
+	}
+}
+
+func TestValidateServerAuthTarget(t *testing.T) {
+	validCases := []struct {
+		in   []byte
+		key  string
+		want string
+	}{
+		{[]byte("MUX\n"), "k", "MUX"},
+		{[]byte("UDP\n"), "k", "UDP"},
+		{[]byte("example.com:443\n"), "k", "example.com:443"},
+		{[]byte("[::1]:8080\n"), "", "[::1]:8080"},
+		{[]byte("mysecret example.com:443\n"), "mysecret", "example.com:443"},
+		{[]byte("mysecret MUX\n"), "mysecret", "MUX"},
+	}
+	for _, tc := range validCases {
+		got, ok := validateServerAuthTarget(tc.in, tc.key)
+		if !ok || got != tc.want {
+			t.Fatalf("validateServerAuthTarget(%q, %q) = (%q, %v), want (%q, true)", tc.in, tc.key, got, ok, tc.want)
+		}
+	}
+
+	// Wrong-key XOR decryption produces non-printable or non-host:port garbage.
+	cRight := NewCrypto("correct-server-key")
+	cWrong := NewCrypto("wrong-client-key")
+	wire := []byte("MUX\n")
+	cWrong.TransformInPlace(wire)
+	cRight.TransformInPlace(wire) // decrypted with server key
+
+	invalidCases := [][]byte{
+		nil,
+		[]byte(""),
+		[]byte("   \r\n"),
+		wire,
+		[]byte("garbage_without_port\n"),
+		[]byte("example.com:0\n"),
+		[]byte("example.com:70000\n"),
+		[]byte(":443\n"),
+		[]byte("example.com:443\x00\n"),
+		bytes.Repeat([]byte("a"), 513),
+	}
+	for _, in := range invalidCases {
+		if got, ok := validateServerAuthTarget(in, "correct-server-key"); ok {
+			t.Fatalf("validateServerAuthTarget(%q) unexpectedly succeeded with %q", in, got)
+		}
+	}
+}
+
+func TestNonMuxAEADFullBufferSealNoPanic(t *testing.T) {
+	rc := NewCryptoMode("aead-full-buf-key", cipherModeAEAD)
+	buf := make([]byte, 4096+14)
+	readEnd := len(buf) - aeadOverhead
+	plainLen := readEnd - 14
+	for i := 0; i < plainLen; i++ {
+		buf[14+i] = byte(i)
+	}
+	wireLen := rc.SealRegion(buf[14:], plainLen)
+	if wireLen != plainLen+aeadOverhead {
+		t.Fatalf("SealRegion wireLen = %d, want %d", wireLen, plainLen+aeadOverhead)
+	}
+	opened, err := rc.OpenRegion(buf[14 : 14+wireLen])
+	if err != nil || len(opened) != plainLen {
+		t.Fatalf("OpenRegion failed: err=%v len=%d", err, len(opened))
+	}
+}
+
+func TestServerMuxRSTDropsQueuedOutboundFrames(t *testing.T) {
+	pool := &sync.Pool{
+		New: func() interface{} {
+			b := make([]byte, 1024)
+			return &b
+		},
+	}
+	w := &muxOutboundWriter{
+		streams: make(map[uint32]*muxStreamQueue),
+		done:    make(chan struct{}),
+	}
+	w.cond = sync.NewCond(&w.mu)
+	bPtr := pool.Get().(*[]byte)
+	if !w.enqueue(muxOutboundFrame{
+		bPtr:       bPtr,
+		pool:       pool,
+		payloadOff: 14,
+		payloadLen: 100,
+		opcode:     0x2,
+		streamID:   77,
+		cmd:        MuxCmdDATA,
+	}) {
+		t.Fatal("enqueue failed")
+	}
+	w.dropStream(77)
+	w.mu.Lock()
+	_, exists := w.streams[77]
+	queued := w.total
+	w.mu.Unlock()
+	if exists || queued != 0 {
+		t.Fatalf("expected stream 77 dropped and queued=0, got exists=%v queued=%d", exists, queued)
+	}
+}
+
+func TestMuxStreamLazyIngressAllocation(t *testing.T) {
+	s := newMuxStream(88, &reorderMockSession{})
+	defer s.Close()
+
+	if s.ingress != nil {
+		t.Fatal("expected ingress to be nil on newly created MuxStream")
+	}
+	if !s.enqueueDataFrame(muxDataFrame{data: []byte("fast-path")}) {
+		t.Fatal("fast-path enqueue failed")
+	}
+	if s.ingress != nil {
+		t.Fatal("expected ingress to remain nil after fast-path enqueue")
+	}
+}
+
+func TestUDPAddrCacheGetIPAndLocalBlock(t *testing.T) {
+	var cache udpAddrCache
+	a1 := cache.getIP([]byte{8, 8, 8, 8}, 53)
+	a2 := cache.getIP([]byte{8, 8, 8, 8}, 53)
+	if a1 == nil || a1 != a2 || a1.Port != 53 || !a1.IP.Equal(net.IPv4(8, 8, 8, 8)) {
+		t.Fatalf("unexpected cached IPv4 UDPAddr: %v vs %v", a1, a2)
+	}
+	cfg := &Config{BlockLocal: true}
+	localPkt := []byte{0, 0, 0, 0x01, 127, 0, 0, 1, 0x00, 0x50, 'x'}
+	pubPkt := []byte{0, 0, 0, 0x01, 8, 8, 8, 8, 0x00, 0x35, 'x'}
+	if !clientUDPDatagramBlocked(cfg, localPkt) {
+		t.Fatal("expected 127.0.0.1 UDP datagram to be blocked")
+	}
+	if clientUDPDatagramBlocked(cfg, pubPkt) {
+		t.Fatal("expected 8.8.8.8 UDP datagram to be allowed")
+	}
+}
+
+func BenchmarkMuxStreamCreateFastPath(b *testing.B) {
+	sess := &reorderMockSession{}
+	frame := muxDataFrame{data: []byte("hello")}
+	buf := make([]byte, 16)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		st := newMuxStream(uint32(i+1), sess)
+		st.enqueueDataFrame(frame)
+		_, _ = st.Read(buf)
+		st.Close()
+	}
+}
+
+func BenchmarkUDPAddrCacheGetIPAndCheck(b *testing.B) {
+	var cache udpAddrCache
+	cfg := &Config{BlockLocal: true, ServerBlockLocal: true}
+	pkt := []byte{0, 0, 0, 0x01, 8, 8, 8, 8, 0x00, 0x35, 'p', 'a', 'y', 'l', 'o', 'a', 'd'}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if clientUDPDatagramBlocked(cfg, pkt) {
+			b.Fatal("unexpected block")
+		}
+		if cache.getIP(pkt[4:8], 53) == nil {
+			b.Fatal("nil addr")
+		}
+	}
+}
+
+// --- Consolidated from goway_fuzz_test.go ---
+
+// Fuzz entry points for wire parsers. Run bounded, e.g.:
+//   go test -fuzz=FuzzWSFrame -fuzztime=120s .
+// These must never panic, hang, or OOM on arbitrary input; any failure is
+// a remotely-triggerable crash (Go panics kill the whole process).
+
+func FuzzWSFrame(f *testing.F) {
+	seeds := [][]byte{
+		{0x82, 0x05, 'h', 'e', 'l', 'l', 'o'},
+		{0x82, 0x85, 0x01, 0x02, 0x03, 0x04, 'h' ^ 0x01, 'e' ^ 0x02, 'l' ^ 0x03, 'l' ^ 0x04, 'o' ^ 0x01},
+		{0x82, 0x7E, 0x00, 0x05, 'h', 'e', 'l', 'l', 'o'},
+		{0x82, 0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 'h', 'e', 'l', 'l', 'o'},
+		{0x89, 0x00},
+		{0x8A, 0x00},
+		{0x88, 0x00},
+		{0x83, 0x01, 'x'},
+		{0x87, 0x01, 'x'},
+		{0x82, 0xFE},
+		{0x82, 0xFF},
+		{0x82},
+		{},
+	}
+	for _, s := range seeds {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		// Cap input: the >64MB length path is already guarded by
+		// MaxWSFrameSize; fuzz the header/payload state machine.
+		if len(data) > 70000 {
+			return
+		}
+		_, _ = readWSFrame(bytes.NewReader(data), io.Discard, nil)
+	})
+}
+
+func FuzzWSFrameInto(f *testing.F) {
+	seeds := [][]byte{
+		{0x82, 0x05, 'h', 'e', 'l', 'l', 'o'},
+		{0x82, 0x85, 0x01, 0x02, 0x03, 0x04, 'h' ^ 0x01, 'e' ^ 0x02, 'l' ^ 0x03, 'l' ^ 0x04, 'o' ^ 0x01},
+		{0x88, 0x00},
+		{},
+	}
+	for _, s := range seeds {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 70000 {
+			return
+		}
+		buf := make([]byte, 70000)
+		_, _ = readWSFrameInto(bytes.NewReader(data), io.Discard, buf, nil)
+	})
+}
+
+func FuzzHTTPHeaders(f *testing.F) {
+	seeds := [][]byte{
+		[]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+		[]byte("GET / HTTP/1.1\r\n"),
+		[]byte("\r\n\r\n"),
+		{},
+		bytes.Repeat([]byte("A"), 9000),
+	}
+	for _, s := range seeds {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 20000 {
+			return
+		}
+		br := bufio.NewReader(bytes.NewReader(data))
+		_, _ = readUntilCRLFCRLF(br)
+	})
+}
+
+// --- Consolidated from goway_reorder_test.go ---
+
+type reorderMockSession struct{}
+
+func (m *reorderMockSession) SendFrame(streamID uint32, cmd byte, payload []byte) error {
+	return nil
+}
+func (m *reorderMockSession) RemoveStream(streamID uint32) {}
+
+const (
+	reorderFillFrames = 144 // 144*65535 = mux*StreamBufferLimit - 144
+	reorderFrameSize  = 65535
+)
+
+// waitQueueDepth polls until the stream's delivery channel holds want
+// frames (with a timeout), so both stalled frames have settled.
+func waitQueueDepth(t *testing.T, depth func() int, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if depth() >= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("queue never reached %d frames (now %d)", want, depth())
+}
+
+// waitIngressDrained waits until deliveryLoop has dequeued everything from
+// ingress (the stalled frame is now inside PushDataFrame's wait).
+func waitIngressDrained(t *testing.T, depth func() int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if depth() == 0 {
+			time.Sleep(50 * time.Millisecond) // let PushDataFrame enter its wait
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("ingress never drained")
+}
+
+func TestMuxStreamFastPathCannotReorderUnderBackpressure(t *testing.T) {
+	s := newMuxStream(7, &reorderMockSession{})
+	defer s.Close()
+
+	fill := bytes.Repeat([]byte{0xCC}, reorderFrameSize)
+	for i := 0; i < reorderFillFrames; i++ {
+		if !s.enqueueDataFrame(muxDataFrame{data: fill}) {
+			t.Fatalf("fill frame %d rejected", i)
+		}
+	}
+
+	big := bytes.Repeat([]byte{0xAA}, reorderFrameSize) // A: misses the budget
+	if !s.enqueueDataFrame(muxDataFrame{data: big}) {
+		t.Fatalf("enqueue A failed")
+	}
+	waitIngressDrained(t, func() int {
+		s.bufMu.Lock()
+		defer s.bufMu.Unlock()
+		return len(s.ingress)
+	})
+
+	small := []byte{0xBB} // B: fits the budget, but must queue behind A
+	if !s.enqueueDataFrame(muxDataFrame{data: small}) {
+		t.Fatalf("enqueue B failed")
+	}
+
+	// Simulate the app consuming one frame: wakes A's stalled PushDataFrame.
+	s.consumedBytes(reorderFrameSize)
+	waitQueueDepth(t, func() int { return len(s.readChan) }, reorderFillFrames+2)
+
+	buf := make([]byte, reorderFrameSize)
+	for i := 0; i < reorderFillFrames; i++ {
+		n, err := s.Read(buf)
+		if err != nil || n != reorderFrameSize || buf[0] != 0xCC {
+			t.Fatalf("fill frame %d: n=%d first=0x%X err=%v", i, n, buf[0], err)
+		}
+	}
+	n, err := s.Read(buf)
+	if err != nil || n != reorderFrameSize || buf[0] != 0xAA {
+		t.Fatalf("REORDER or corruption: expected stalled frame A (0xAA) after fill, got n=%d first=0x%X err=%v", n, buf[0], err)
+	}
+	b := make([]byte, 16)
+	n, err = s.Read(b)
+	if err != nil || n != 1 || b[0] != 0xBB {
+		t.Fatalf("expected frame B (0xBB) last, got n=%d first=0x%X err=%v", n, b[0], err)
+	}
+}
+
+func TestMuxServerStreamFastPathCannotReorderUnderBackpressure(t *testing.T) {
+	sess := &MuxServerSession{streams: make(map[uint32]*MuxServerStream), closed: make(chan struct{})}
+	s := newMuxServerStream(9, sess)
+	defer s.Close()
+
+	fill := bytes.Repeat([]byte{0xCC}, reorderFrameSize)
+	for i := 0; i < reorderFillFrames; i++ {
+		if !s.enqueueDataFrame(muxDataFrame{data: fill}) {
+			t.Fatalf("fill frame %d rejected", i)
+		}
+	}
+
+	big := bytes.Repeat([]byte{0xAA}, reorderFrameSize)
+	if !s.enqueueDataFrame(muxDataFrame{data: big}) {
+		t.Fatalf("enqueue A failed")
+	}
+	waitIngressDrained(t, func() int {
+		s.bufMu.Lock()
+		defer s.bufMu.Unlock()
+		return len(s.ingress)
+	})
+
+	small := []byte{0xBB}
+	if !s.enqueueDataFrame(muxDataFrame{data: small}) {
+		t.Fatalf("enqueue B failed")
+	}
+
+	// Simulate the target pump consuming one frame: wakes A's stalled
+	// PushDataFrame.
+	s.consumedBytes(reorderFrameSize)
+	waitQueueDepth(t, func() int { return len(s.writeChan) }, reorderFillFrames+2)
+
+	expect := func(wantLen int, wantFirst byte, what string) {
+		t.Helper()
+		select {
+		case f := <-s.writeChan:
+			if len(f.data) != wantLen || f.data[0] != wantFirst {
+				t.Fatalf("%s: got len=%d first=0x%X (want len=%d first=0x%X) — REORDER", what, len(f.data), f.data[0], wantLen, wantFirst)
+			}
+			f.release()
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s: no frame on writeChan", what)
+		}
+	}
+	for i := 0; i < reorderFillFrames; i++ {
+		expect(reorderFrameSize, 0xCC, "fill")
+	}
+	expect(reorderFrameSize, 0xAA, "stalled frame A")
+	expect(1, 0xBB, "frame B")
+}
+
+// --- Consolidated from goway_v1816_test.go ---
+
+// --- classifyServerTarget (UDP/MUX exact-match routing) ---
+
+func TestClassifyServerTargetExactMatch(t *testing.T) {
+	cases := []struct {
+		in   string
+		want byte
+	}{
+		{"UDP", 'u'},
+		{"udp", 'u'},
+		{"MUX", 'm'},
+		{"mux", 'm'},
+		{"example.com:443", 't'},
+		{"udp-example.com:443", 't'}, // regressed to 'u' under the old HasPrefix routing
+		{"udpserver:80", 't'},
+		{"mux.dev:443", 't'},
+		{"UDPproxy:80", 't'},
+		{"", 't'},
+	}
+	for _, c := range cases {
+		if got := classifyServerTarget(c.in); got != c.want {
+			t.Errorf("classifyServerTarget(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// --- AEAD seal/open round trip ---
+
+func TestCryptoAEADSealOpenRoundTrip(t *testing.T) {
+	c := NewCryptoMode("aead-test-key", cipherModeAEAD)
+	if c == nil || c.isXOR() {
+		t.Fatalf("expected AEAD-mode crypto")
+	}
+	sizes := []int{0, 1, 7, 12, 16, 17, 100, 4096, 65535, 65536, 70000}
+	for _, n := range sizes {
+		plain := make([]byte, n)
+		for i := range plain {
+			plain[i] = byte(i * 7)
+		}
+		buf := make([]byte, n, n+aeadOverhead)
+		copy(buf, plain)
+		sealed := c.SealRegion(buf, n)
+		if sealed != n+aeadOverhead {
+			t.Fatalf("size %d: sealed len = %d, want %d", n, sealed, n+aeadOverhead)
+		}
+		got, err := c.OpenRegion(buf[:sealed])
+		if err != nil {
+			t.Fatalf("size %d: open: %v", n, err)
+		}
+		if len(got) != n || !bytes.Equal(got, plain) {
+			t.Fatalf("size %d: round trip mismatch (got %d bytes)", n, len(got))
+		}
+	}
+}
+
+func TestCryptoAEADUniqueNoncesAndBitFlip(t *testing.T) {
+	c := NewCryptoMode("aead-test-key", cipherModeAEAD)
+	seen := make(map[string]bool)
+	buf := make([]byte, 32, 32+aeadOverhead)
+	for i := 0; i < 1000; i++ {
+		n := c.SealRegion(buf, 32)
+		nonce := string(buf[:aeadNonceSize])
+		if seen[nonce] {
+			t.Fatalf("nonce reuse at iteration %d", i)
+		}
+		seen[nonce] = true
+		// reset plaintext for the next seal
+		for j := range buf[:32] {
+			buf[j] = 0xAB
+		}
+		_ = n
+	}
+
+	// Tampered ciphertext must fail the open.
+	plain := bytes.Repeat([]byte{0x5A}, 64)
+	region := make([]byte, 64, 64+aeadOverhead)
+	copy(region, plain)
+	sealed := c.SealRegion(region, 64)
+	region[aeadNonceSize] ^= 0x01
+	if _, err := c.OpenRegion(region[:sealed]); err == nil {
+		t.Fatal("expected open failure after ciphertext tampering")
+	}
+}
+
+func TestCryptoXORUnchangedByModePlumbing(t *testing.T) {
+	c := NewCrypto("legacy-key")
+	if c == nil || !c.isXOR() {
+		t.Fatal("NewCrypto must return legacy XOR mode")
+	}
+	region := []byte("hello world")
+	ref := append([]byte(nil), region...)
+	c.TransformInPlace(region)
+	c.TransformInPlace(region)
+	if !bytes.Equal(region, ref) {
+		t.Fatal("XOR transform no longer self-inverting")
+	}
+}
+
+// --- readWSFrameIntoFused AEAD ingress (masked and unmasked) ---
+
+func TestReadWSFrameIntoFusedAEADRoundTrip(t *testing.T) {
+	c := NewCryptoMode("aead-test-key", cipherModeAEAD)
+	plain := []byte("target.example.com:443\n")
+
+	for _, masked := range []bool{true, false} {
+		pr, pw := net.Pipe()
+		sealed := c.sealFrame(plain)
+		go func() {
+			if err := writeWSFrame(pw, sealed, 0x2, masked); err != nil {
+				t.Errorf("writeWSFrame: %v", err)
+			}
+			pw.Close()
+		}()
+		got, err := readWSFrame(pr, nil, c)
+		if err != nil {
+			t.Fatalf("masked=%v: readWSFrame: %v", masked, err)
+		}
+		if !bytes.Equal(got, plain) {
+			t.Fatalf("masked=%v: got %q, want %q", masked, got, plain)
+		}
+	}
+}
+
+// --- okCiphered / sealFrame mode behavior ---
+
+func TestOKCipheredModes(t *testing.T) {
+	if got := okCiphered(nil); !bytes.Equal(got, okBytes) {
+		t.Fatalf("nil crypto: got %q", got)
+	}
+	x := NewCrypto("k")
+	got := okCiphered(x)
+	if bytes.Equal(got, okBytes) {
+		t.Fatal("XOR mode must transform the OK frame")
+	}
+	back := append([]byte(nil), got...)
+	x.TransformInPlace(back)
+	if !bytes.Equal(back, okBytes) {
+		t.Fatalf("XOR OK frame not self-inverting: %q", back)
+	}
+	a := NewCryptoMode("k", cipherModeAEAD)
+	gotA := okCiphered(a)
+	if len(gotA) != len(okBytes)+aeadOverhead {
+		t.Fatalf("AEAD OK frame len = %d, want %d", len(gotA), len(okBytes)+aeadOverhead)
+	}
+	backA, err := a.OpenRegion(gotA)
+	if err != nil || !bytes.Equal(backA, okBytes) {
+		t.Fatalf("AEAD OK frame round trip: %v %q", err, backA)
+	}
+}
+
+// --- QUIC cert pinning ---
+
+func TestQUICCertDeterministicAndPinned(t *testing.T) {
+	pub := pinnedQUICPublicKey("shared-secret")
+	if len(pub) != ed25519.PublicKeySize {
+		t.Fatalf("unexpected pubkey size %d", len(pub))
+	}
+	pub2 := pinnedQUICPublicKey("shared-secret")
+	if !bytes.Equal(pub, pub2) {
+		t.Fatal("key-derived cert must be deterministic")
+	}
+	other := pinnedQUICPublicKey("other-secret")
+	if bytes.Equal(pub, other) {
+		t.Fatal("different keys must derive different certs")
+	}
+
+	// Server cert generated with the key must carry the pinned public key.
+	cert, err := generateSelfSignedCert("shared-secret")
+	if err != nil {
+		t.Fatalf("generateSelfSignedCert: %v", err)
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	pk, ok := leaf.PublicKey.(ed25519.PublicKey)
+	if !ok || !bytes.Equal(pk, pub) {
+		t.Fatal("server cert public key does not match the pinned key")
+	}
+
+	// Without a key: random ECDSA cert (legacy behavior).
+	randCert, err := generateSelfSignedCert("")
+	if err != nil {
+		t.Fatalf("random cert: %v", err)
+	}
+	if _, err := x509.ParseCertificate(randCert.Certificate[0]); err != nil {
+		t.Fatalf("parse random cert: %v", err)
+	}
+}
+
+// --- DNS cache eviction ---
+
+func TestDNSCacheEviction(t *testing.T) {
+	r := NewRemoteResolver("127.0.0.1")
+	r.cacheTTL = time.Minute
+	// Bypass the network: insert directly through the same guard used by Resolve.
+	for i := 0; i < maxDNSCacheEntries+500; i++ {
+		host := "host-" + strconv.Itoa(i) + ".example.com"
+		r.cacheMu.Lock()
+		if len(r.cache) >= maxDNSCacheEntries {
+			r.evictDNSCacheLocked()
+		}
+		r.cache[host] = dnsCacheEntry{ip: "127.0.0.1", expires: time.Now().Add(r.cacheTTL)}
+		r.cacheMu.Unlock()
+	}
+	r.cacheMu.RLock()
+	n := len(r.cache)
+	r.cacheMu.RUnlock()
+	if n > maxDNSCacheEntries {
+		t.Fatalf("cache grew to %d entries, want <= %d", n, maxDNSCacheEntries)
+	}
+}
+
+// --- serverTargetBlocked ---
+
+func TestServerTargetBlocked(t *testing.T) {
+	cfg := &Config{ServerBlockLocal: true}
+	cases := []struct {
+		target string
+		want   bool
+	}{
+		{"127.0.0.1:8080", true},
+		{"[::1]:9090", true},
+		{"192.168.1.10:443", true},
+		{"10.0.0.5:80", true},
+		{"localhost:80", true},
+		{"example.com:443", false},
+		{"8.8.8.8:53", false},
+	}
+	for _, c := range cases {
+		if got := serverTargetBlocked(cfg, c.target); got != c.want {
+			t.Errorf("serverTargetBlocked(%q) = %v, want %v", c.target, got, c.want)
+		}
+	}
+	if serverTargetBlocked(&Config{}, "127.0.0.1:80") {
+		t.Error("flag off must not block")
+	}
 }
