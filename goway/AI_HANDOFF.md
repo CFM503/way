@@ -12,6 +12,18 @@
 - User mandate, 2026-09-23. 违反此规则的改动一律不得合入：只允许正向优化，永远禁止反向优化。
 
 
+## v1.8.33 cycle: MUX v2 Unlimited Throughput Protocol — 23-Bit Jumbo Frames, Multi-MUX Super-Packet Unpacking & 32-Bit Window Extension (2026-11-05)
+
+### Status & Release Summary
+- **Version**: Bumped to `1.8.33` in `goway.go` (`Version = "1.8.33"`), `README.md`, and `AI_HANDOFF.md`.
+- **Core Vectors Shipped**:
+  1. **MUX v2 Protocol Negotiation (`muxProtoVersion = 2`)**: Upgraded advertised MUX protocol version to `2` (100% backward-compatible with `v1` peers in GoWay `<= v1.8.32` and RushWay `<= v0.0.76`). Added `peerVersion` tracking on `MuxClientSession` and `MuxServerSession` so `v2` Jumbo frames are automatically enabled once a `v2` peer's `MuxCmdVERSION` is observed, while remaining clamped to `65535` bytes for `v1` peers.
+  2. **23-Bit Jumbo `MuxCmdDATA` Frame Header (`encodeMuxHeader` / `decodeMuxHeader`)**: Reused bit 7 (`0x80`) of the 1-byte command field in the 7-byte MUX header (`0x80 | byte(wireLen >> 16)` in byte 4, `uint16(wireLen & 0xFFFF)` in bytes 5..7) to encode 23-bit payload lengths up to `maxMuxPayloadV2 = 512 KiB`. Raised the per-read chunk limit (`maxDataChunkLen`) to `maxMuxV2Chunk = 129,600` bytes (exact multiple of 9000B jumbo MTU / 1440B TCP MSS, fitting inside a single 128 KiB `BufPool` slab alongside WS/MUX headers, AEAD overhead, and `-obfs` padding), eliminating the `v1` `65535`-byte frame split and halving per-byte framing and scheduling overhead.
+  3. **Multi-MUX Coalesced Super-Packet Unpacking (`isValidCoalescedMuxTail`)**: Updated `MuxClientSession.readLoop` and `handleServerMux` to detect and unpack multiple concatenated MUX frames inside a single WebSocket binary frame (as emitted by RushWay `v0.0.77`), while preserving zero-copy `BufPool` ownership transfer on the final frame and preventing double-Put races.
+  4. **32-Bit Session Flow-Control Window Extension (`streamID = 0` `MuxCmdWINDOW` & `creditGate.UpgradeWindow`)**: Added support for `streamID = 0` `MuxCmdWINDOW` carrying a 32-bit `uint32` window in KiB (up to `maxMuxV2WindowKiB = 1048576 KiB = 1 GiB`) and raised the `-mux-window` CLI flag limit from `65535` to `1048576` KiB, removing the `v1` 16-bit (`~64 MiB`) BDP ceiling on high-RTT Gigabit/10GbE links.
+  5. **DRR Scheduler Quantum Alignment (`muxDRRQuantum = 144 KiB`)**: Raised `muxDRRQuantum` from `128 KiB` to `144 KiB` so `129.6 KiB` `MUX v2` Jumbo frames (including AEAD tags and `-obfs` padding) always dispatch in a single DRR rotation pass without deficit underflow.
+
+
 ## v1.8.32 cycle: Gigabit BDP Window Upgrade, Zero-Alloc MUX SmallBufPool, Non-Linux UDP Batch Trim, Connection Retry & Timeout Hardening (2026-11-05)
 
 ### Status & Release Summary

@@ -6,6 +6,18 @@ All notable changes to the **Way Proxy** project (Goway & Pyway) are documented 
 
 ---
 
+## [v1.8.33] - 2026-11-05
+
+### MUX v2 协议无上限吞吐升级：23-Bit 巨型帧、多帧超包解包与 32-Bit 流控窗口扩展
+
+- **MUX v2 协议版本协商 (`muxProtoVersion = 2`)**: 升级 MUX 协议版本号至 `2`（与 RushWay `v0.0.77` 完全对齐，并与 GoWay `<= v1.8.32` / RushWay `<= v0.0.76` 的 `v1` 节点保持 100% 向下兼容），自动记录对端协议版本 (`peerVersion`) 并按需启用 `v2` 巨型帧。
+- **23-Bit 巨型数据帧 (`encodeMuxHeader` / `decodeMuxHeader`)**: 当对端支持 `MUX v2` 时，复用 7 字节 MUX 头第 4 字节最高位 `0x80 | (len >> 16)` 组合第 5..7 字节构成 23-bit 载荷长度（上限 `512KiB`），单次读取分片上限提升至 `129,600B`（恰好装入单块 128KiB `BufPool` 缓冲），彻底消除 `v1` 协议 `65535B` 拆帧瓶颈，WebSocket 封包与 XOR/Mask 调度开销减半。
+- **多 MUX 帧合并超包解包 (`isValidCoalescedMuxTail`)**: 客户端 `readLoop` 与服务端 `handleServerMux` 支持在单个 WebSocket Binary 帧中连续解包多个合并的 MUX 帧（兼容 RushWay `v0.0.77` 下行多帧合并超包），同时保障尾帧零拷贝移交与 `BufPool` 安全归还。
+- **32-Bit 无上限会话流控窗口扩展 (`streamID = 0` `MuxCmdWINDOW` & `creditGate.UpgradeWindow`)**: 支持通过 `streamID = 0` 的 `MuxCmdWINDOW` 帧协商最高 `1GiB (1048576 KiB)` 的 32-bit 流控窗口，动态无锁扩容活跃流发送配额，并将 `-mux-window` 命令行上限提升至 `1048576 KiB`。
+- **DRR 公平调度量子对齐 (`muxDRRQuantum = 144KiB`)**: 将 `muxOutboundWriter` 每轮赤字轮询量子从 `128KiB` 提升至 `144KiB`，确保携带 AEAD 标签或 `-obfs` 填充的 `129.6KB` 巨型数据帧单轮直接放行。
+
+---
+
 ## [v1.8.32] - 2026-11-05
 
 ### 千兆网络流控窗口升级、MUX 小帧池化零分配、UDP 批处理零分配优化、连接池透明重试与超时防泄漏加固

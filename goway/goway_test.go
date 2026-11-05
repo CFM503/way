@@ -3946,3 +3946,137 @@ func TestServerTargetBlocked(t *testing.T) {
 		t.Error("flag off must not block")
 	}
 }
+
+// --- MUX v2 Jumbo Frame, Coalesced Super-Packet & 32-Bit Window Tests ---
+
+func TestMuxV2JumboHeaderEncodeDecodeRoundTrip(t *testing.T) {
+	var hdr [MuxHeaderLen]byte
+	for _, length := range []int{0, 1, 65535, 65536, 129600, maxMuxPayloadV2} {
+		encodeMuxHeader(hdr[:], 42, MuxCmdDATA, length)
+		if length <= 65535 {
+			if hdr[4] != MuxCmdDATA {
+				t.Fatalf("len %d: expected classic MuxCmdDATA (0x02), got 0x%02X", length, hdr[4])
+			}
+		} else {
+			if hdr[4]&muxJumboFlag == 0 {
+				t.Fatalf("len %d: expected muxJumboFlag set in byte 4, got 0x%02X", length, hdr[4])
+			}
+		}
+		sid, cmd, gotLen, ok := decodeMuxHeader(hdr[:])
+		if !ok || sid != 42 || cmd != MuxCmdDATA || gotLen != length {
+			t.Fatalf("len %d: decodeMuxHeader = (%d, 0x%02X, %d, %v)", length, sid, cmd, gotLen, ok)
+		}
+	}
+
+	// Oversized (> maxMuxPayloadV2) must be rejected by decodeMuxHeader
+	oversize := maxMuxPayloadV2 + 1
+	hdr[4] = muxJumboFlag | byte((oversize>>16)&0x7F)
+	binary.BigEndian.PutUint16(hdr[5:7], uint16(oversize&0xFFFF))
+	if _, _, _, ok := decodeMuxHeader(hdr[:]); ok {
+		t.Fatal("expected decodeMuxHeader to reject length > maxMuxPayloadV2")
+	}
+}
+
+func TestMuxV2CoalescedSuperPacketUnpack(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	bufSize := maxMuxV2Chunk + 14 + MuxHeaderLen + 64
+	cfg := &Config{
+		ConnTimeout: 5,
+		BufPool: &sync.Pool{
+			New: func() interface{} {
+				b := make([]byte, bufSize)
+				return &b
+			},
+		},
+	}
+	prng := maskPool.Get().(*maskPRNG)
+	sess := &MuxClientSession{
+		wsConn:  c1,
+		br:      bufio.NewReaderSize(c1, 65536),
+		cfg:     cfg,
+		streams: make(map[uint32]*MuxStream),
+		closed:  make(chan struct{}),
+		prng:    prng,
+	}
+	sess.peerVersion.Store(2)
+	sess.writer = newMuxOutboundWriter(c1, prng, nil, true, 5*time.Second)
+	defer sess.Close()
+
+	st := newMuxStream(77, sess)
+	sess.streams[77] = st
+	go sess.readLoop()
+
+	// Build a single WebSocket binary payload containing 3 coalesced MUX frames:
+	// 1) 12,000-byte DATA frame (> muxSmallPayloadCopyLimit)
+	// 2) 1,024-byte DATA frame (<= muxSmallPayloadCopyLimit)
+	// 3) FIN frame
+	p1 := bytes.Repeat([]byte{0xA5}, 12000)
+	p2 := bytes.Repeat([]byte{0x5A}, 1024)
+	super := make([]byte, (MuxHeaderLen+len(p1))+(MuxHeaderLen+len(p2))+MuxHeaderLen)
+	off := 0
+	encodeMuxHeader(super[off:off+MuxHeaderLen], 77, MuxCmdDATA, len(p1))
+	copy(super[off+MuxHeaderLen:], p1)
+	off += MuxHeaderLen + len(p1)
+	encodeMuxHeader(super[off:off+MuxHeaderLen], 77, MuxCmdDATA, len(p2))
+	copy(super[off+MuxHeaderLen:], p2)
+	off += MuxHeaderLen + len(p2)
+	encodeMuxHeader(super[off:off+MuxHeaderLen], 77, MuxCmdFIN, 0)
+
+	if !isValidCoalescedMuxTail(super[MuxHeaderLen+len(p1):]) {
+		t.Fatal("expected valid coalesced MUX tail")
+	}
+
+	if err := writeWSFrame(c2, super, 0x2, false); err != nil {
+		t.Fatalf("writeWSFrame super-packet failed: %v", err)
+	}
+
+	got, err := io.ReadAll(st)
+	if err != nil {
+		t.Fatalf("io.ReadAll(st) failed: %v", err)
+	}
+	want := append(append([]byte(nil), p1...), p2...)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("coalesced unpack mismatch: got %d bytes, want %d bytes", len(got), len(want))
+	}
+}
+
+func TestMuxV2VersionAnd32BitWindowExtension(t *testing.T) {
+	cfg := &Config{ConnTimeout: 5}
+	sess := &MuxClientSession{
+		cfg:     cfg,
+		streams: make(map[uint32]*MuxStream),
+		closed:  make(chan struct{}),
+	}
+	sess.peerVersion.Store(1)
+	st := newMuxStream(1, sess)
+	sess.streams[1] = st
+
+	bufLen := maxMuxV2Chunk + 14 + MuxHeaderLen
+	if got := sess.maxDataChunkLen(bufLen); got != muxDataChunkLimit {
+		t.Fatalf("v1 peer maxDataChunkLen = %d, want %d", got, muxDataChunkLimit)
+	}
+
+	// Apply MUX v2 VERSION frame (v2, 65535 KiB initial 16-bit window)
+	sess.applyPeerVersion([]byte{2, 0xFF, 0xFF})
+	if sess.peerVersion.Load() != 2 {
+		t.Fatalf("expected peerVersion = 2, got %d", sess.peerVersion.Load())
+	}
+	if got := sess.maxDataChunkLen(bufLen); got != maxMuxV2Chunk {
+		t.Fatalf("v2 peer maxDataChunkLen = %d, want %d", got, maxMuxV2Chunk)
+	}
+
+	// Apply MUX v2 32-bit session window extension (streamID == 0, 131072 KiB = 128 MiB)
+	var ext [4]byte
+	binary.BigEndian.PutUint32(ext[:], 131072)
+	sess.applyWindow(0, ext[:])
+	wantBytes := int64(131072) * 1024
+	if sess.peerWindow.Load() != wantBytes {
+		t.Fatalf("expected peerWindow = %d, got %d", wantBytes, sess.peerWindow.Load())
+	}
+	if st.sendGate.window.Load() != wantBytes {
+		t.Fatalf("expected stream sendGate window = %d, got %d", wantBytes, st.sendGate.window.Load())
+	}
+}

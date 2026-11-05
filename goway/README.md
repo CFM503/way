@@ -1,4 +1,4 @@
-# GOWAY v1.8.32
+# GOWAY v1.8.33
 
 GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具，支持 HTTP 和完整 SOCKS5 (TCP + UDP) 协议，具备浏览器指纹伪装、0-RTT 多路复用 (Mux)、QUIC 弱网抗丢包传输、Cloudflare CDN 边缘接入与 PGO 机器码级性能优化。
 
@@ -7,6 +7,20 @@ GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具�
 > 接手本项目的 AI 必须先读 `goway/AI_HANDOFF.md` 顶部同名规则并原样保留；每个性能改动必须在 `AI_HANDOFF.md` 记录前后数据，**没有数据不算完成**。
 
 ## 版本历史
+
+### v1.8.33 (2026-11-05) - MUX v2 协议无上限吞吐升级：23-Bit 巨型帧、多帧超包解包与 32-Bit 流控窗口扩展
+
+#### 核心优化与协议加固
+
+| 优化/修复项 | 说明 | 收益与特性 |
+|---|---|---|
+| **MUX v2 协议升级 (`muxProtoVersion = 2`)** | 与 RushWay `v0.0.77` 完全对齐并保持对 `v1` 节点的 100% 向下兼容：握手阶段通过 `MuxCmdVERSION` 自动感知对端协议版本 (`peerVersion`) | **新旧版本客户端与服务端（GoWay v1/v2、RushWay v1/v2）任意混搭平滑互通，零断流** |
+| **23-Bit 巨型数据帧 (`MuxCmdDATA` Jumbo Frame)** | 当对端支持 `MUX v2` 时，复用 7 字节 MUX 头第 4 字节最高位 `0x80 | (len >> 16)` 组合第 5..7 字节构成 23-bit 长度（单帧上限 `512KiB`，默认单次读取分片提升至 `129,600B`） | **彻底突破 v1 协议 `uint16 (65535B)` 单帧硬上限，128KB 满缓冲读取不再被强制拆分为多帧，WebSocket 封包与 XOR/Mask 固定开销减半** |
+| **多 MUX 帧合并超包解包 (`isValidCoalescedMuxTail`)** | 客户端 `readLoop` 与服务端 `handleServerMux` 支持在单个 WebSocket Binary 帧中零拷贝连续解包多个合并的 MUX 帧，并严格保证 `BufPool` 尾帧单次所有权移交 | **无缝兼容 RushWay `v0.0.77` 下行多帧合并超包（Super-Packet），杜绝 `BufPool` 二次归还竞态** |
+| **32-Bit 无上限会话流控窗口扩展 (`streamID = 0` `MuxCmdWINDOW`)** | 支持通过 `streamID = 0` 的 `MuxCmdWINDOW` 帧传输 `uint32` KiB 窗口（最高 `1GiB`），新增 `creditGate.UpgradeWindow` 动态无锁扩容活跃流发送配额，并将 `-mux-window` 命令行上限提升至 `1048576 KiB (1GiB)` | **彻底解除 `MuxCmdVERSION` 16-bit (`65535 KiB ≈ 64MiB`) 的流控窗口天花板，满足跨洋高延迟千兆/万兆专线极限吞吐** |
+| **DRR 公平调度量子对齐 (`muxDRRQuantum = 144KiB`)** | 将 `muxOutboundWriter` 每轮赤字轮询量子从 `128KiB` 提升至 `144KiB` | **确保携带 AEAD 标签或 `-obfs` 随机填充的 `129.6KB` 巨型数据帧在单轮 DRR 调度中一次放行，零空转周期** |
+
+---
 
 ### v1.8.32 (2026-11-05) - 千兆网络流控窗口升级、MUX 小帧池化零分配、UDP 批处理零分配优化、连接池透明重试与超时防泄漏加固
 

@@ -59,7 +59,7 @@ import (
 // ============================================================================
 // GOWAY 版本号定义 (发布新版本时在此修改)
 // ============================================================================
-const Version = "1.8.32"
+const Version = "1.8.33"
 
 const (
 	// MaxWSFrameSize matches the largest frame the sender side can build
@@ -2614,7 +2614,7 @@ func main() {
 	muxFlag := flag.Bool("mux", true, "Enable 0-RTT Connection Multiplexing (default true)")
 	noMuxFlag := flag.Bool("no-mux", false, "Disable 0-RTT Connection Multiplexing (fallback to 1:1 pool)")
 	muxSessionsFlag := flag.Int("mux-sessions", 8, "Number of parallel physical Mux sessions (default 8, max 64)")
-	muxWindowFlag := flag.Int("mux-window", 0, "MUX per-stream receive window in KiB (64..65535, default 0 = auto adaptive)")
+	muxWindowFlag := flag.Int("mux-window", 0, "MUX per-stream receive window in KiB (64..1048576, default 0 = auto adaptive)")
 	obfsFlag := flag.Bool("obfs", false, "Pad MUX DATA frames with random lengths to resist packet-size fingerprinting")
 	wFlag := flag.Int("W", 128, "App Buffer Size in KB (default 128KB, recommend 256-1024 for high-throughput streaming)")
 	sockBufFlag := flag.Int("socket-buffer", 0, "Kernel Socket Buffer in KB (default 0 = OS auto-tuning)")
@@ -2671,7 +2671,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  -mux-sessions int\n")
 		fmt.Fprintf(os.Stderr, "        Number of parallel physical Mux sessions (default 8, max 64)\n")
 		fmt.Fprintf(os.Stderr, "  -mux-window int\n")
-		fmt.Fprintf(os.Stderr, "        MUX per-stream receive window in KiB (64..65535, default 0 = auto adaptive)\n")
+		fmt.Fprintf(os.Stderr, "        MUX per-stream receive window in KiB (64..1048576, default 0 = auto adaptive)\n")
 		fmt.Fprintf(os.Stderr, "  -W int\n")
 		fmt.Fprintf(os.Stderr, "        App Buffer Size in KB (default 128, recommend 512-1024 for 4K streaming)\n")
 		fmt.Fprintf(os.Stderr, "  -socket-buffer int\n")
@@ -2775,8 +2775,8 @@ func main() {
 		fmt.Printf("Error: -mux-sessions must be between 1 and 64, got %d\n", *muxSessionsFlag)
 		os.Exit(1)
 	}
-	if *muxWindowFlag != 0 && (*muxWindowFlag < 64 || *muxWindowFlag > 65535) {
-		fmt.Printf("Error: -mux-window must be 0 (auto) or between 64 and 65535 KiB, got %d\n", *muxWindowFlag)
+	if *muxWindowFlag != 0 && (*muxWindowFlag < 64 || *muxWindowFlag > maxMuxV2WindowKiB) {
+		fmt.Printf("Error: -mux-window must be 0 (auto) or between 64 and %d KiB, got %d\n", maxMuxV2WindowKiB, *muxWindowFlag)
 		os.Exit(1)
 	}
 	if *muxWindowFlag > 0 {
@@ -3004,11 +3004,11 @@ func main() {
 		initProfileTLSConfigs(cfg.TLSBase)
 	}
 
-	minBufSize := 65536 + 14 + MuxHeaderLen
+	minBufSize := maxMuxV2Chunk + 14 + MuxHeaderLen
 	if cipherMode == cipherModeAEAD {
 		minBufSize += aeadOverhead
 	}
-	bufSize := cfg.BufferSize + 14
+	bufSize := cfg.BufferSize + 14 + MuxHeaderLen
 	if cipherMode == cipherModeAEAD {
 		bufSize += aeadOverhead
 	}
@@ -3214,12 +3214,77 @@ const (
 	MuxHeaderLen       = 7    // 4B StreamID + 1B Cmd + 2B PayloadLen
 
 	muxPushStallTimeout      = 15 * time.Second
-	muxProtoVersion     byte = 1
+	muxProtoVersion     byte = 2
 	muxWindowMinKib          = 64
+	muxJumboFlag        byte = 0x80
+	maxMuxPayloadV1          = 65535
+	maxMuxPayloadV2          = 512 * 1024
+	maxMuxV2Chunk            = 129600
+	maxMuxV2WindowKiB        = 1024 * 1024
 	// Small MUX frames (<= 8 KiB) copy into exact-sized slices so they never
 	// pin a 128 KiB+ BufPool buffer inside stream queues on low-RAM VPS.
 	muxSmallPayloadCopyLimit = 8192
 )
+
+// encodeMuxHeader writes a 7-byte MUX v1/v2 frame header into dst[:7].
+// For MuxCmdDATA frames with wireLen > 65535, byte 4 encodes 0x80 | (wireLen >> 16)
+// and bytes 5..7 encode uint16(wireLen & 0xFFFF) (23-bit Jumbo length).
+func encodeMuxHeader(dst []byte, streamID uint32, cmd byte, wireLen int) {
+	binary.BigEndian.PutUint32(dst[0:4], streamID)
+	if cmd == MuxCmdDATA && wireLen > maxMuxPayloadV1 {
+		dst[4] = muxJumboFlag | byte((wireLen>>16)&0x7F)
+		binary.BigEndian.PutUint16(dst[5:7], uint16(wireLen&0xFFFF))
+	} else {
+		dst[4] = cmd
+		binary.BigEndian.PutUint16(dst[5:7], uint16(wireLen))
+	}
+}
+
+// decodeMuxHeader parses a 7-byte MUX v1/v2 header from src.
+func decodeMuxHeader(src []byte) (streamID uint32, cmd byte, payloadLen int, ok bool) {
+	if len(src) < MuxHeaderLen {
+		return 0, 0, 0, false
+	}
+	streamID = binary.BigEndian.Uint32(src[0:4])
+	rawCmd := src[4]
+	lenLo := int(binary.BigEndian.Uint16(src[5:7]))
+	if rawCmd&muxJumboFlag != 0 {
+		cmd = MuxCmdDATA
+		payloadLen = (int(rawCmd&0x7F) << 16) | lenLo
+		if payloadLen > maxMuxPayloadV2 {
+			return 0, 0, 0, false
+		}
+	} else {
+		cmd = rawCmd
+		payloadLen = lenLo
+	}
+	return streamID, cmd, payloadLen, true
+}
+
+// isValidCoalescedMuxTail verifies whether rem consists of one or more complete
+// MUX frames whose lengths sum to len(rem) (used for multi-MUX super-packets).
+func isValidCoalescedMuxTail(rem []byte) bool {
+	if len(rem) < MuxHeaderLen {
+		return false
+	}
+	off := 0
+	for off < len(rem) {
+		_, cmd, pLen, ok := decodeMuxHeader(rem[off:])
+		if !ok {
+			return false
+		}
+		switch cmd {
+		case MuxCmdSYN, MuxCmdDATA, MuxCmdFIN, MuxCmdRST, MuxCmdVERSION, MuxCmdWINDOW:
+		default:
+			return false
+		}
+		if off+MuxHeaderLen+pLen > len(rem) {
+			return false
+		}
+		off += MuxHeaderLen + pLen
+	}
+	return off == len(rem)
+}
 
 // muxSmallBufPool provides pooled 8 KiB buffers for small frames to eliminate
 // heap allocations in high-frequency interactive or web requests.
@@ -3394,6 +3459,33 @@ func (g *creditGate) Enable(window int64) {
 		g.window.Store(window)
 		g.available.Store(window)
 		g.state.Store(gateBounded)
+	}
+	g.enableMu.Unlock()
+}
+
+// UpgradeWindow expands an already-bounded (or unbounded) creditGate when a
+// MUX v2 32-bit session window extension (streamID == 0 MuxCmdWINDOW) arrives.
+func (g *creditGate) UpgradeWindow(newWin int64) {
+	if newWin < 1 {
+		return
+	}
+	g.enableMu.Lock()
+	state := g.state.Load()
+	if state == gateUnbounded {
+		g.window.Store(newWin)
+		g.available.Store(newWin)
+		g.state.Store(gateBounded)
+	} else if state == gateBounded {
+		oldWin := g.window.Load()
+		if newWin > oldWin {
+			diff := newWin - oldWin
+			g.window.Store(newWin)
+			g.available.Add(diff)
+			select {
+			case g.credit <- struct{}{}:
+			default:
+			}
+		}
 	}
 	g.enableMu.Unlock()
 }
@@ -3947,9 +4039,9 @@ const (
 	// so bulk streams may use deeper backlog (~4MB worst case at 64KB).
 	muxOutboundQueueDepth = 128
 	// Per-stream byte credit added each deficit round.
-	// Set to 128KB so that even maximum-size MUX frames with -obfs padding (~67KB)
-	// can be dispatched in a single round without deficit underflow stall.
-	muxDRRQuantum = 128 * 1024
+	// Set to 144KB so that even MUX v2 Jumbo frames (129.6KB) with -obfs padding
+	// and AEAD overhead can be dispatched in a single round without deficit underflow stall.
+	muxDRRQuantum = 144 * 1024
 	// Cap accumulated credit so a long-idle stream cannot hog the link.
 	muxDRRMaxDeficit = 512 * 1024
 	// Max random padding appended to MUX DATA frames when -obfs is on.
@@ -4427,7 +4519,30 @@ type MuxClientSession struct {
 	writer        *muxOutboundWriter
 	activeStreams atomic.Int64
 	// W3: peer-advertised receive window in bytes (0 = not negotiated).
-	peerWindow atomic.Int64
+	peerWindow  atomic.Int64
+	peerVersion atomic.Uint32
+}
+
+func (s *MuxClientSession) maxDataChunkLen(bufLen int) int {
+	const payloadStart = 14 + MuxHeaderLen
+	limit := bufLen - payloadStart
+	if s.cfg != nil && s.cfg.Crypto != nil && !s.cfg.Crypto.isXOR() {
+		limit -= aeadOverhead
+	}
+	maxChunk := muxDataChunkLimit
+	if s.peerVersion.Load() >= 2 {
+		maxChunk = maxMuxV2Chunk
+		if s.cfg != nil && s.cfg.Crypto != nil && !s.cfg.Crypto.isXOR() && maxChunk > maxMuxPayloadV2-aeadOverhead {
+			maxChunk = maxMuxPayloadV2 - aeadOverhead
+		}
+	}
+	if limit > maxChunk {
+		limit = maxChunk
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	return limit
 }
 
 func (s *MuxClientSession) ActiveStreams() int64 {
@@ -4465,11 +4580,21 @@ func (s *MuxClientSession) decrementActiveStreams() {
 func newMuxClientSession(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, cfg *Config, setupDur time.Duration) *MuxClientSession {
 	prng := maskPool.Get().(*maskPRNG)
 	s := &MuxClientSession{wsConn: wsConn, br: br, wsTCPConn: wsTCPConn, cfg: cfg, streams: make(map[uint32]*MuxStream), closed: make(chan struct{}), prng: prng}
+	s.peerVersion.Store(1)
 	s.writer = newMuxOutboundWriterBatched(wsConn, prng, cfg.Crypto, true, time.Duration(cfg.ConnTimeout)*time.Second, writevBatchFor(setupDur))
-	// W3 version negotiation: advertise our version + initial receive
+	// W3 / MUX v2 version negotiation: advertise our version + initial receive
 	// window right after the session handshake. Old servers skip the
 	// unknown command; new servers answer with their own VERSION.
-	s.SendFrame(0, MuxCmdVERSION, []byte{muxProtoVersion, byte(muxInitialWindowKib >> 8), byte(muxInitialWindowKib & 0xff)})
+	win16 := muxInitialWindowKib
+	if win16 > 65535 {
+		win16 = 65535
+	}
+	s.SendFrame(0, MuxCmdVERSION, []byte{muxProtoVersion, byte(win16 >> 8), byte(win16 & 0xff)})
+	if muxInitialWindowKib > 65535 {
+		var wb [4]byte
+		binary.BigEndian.PutUint32(wb[:], uint32(muxInitialWindowKib))
+		s.SendFrame(0, MuxCmdWINDOW, wb[:])
+	}
 	go s.readLoop()
 	go s.heartbeatLoop()
 	return s
@@ -4481,6 +4606,7 @@ func (s *MuxClientSession) applyPeerVersion(payload []byte) {
 	if len(payload) != 3 || payload[0] < 1 || s.peerWindow.Load() != 0 {
 		return
 	}
+	s.peerVersion.Store(uint32(payload[0]))
 	kib := int(binary.BigEndian.Uint16(payload[1:3]))
 	if kib < muxWindowMinKib {
 		kib = muxWindowMinKib
@@ -4492,23 +4618,39 @@ func (s *MuxClientSession) applyPeerVersion(payload []byte) {
 		st.sendGate.Enable(window)
 	}
 	s.streamsMu.RUnlock()
-	logDebug("[CLIENT-MUX] peer VERSION received; send window enabled (kib=%d)", kib)
+	logDebug("[CLIENT-MUX] peer VERSION v%d received; send window enabled (kib=%d)", payload[0], kib)
 }
 
-// applyWindow refunds upload credit for one stream.
+// applyWindow refunds upload credit for one stream, or expands the session
+// window when streamID == 0 (MUX v2 32-bit KiB window extension).
 func (s *MuxClientSession) applyWindow(streamID uint32, payload []byte) {
 	if len(payload) != 4 {
 		return
 	}
-	credit := binary.BigEndian.Uint32(payload)
-	if credit == 0 || uint64(credit) > uint64(muxInitialWindowKib)*1024*64 {
+	val := binary.BigEndian.Uint32(payload)
+	if streamID == 0 {
+		if val >= muxWindowMinKib && val <= maxMuxV2WindowKiB {
+			newWin := int64(val) * 1024
+			oldWin := s.peerWindow.Swap(newWin)
+			if newWin > oldWin {
+				s.streamsMu.RLock()
+				for _, st := range s.streams {
+					st.sendGate.UpgradeWindow(newWin)
+				}
+				s.streamsMu.RUnlock()
+				logDebug("[CLIENT-MUX] peer 32-bit WINDOW extension applied (kib=%d)", val)
+			}
+		}
+		return
+	}
+	if val == 0 || uint64(val) > uint64(maxMuxV2WindowKiB)*1024 {
 		return
 	}
 	s.streamsMu.RLock()
 	st, ok := s.streams[streamID]
 	s.streamsMu.RUnlock()
 	if ok {
-		st.sendGate.Release(int64(credit))
+		st.sendGate.Release(int64(val))
 	}
 }
 
@@ -4593,13 +4735,17 @@ func (s *MuxClientSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 		return nil
 	}
 	payloadLen := len(payload)
-	if payloadLen > 65535 {
-		return fmt.Errorf("mux frame payload %d exceeds maximum uint16 length (65535)", payloadLen)
-	}
 	aead := s.cfg.Crypto != nil && !s.cfg.Crypto.isXOR()
 	wireLen := payloadLen
 	if aead && payloadLen > 0 {
 		wireLen += aeadOverhead
+	}
+	maxWire := maxMuxPayloadV1
+	if cmd == MuxCmdDATA {
+		maxWire = maxMuxPayloadV2
+	}
+	if wireLen > maxWire {
+		return fmt.Errorf("mux frame payload %d exceeds maximum length (%d)", wireLen, maxWire)
 	}
 	frameLen := MuxHeaderLen + wireLen
 	pool := s.cfg.BufPool
@@ -4613,9 +4759,7 @@ func (s *MuxClientSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 		return errors.New("mux frame exceeds buffer size")
 	}
 	frameStart := 14
-	binary.BigEndian.PutUint32(buf[frameStart:frameStart+4], streamID)
-	buf[frameStart+4] = cmd
-	binary.BigEndian.PutUint16(buf[frameStart+5:frameStart+7], uint16(wireLen))
+	encodeMuxHeader(buf[frameStart:frameStart+MuxHeaderLen], streamID, cmd, wireLen)
 	if payloadLen > 0 {
 		copy(buf[frameStart+7:frameStart+7+payloadLen], payload)
 		if aead {
@@ -4663,14 +4807,14 @@ func (s *MuxClientSession) SendDataFramePreallocated(streamID uint32, bPtr *[]by
 		}
 		return nil
 	}
-	if payloadLen > 65535 {
-		s.cfg.BufPool.Put(bPtr)
-		return fmt.Errorf("mux frame payload %d exceeds maximum uint16 length (65535)", payloadLen)
-	}
 	aead := s.cfg.Crypto != nil && !s.cfg.Crypto.isXOR()
 	wireLen := payloadLen
 	if aead && payloadLen > 0 {
 		wireLen += aeadOverhead
+	}
+	if wireLen > maxMuxPayloadV2 {
+		s.cfg.BufPool.Put(bPtr)
+		return fmt.Errorf("mux frame payload %d exceeds maximum v2 length (%d)", wireLen, maxMuxPayloadV2)
 	}
 	frameLen := MuxHeaderLen + wireLen
 	buf := *bPtr
@@ -4679,9 +4823,7 @@ func (s *MuxClientSession) SendDataFramePreallocated(streamID uint32, bPtr *[]by
 		return errors.New("mux frame exceeds buffer size")
 	}
 	const frameStart = 14
-	binary.BigEndian.PutUint32(buf[frameStart:frameStart+4], streamID)
-	buf[frameStart+4] = MuxCmdDATA
-	binary.BigEndian.PutUint16(buf[frameStart+5:frameStart+7], uint16(wireLen))
+	encodeMuxHeader(buf[frameStart:frameStart+MuxHeaderLen], streamID, MuxCmdDATA, wireLen)
 	if aead && payloadLen > 0 {
 		s.cfg.Crypto.SealRegion(buf[frameStart+7:], payloadLen)
 	}
@@ -4725,81 +4867,108 @@ func (s *MuxClientSession) readLoop() {
 			return
 		}
 
-		if len(data) < MuxHeaderLen {
+		streamID, cmd, payloadLen, okHdr := decodeMuxHeader(data)
+		if !okHdr || len(data) < MuxHeaderLen+payloadLen {
 			continue
 		}
-		streamID := binary.BigEndian.Uint32(data[:4])
-		cmd := data[4]
-		payloadLen := int(binary.BigEndian.Uint16(data[5:7]))
-		if len(data) < MuxHeaderLen+payloadLen {
-			continue
+		frameLimit := MuxHeaderLen + payloadLen
+		if !s.cfg.Obfs && frameLimit < len(data) && isValidCoalescedMuxTail(data[frameLimit:]) {
+			frameLimit = len(data)
 		}
-		payload := data[MuxHeaderLen : MuxHeaderLen+payloadLen]
 
-		// AEAD mode: the sealed region [nonce|ct|tag] is opened in place
-		// before any dispatch; empty payloads (FIN/RST) were never sealed.
-		if s.cfg.Crypto != nil && !s.cfg.Crypto.isXOR() && len(payload) > 0 {
-			var openErr error
-			payload, openErr = s.cfg.Crypto.OpenRegion(payload)
-			if openErr != nil {
-				logDebug("[CLIENT-MUX] Stream %d aead open failed: %v", streamID, openErr)
-				s.streamsMu.RLock()
-				st, ok := s.streams[streamID]
-				s.streamsMu.RUnlock()
-				if ok {
-					st.Reset()
+		for off := 0; off < frameLimit; {
+			if off > 0 {
+				var okNext bool
+				streamID, cmd, payloadLen, okNext = decodeMuxHeader(data[off:])
+				if !okNext || off+MuxHeaderLen+payloadLen > frameLimit {
+					break
 				}
+			}
+			payload := data[off+MuxHeaderLen : off+MuxHeaderLen+payloadLen]
+			off += MuxHeaderLen + payloadLen
+			isLastFrame := off >= frameLimit
+
+			// AEAD mode: the sealed region [nonce|ct|tag] is opened in place
+			// before any dispatch; empty payloads (FIN/RST) were never sealed.
+			if s.cfg.Crypto != nil && !s.cfg.Crypto.isXOR() && len(payload) > 0 {
+				var openErr error
+				payload, openErr = s.cfg.Crypto.OpenRegion(payload)
+				if openErr != nil {
+					logDebug("[CLIENT-MUX] Stream %d aead open failed: %v", streamID, openErr)
+					s.streamsMu.RLock()
+					st, ok := s.streams[streamID]
+					s.streamsMu.RUnlock()
+					if ok {
+						st.Reset()
+					}
+					continue
+				}
+			}
+
+			// W3 control frames arrive before the stream lookup: VERSION uses
+			// stream id 0 (not in the map) and WINDOW must not be swallowed
+			// by the unknown-stream skip.
+			if cmd == MuxCmdVERSION {
+				s.applyPeerVersion(payload)
 				continue
 			}
-		}
-
-		// W3 control frames arrive before the stream lookup: VERSION uses
-		// stream id 0 (not in the map) and WINDOW must not be swallowed
-		// by the unknown-stream skip.
-		if cmd == MuxCmdVERSION {
-			s.applyPeerVersion(payload)
-			continue
-		}
-		if cmd == MuxCmdWINDOW {
-			s.applyWindow(streamID, payload)
-			continue
-		}
-
-		s.streamsMu.RLock()
-		st, ok := s.streams[streamID]
-		s.streamsMu.RUnlock()
-
-		if !ok {
-			continue
-		}
-
-		switch cmd {
-		case MuxCmdDATA:
-			if len(payload) > 0 {
-				if len(payload) <= muxSmallPayloadCopyLimit {
-					sPtr := muxSmallBufPool.Get().(*[]byte)
-					copy(*sPtr, payload)
-					st.enqueueDataFrame(muxDataFrame{
-						data: (*sPtr)[:len(payload)],
-						bPtr: sPtr,
-						pool: muxSmallBufPool,
-					})
-				} else {
-					nextBPtr := s.cfg.BufPool.Get().(*[]byte)
-					frame := muxDataFrame{
-						data: payload,
-						bPtr: bPtr,
-						pool: s.cfg.BufPool,
-					}
-					bPtr = nextBPtr
-					buf = *bPtr
-					st.enqueueDataFrame(frame)
-				}
+			if cmd == MuxCmdWINDOW {
+				s.applyWindow(streamID, payload)
+				continue
 			}
-		case MuxCmdFIN:
-			st.enqueueDataFrame(muxDataFrame{data: nil})
-		case MuxCmdRST:
-			st.ResetLocal()
+
+			s.streamsMu.RLock()
+			st, ok := s.streams[streamID]
+			s.streamsMu.RUnlock()
+
+			if !ok {
+				continue
+			}
+
+			switch cmd {
+			case MuxCmdDATA:
+				if len(payload) > 0 {
+					if len(payload) <= muxSmallPayloadCopyLimit {
+						sPtr := muxSmallBufPool.Get().(*[]byte)
+						copy(*sPtr, payload)
+						st.enqueueDataFrame(muxDataFrame{
+							data: (*sPtr)[:len(payload)],
+							bPtr: sPtr,
+							pool: muxSmallBufPool,
+						})
+					} else if isLastFrame && len(data) <= len(buf)-14 {
+						nextBPtr := s.cfg.BufPool.Get().(*[]byte)
+						frame := muxDataFrame{
+							data: payload,
+							bPtr: bPtr,
+							pool: s.cfg.BufPool,
+						}
+						bPtr = nextBPtr
+						buf = *bPtr
+						st.enqueueDataFrame(frame)
+					} else {
+						cPtr := s.cfg.BufPool.Get().(*[]byte)
+						cBuf := *cPtr
+						if len(payload) <= len(cBuf) {
+							copy(cBuf[:len(payload)], payload)
+							st.enqueueDataFrame(muxDataFrame{
+								data: cBuf[:len(payload)],
+								bPtr: cPtr,
+								pool: s.cfg.BufPool,
+							})
+						} else {
+							s.cfg.BufPool.Put(cPtr)
+							cp := make([]byte, len(payload))
+							copy(cp, payload)
+							st.enqueueDataFrame(muxDataFrame{data: cp})
+						}
+					}
+				}
+			case MuxCmdFIN:
+				st.enqueueDataFrame(muxDataFrame{data: nil})
+			case MuxCmdRST:
+				st.ResetLocal()
+			}
 		}
 	}
 }
@@ -5139,10 +5308,7 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 		for {
 			bPtr := cfg.BufPool.Get().(*[]byte)
 			buf := *bPtr
-			limit := len(buf) - payloadStart
-			if limit > muxDataChunkLimit {
-				limit = muxDataChunkLimit
-			}
+			limit := session.maxDataChunkLen(len(buf))
 			nr, errRead := localConn.Read(buf[payloadStart : payloadStart+limit])
 			if nr > 0 {
 				if !stream.sendGate.Acquire(nr, stream.closed) {
@@ -5261,7 +5427,30 @@ type MuxServerSession struct {
 	closed    chan struct{}
 	closeOnce sync.Once
 	// W3: peer-advertised receive window in bytes (0 = not negotiated).
-	peerWindow atomic.Int64
+	peerWindow  atomic.Int64
+	peerVersion atomic.Uint32
+}
+
+func (s *MuxServerSession) maxDataChunkLen(bufLen int) int {
+	const payloadStart = 14 + MuxHeaderLen
+	limit := bufLen - payloadStart
+	if s.cfg != nil && s.cfg.Crypto != nil && !s.cfg.Crypto.isXOR() {
+		limit -= aeadOverhead
+	}
+	maxChunk := muxDataChunkLimit
+	if s.peerVersion.Load() >= 2 {
+		maxChunk = maxMuxV2Chunk
+		if s.cfg != nil && s.cfg.Crypto != nil && !s.cfg.Crypto.isXOR() && maxChunk > maxMuxPayloadV2-aeadOverhead {
+			maxChunk = maxMuxPayloadV2 - aeadOverhead
+		}
+	}
+	if limit > maxChunk {
+		limit = maxChunk
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	return limit
 }
 
 type MuxServerStream struct {
@@ -5553,13 +5742,17 @@ func (s *MuxServerSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 		s.writer.dropStream(streamID)
 	}
 	payloadLen := len(payload)
-	if payloadLen > 65535 {
-		return fmt.Errorf("mux server frame payload %d exceeds maximum uint16 length (65535)", payloadLen)
-	}
 	aead := s.cfg.Crypto != nil && !s.cfg.Crypto.isXOR()
 	wireLen := payloadLen
 	if aead && payloadLen > 0 {
 		wireLen += aeadOverhead
+	}
+	maxWire := maxMuxPayloadV1
+	if cmd == MuxCmdDATA {
+		maxWire = maxMuxPayloadV2
+	}
+	if wireLen > maxWire {
+		return fmt.Errorf("mux server frame payload %d exceeds maximum length (%d)", wireLen, maxWire)
 	}
 	frameLen := MuxHeaderLen + wireLen
 	pool := s.cfg.BufPool
@@ -5573,9 +5766,7 @@ func (s *MuxServerSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 		return errors.New("mux server frame exceeds buffer")
 	}
 	frameStart := 14
-	binary.BigEndian.PutUint32(buf[frameStart:frameStart+4], streamID)
-	buf[frameStart+4] = cmd
-	binary.BigEndian.PutUint16(buf[frameStart+5:frameStart+7], uint16(wireLen))
+	encodeMuxHeader(buf[frameStart:frameStart+MuxHeaderLen], streamID, cmd, wireLen)
 	if payloadLen > 0 {
 		copy(buf[frameStart+7:frameStart+7+payloadLen], payload)
 		if aead {
@@ -5626,14 +5817,14 @@ func (s *MuxServerSession) SendDataFramePreallocated(streamID uint32, bPtr *[]by
 		}
 		return err
 	}
-	if payloadLen > 65535 {
-		s.cfg.BufPool.Put(bPtr)
-		return fmt.Errorf("mux server frame payload %d exceeds maximum uint16 length (65535)", payloadLen)
-	}
 	aead := s.cfg.Crypto != nil && !s.cfg.Crypto.isXOR()
 	wireLen := payloadLen
 	if aead && payloadLen > 0 {
 		wireLen += aeadOverhead
+	}
+	if wireLen > maxMuxPayloadV2 {
+		s.cfg.BufPool.Put(bPtr)
+		return fmt.Errorf("mux server frame payload %d exceeds maximum v2 length (%d)", wireLen, maxMuxPayloadV2)
 	}
 	frameLen := MuxHeaderLen + wireLen
 	buf := *bPtr
@@ -5642,9 +5833,7 @@ func (s *MuxServerSession) SendDataFramePreallocated(streamID uint32, bPtr *[]by
 		return errors.New("mux server frame exceeds buffer")
 	}
 	const frameStart = 14
-	binary.BigEndian.PutUint32(buf[frameStart:frameStart+4], streamID)
-	buf[frameStart+4] = MuxCmdDATA
-	binary.BigEndian.PutUint16(buf[frameStart+5:frameStart+7], uint16(wireLen))
+	encodeMuxHeader(buf[frameStart:frameStart+MuxHeaderLen], streamID, MuxCmdDATA, wireLen)
 	if aead && payloadLen > 0 {
 		s.cfg.Crypto.SealRegion(buf[frameStart+7:], payloadLen)
 	}
@@ -5679,8 +5868,12 @@ func (s *MuxServerSession) sendFrameInline(streamID uint32, cmd byte, payload []
 		return errors.New("sendFrameInline does not support aead mode")
 	}
 	payloadLen := len(payload)
-	if payloadLen > 65535 {
-		return fmt.Errorf("mux server frame payload %d exceeds maximum uint16 length (65535)", payloadLen)
+	maxWire := maxMuxPayloadV1
+	if cmd == MuxCmdDATA {
+		maxWire = maxMuxPayloadV2
+	}
+	if payloadLen > maxWire {
+		return fmt.Errorf("mux server frame payload %d exceeds maximum length (%d)", payloadLen, maxWire)
 	}
 
 	frameLen := MuxHeaderLen + payloadLen
@@ -5693,9 +5886,7 @@ func (s *MuxServerSession) sendFrameInline(streamID uint32, cmd byte, payload []
 	}
 
 	frameStart := 14
-	binary.BigEndian.PutUint32(buf[frameStart:frameStart+4], streamID)
-	buf[frameStart+4] = cmd
-	binary.BigEndian.PutUint16(buf[frameStart+5:frameStart+7], uint16(payloadLen))
+	encodeMuxHeader(buf[frameStart:frameStart+MuxHeaderLen], streamID, cmd, payloadLen)
 	if payloadLen > 0 {
 		copy(buf[frameStart+7:frameStart+7+payloadLen], payload)
 	}
@@ -5739,14 +5930,24 @@ func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 		streams:   make(map[uint32]*MuxServerStream),
 		closed:    make(chan struct{}),
 	}
+	session.peerVersion.Store(1)
 	// Server never masks; prng unused by the unmasked write path.
 	session.writer = newMuxOutboundWriterBatched(wsConn, nil, cfg.Crypto, false, time.Duration(cfg.ConnTimeout)*time.Second, writevBatchFor(setupDur))
 	defer session.Close()
 
-	// W3 version negotiation: advertise our version + initial receive
+	// W3 / MUX v2 version negotiation: advertise our version + initial receive
 	// window right after the session handshake. Old clients skip the
 	// unknown command; new clients answer with their own VERSION.
-	_ = session.SendFrame(0, MuxCmdVERSION, []byte{muxProtoVersion, byte(muxInitialWindowKib >> 8), byte(muxInitialWindowKib & 0xff)})
+	win16 := muxInitialWindowKib
+	if win16 > 65535 {
+		win16 = 65535
+	}
+	_ = session.SendFrame(0, MuxCmdVERSION, []byte{muxProtoVersion, byte(win16 >> 8), byte(win16 & 0xff)})
+	if muxInitialWindowKib > 65535 {
+		var wb [4]byte
+		binary.BigEndian.PutUint32(wb[:], uint32(muxInitialWindowKib))
+		_ = session.SendFrame(0, MuxCmdWINDOW, wb[:])
+	}
 
 	logInfo("[SERVER] Mux Session active")
 
@@ -5769,150 +5970,191 @@ func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 			return
 		}
 
-		if len(data) < MuxHeaderLen {
+		streamID, cmd, payloadLen, okHdr := decodeMuxHeader(data)
+		if !okHdr || len(data) < MuxHeaderLen+payloadLen {
 			continue
 		}
-		streamID := binary.BigEndian.Uint32(data[:4])
-		cmd := data[4]
-		payloadLen := int(binary.BigEndian.Uint16(data[5:7]))
-		if len(data) < MuxHeaderLen+payloadLen {
-			continue
-		}
-		payload := data[MuxHeaderLen : MuxHeaderLen+payloadLen]
-
-		// AEAD mode: open the sealed region in place before dispatch
-		// (empty payloads — FIN/RST — were never sealed).
-		if cfg.Crypto != nil && !cfg.Crypto.isXOR() && len(payload) > 0 {
-			var openErr error
-			payload, openErr = cfg.Crypto.OpenRegion(payload)
-			if openErr != nil {
-				logDebug("[SERVER-MUX] Stream %d aead open failed: %v", streamID, openErr)
-				session.streamsMu.RLock()
-				st, ok := session.streams[streamID]
-				session.streamsMu.RUnlock()
-				if ok {
-					st.Close()
-					session.SendFrame(streamID, MuxCmdRST, nil)
-				}
-				continue
-			}
+		frameLimit := MuxHeaderLen + payloadLen
+		if !cfg.Obfs && frameLimit < len(data) && isValidCoalescedMuxTail(data[frameLimit:]) {
+			frameLimit = len(data)
 		}
 
-		// W3 control frames: VERSION records the client's window (first
-		// wins) and enables bounded server->client sends on live streams;
-		// WINDOW credits a specific stream's upload gate.
-		if cmd == MuxCmdVERSION {
-			if len(payload) == 3 && payload[0] >= 1 && session.peerWindow.Load() == 0 {
-				kib := int(binary.BigEndian.Uint16(payload[1:3]))
-				if kib < muxWindowMinKib {
-					kib = muxWindowMinKib
+		for off := 0; off < frameLimit; {
+			if off > 0 {
+				var okNext bool
+				streamID, cmd, payloadLen, okNext = decodeMuxHeader(data[off:])
+				if !okNext || off+MuxHeaderLen+payloadLen > frameLimit {
+					break
 				}
-				window := int64(kib) * 1024
-				session.peerWindow.Store(window)
-				session.streamsMu.RLock()
-				for _, st := range session.streams {
-					st.sendGate.Enable(window)
-				}
-				session.streamsMu.RUnlock()
-				logDebug("[SERVER-MUX] peer VERSION received; send window enabled (kib=%d)", kib)
 			}
-			continue
-		}
-		if cmd == MuxCmdWINDOW {
-			if len(payload) == 4 {
-				credit := binary.BigEndian.Uint32(payload)
-				if credit > 0 && uint64(credit) <= uint64(muxInitialWindowKib)*1024*64 {
+			payload := data[off+MuxHeaderLen : off+MuxHeaderLen+payloadLen]
+			off += MuxHeaderLen + payloadLen
+			isLastFrame := off >= frameLimit
+
+			// AEAD mode: open the sealed region in place before dispatch
+			// (empty payloads — FIN/RST — were never sealed).
+			if cfg.Crypto != nil && !cfg.Crypto.isXOR() && len(payload) > 0 {
+				var openErr error
+				payload, openErr = cfg.Crypto.OpenRegion(payload)
+				if openErr != nil {
+					logDebug("[SERVER-MUX] Stream %d aead open failed: %v", streamID, openErr)
 					session.streamsMu.RLock()
 					st, ok := session.streams[streamID]
 					session.streamsMu.RUnlock()
 					if ok {
-						st.sendGate.Release(int64(credit))
+						st.Close()
+						session.SendFrame(streamID, MuxCmdRST, nil)
 					}
+					continue
 				}
 			}
-			continue
-		}
 
-		switch cmd {
-		case MuxCmdSYN:
-			if len(payload) < 2 {
+			// W3 control frames: VERSION records the client's window (first
+			// wins) and enables bounded server->client sends on live streams;
+			// WINDOW credits a specific stream's upload gate or extends session window.
+			if cmd == MuxCmdVERSION {
+				if len(payload) == 3 && payload[0] >= 1 && session.peerWindow.Load() == 0 {
+					session.peerVersion.Store(uint32(payload[0]))
+					kib := int(binary.BigEndian.Uint16(payload[1:3]))
+					if kib < muxWindowMinKib {
+						kib = muxWindowMinKib
+					}
+					window := int64(kib) * 1024
+					session.peerWindow.Store(window)
+					session.streamsMu.RLock()
+					for _, st := range session.streams {
+						st.sendGate.Enable(window)
+					}
+					session.streamsMu.RUnlock()
+					logDebug("[SERVER-MUX] peer VERSION v%d received; send window enabled (kib=%d)", payload[0], kib)
+				}
 				continue
 			}
-			tLen := int(binary.BigEndian.Uint16(payload[:2]))
-			if len(payload) < 2+tLen {
+			if cmd == MuxCmdWINDOW {
+				if len(payload) == 4 {
+					val := binary.BigEndian.Uint32(payload)
+					if streamID == 0 {
+						if val >= muxWindowMinKib && val <= maxMuxV2WindowKiB {
+							newWin := int64(val) * 1024
+							oldWin := session.peerWindow.Swap(newWin)
+							if newWin > oldWin {
+								session.streamsMu.RLock()
+								for _, st := range session.streams {
+									st.sendGate.UpgradeWindow(newWin)
+								}
+								session.streamsMu.RUnlock()
+								logDebug("[SERVER-MUX] peer 32-bit WINDOW extension applied (kib=%d)", val)
+							}
+						}
+					} else if val > 0 && uint64(val) <= uint64(maxMuxV2WindowKiB)*1024 {
+						session.streamsMu.RLock()
+						st, ok := session.streams[streamID]
+						session.streamsMu.RUnlock()
+						if ok {
+							st.sendGate.Release(int64(val))
+						}
+					}
+				}
 				continue
 			}
-			targetStr := string(payload[2 : 2+tLen])
-			var initialData []byte
-			if len(payload) > 2+tLen {
-				initialData = make([]byte, len(payload)-(2+tLen))
-				copy(initialData, payload[2+tLen:])
-			}
 
-			if cfg != nil && cfg.MaxConns > 0 && !tryAcquireConn(int64(cfg.MaxConns)) {
-				logWarn("[SERVER-MUX] MaxConns (%d) reached, rejecting stream %d", cfg.MaxConns, streamID)
-				session.SendFrame(streamID, MuxCmdRST, nil)
-				continue
-			}
+			switch cmd {
+			case MuxCmdSYN:
+				if len(payload) < 2 {
+					continue
+				}
+				tLen := int(binary.BigEndian.Uint16(payload[:2]))
+				if len(payload) < 2+tLen {
+					continue
+				}
+				targetStr := string(payload[2 : 2+tLen])
+				var initialData []byte
+				if len(payload) > 2+tLen {
+					initialData = make([]byte, len(payload)-(2+tLen))
+					copy(initialData, payload[2+tLen:])
+				}
 
-			session.streamsMu.Lock()
-			if oldSt, ok := session.streams[streamID]; ok {
-				delete(session.streams, streamID)
-				session.streamsMu.Unlock()
-				oldSt.Close()
+				if cfg != nil && cfg.MaxConns > 0 && !tryAcquireConn(int64(cfg.MaxConns)) {
+					logWarn("[SERVER-MUX] MaxConns (%d) reached, rejecting stream %d", cfg.MaxConns, streamID)
+					session.SendFrame(streamID, MuxCmdRST, nil)
+					continue
+				}
+
 				session.streamsMu.Lock()
-			}
-			st := newMuxServerStream(streamID, session)
-			session.streams[streamID] = st
-			session.streamsMu.Unlock()
-
-			go session.handleNewStream(st, targetStr, initialData)
-
-		case MuxCmdDATA:
-			session.streamsMu.RLock()
-			st, ok := session.streams[streamID]
-			session.streamsMu.RUnlock()
-			if ok && len(payload) > 0 {
-				if len(payload) <= muxSmallPayloadCopyLimit {
-					sPtr := muxSmallBufPool.Get().(*[]byte)
-					copy(*sPtr, payload)
-					st.enqueueDataFrame(muxDataFrame{
-						data: (*sPtr)[:len(payload)],
-						bPtr: sPtr,
-						pool: muxSmallBufPool,
-					})
-				} else {
-					nextBPtr := cfg.BufPool.Get().(*[]byte)
-					frame := muxDataFrame{
-						data: payload,
-						bPtr: bPtr,
-						pool: cfg.BufPool,
-					}
-					bPtr = nextBPtr
-					buf = *bPtr
-					st.enqueueDataFrame(frame)
+				if oldSt, ok := session.streams[streamID]; ok {
+					delete(session.streams, streamID)
+					session.streamsMu.Unlock()
+					oldSt.Close()
+					session.streamsMu.Lock()
 				}
-			}
+				st := newMuxServerStream(streamID, session)
+				session.streams[streamID] = st
+				session.streamsMu.Unlock()
 
-		case MuxCmdFIN:
-			session.streamsMu.RLock()
-			st, ok := session.streams[streamID]
-			session.streamsMu.RUnlock()
-			if ok {
-				st.enqueueDataFrame(muxDataFrame{data: nil})
-			}
+				go session.handleNewStream(st, targetStr, initialData)
 
-		case MuxCmdRST:
-			session.streamsMu.Lock()
-			st, ok := session.streams[streamID]
-			if ok {
-				delete(session.streams, streamID)
-			}
-			session.streamsMu.Unlock()
-			if ok {
-				st.Close()
-				if session.writer != nil {
-					session.writer.dropStream(streamID)
+			case MuxCmdDATA:
+				session.streamsMu.RLock()
+				st, ok := session.streams[streamID]
+				session.streamsMu.RUnlock()
+				if ok && len(payload) > 0 {
+					if len(payload) <= muxSmallPayloadCopyLimit {
+						sPtr := muxSmallBufPool.Get().(*[]byte)
+						copy(*sPtr, payload)
+						st.enqueueDataFrame(muxDataFrame{
+							data: (*sPtr)[:len(payload)],
+							bPtr: sPtr,
+							pool: muxSmallBufPool,
+						})
+					} else if isLastFrame && len(data) <= len(buf)-14 {
+						nextBPtr := cfg.BufPool.Get().(*[]byte)
+						frame := muxDataFrame{
+							data: payload,
+							bPtr: bPtr,
+							pool: cfg.BufPool,
+						}
+						bPtr = nextBPtr
+						buf = *bPtr
+						st.enqueueDataFrame(frame)
+					} else {
+						cPtr := cfg.BufPool.Get().(*[]byte)
+						cBuf := *cPtr
+						if len(payload) <= len(cBuf) {
+							copy(cBuf[:len(payload)], payload)
+							st.enqueueDataFrame(muxDataFrame{
+								data: cBuf[:len(payload)],
+								bPtr: cPtr,
+								pool: cfg.BufPool,
+							})
+						} else {
+							cfg.BufPool.Put(cPtr)
+							cp := make([]byte, len(payload))
+							copy(cp, payload)
+							st.enqueueDataFrame(muxDataFrame{data: cp})
+						}
+					}
+				}
+
+			case MuxCmdFIN:
+				session.streamsMu.RLock()
+				st, ok := session.streams[streamID]
+				session.streamsMu.RUnlock()
+				if ok {
+					st.enqueueDataFrame(muxDataFrame{data: nil})
+				}
+
+			case MuxCmdRST:
+				session.streamsMu.Lock()
+				st, ok := session.streams[streamID]
+				if ok {
+					delete(session.streams, streamID)
+				}
+				session.streamsMu.Unlock()
+				if ok {
+					st.Close()
+					if session.writer != nil {
+						session.writer.dropStream(streamID)
+					}
 				}
 			}
 		}
@@ -6020,10 +6262,7 @@ func (s *MuxServerSession) handleNewStream(st *MuxServerStream, targetStr string
 	for {
 		bPtr := s.cfg.BufPool.Get().(*[]byte)
 		buf := *bPtr
-		limit := len(buf) - payloadStart
-		if limit > muxDataChunkLimit {
-			limit = muxDataChunkLimit
-		}
+		limit := s.maxDataChunkLen(len(buf))
 		nr, errRead := targetConn.Read(buf[payloadStart : payloadStart+limit])
 		if nr > 0 {
 			// W3 server->client send gate: credit granted by the client's
