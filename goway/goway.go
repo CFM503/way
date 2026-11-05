@@ -59,7 +59,7 @@ import (
 // ============================================================================
 // GOWAY 版本号定义 (发布新版本时在此修改)
 // ============================================================================
-const Version = "1.8.31"
+const Version = "1.8.32"
 
 const (
 	// MaxWSFrameSize matches the largest frame the sender side can build
@@ -1895,6 +1895,21 @@ func deadlineThrottle(lastSet *time.Time) bool {
 	return false
 }
 
+// readDeadlineSetter is the SetReadDeadline subset shared by net.Conn
+// and quic.Stream.
+type readDeadlineSetter interface {
+	SetReadDeadline(t time.Time) error
+}
+
+func refreshReadDeadline(conn readDeadlineSetter, timeout time.Duration, lastSet *time.Time) {
+	if timeout <= 0 {
+		return
+	}
+	if deadlineThrottle(lastSet) {
+		_ = conn.SetReadDeadline(time.Now().Add(timeout))
+	}
+}
+
 // writeDeadlineSetter is the SetWriteDeadline subset shared by net.Conn
 // and quic.Stream.
 type writeDeadlineSetter interface {
@@ -1918,7 +1933,6 @@ func refreshWriteDeadline(conn writeDeadlineSetter, timeout time.Duration, lastS
 
 func readUntilCRLFCRLF(br *bufio.Reader) ([]byte, error) {
 	var buf bytes.Buffer
-	buf.Grow(MaxHeaderSize)
 	for {
 		line, err := br.ReadSlice('\n')
 		if err == bufio.ErrBufferFull {
@@ -2150,6 +2164,7 @@ type PooledConn struct {
 	br       *bufio.Reader
 	created  time.Time
 	lastUsed time.Time
+	fromPool bool
 }
 
 type ConnPool struct {
@@ -2599,6 +2614,7 @@ func main() {
 	muxFlag := flag.Bool("mux", true, "Enable 0-RTT Connection Multiplexing (default true)")
 	noMuxFlag := flag.Bool("no-mux", false, "Disable 0-RTT Connection Multiplexing (fallback to 1:1 pool)")
 	muxSessionsFlag := flag.Int("mux-sessions", 8, "Number of parallel physical Mux sessions (default 8, max 64)")
+	muxWindowFlag := flag.Int("mux-window", 0, "MUX per-stream receive window in KiB (64..65535, default 0 = auto adaptive)")
 	obfsFlag := flag.Bool("obfs", false, "Pad MUX DATA frames with random lengths to resist packet-size fingerprinting")
 	wFlag := flag.Int("W", 128, "App Buffer Size in KB (default 128KB, recommend 256-1024 for high-throughput streaming)")
 	sockBufFlag := flag.Int("socket-buffer", 0, "Kernel Socket Buffer in KB (default 0 = OS auto-tuning)")
@@ -2654,6 +2670,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "        Disable 0-RTT Connection Multiplexing (fallback to 1:1 pool)\n")
 		fmt.Fprintf(os.Stderr, "  -mux-sessions int\n")
 		fmt.Fprintf(os.Stderr, "        Number of parallel physical Mux sessions (default 8, max 64)\n")
+		fmt.Fprintf(os.Stderr, "  -mux-window int\n")
+		fmt.Fprintf(os.Stderr, "        MUX per-stream receive window in KiB (64..65535, default 0 = auto adaptive)\n")
 		fmt.Fprintf(os.Stderr, "  -W int\n")
 		fmt.Fprintf(os.Stderr, "        App Buffer Size in KB (default 128, recommend 512-1024 for 4K streaming)\n")
 		fmt.Fprintf(os.Stderr, "  -socket-buffer int\n")
@@ -2756,6 +2774,31 @@ func main() {
 	if *muxSessionsFlag < 1 || *muxSessionsFlag > 64 {
 		fmt.Printf("Error: -mux-sessions must be between 1 and 64, got %d\n", *muxSessionsFlag)
 		os.Exit(1)
+	}
+	if *muxWindowFlag != 0 && (*muxWindowFlag < 64 || *muxWindowFlag > 65535) {
+		fmt.Printf("Error: -mux-window must be 0 (auto) or between 64 and 65535 KiB, got %d\n", *muxWindowFlag)
+		os.Exit(1)
+	}
+	if *muxWindowFlag > 0 {
+		muxInitialWindowKib = *muxWindowFlag
+		winBytes := int64(*muxWindowFlag) * 1024
+		bufLim := winBytes + 2*1024*1024
+		if bufLim < 4*1024*1024 {
+			bufLim = 4 * 1024 * 1024
+		}
+		muxClientStreamBufferLimit = bufLim
+		muxServerStreamBufferLimit = bufLim
+		halfWin := winBytes / 2
+		if muxWindowRefresh < halfWin {
+			muxRefundThreshold = muxWindowRefresh
+		} else {
+			muxRefundThreshold = halfWin
+		}
+		minSlots := int((bufLim + 65534) / 65535)
+		if minSlots > muxStreamIngressQueue {
+			muxStreamIngressQueue = minSlots
+			muxStreamAppQueue = minSlots
+		}
 	}
 	if *quicConnsFlag < 1 || *quicConnsFlag > 16 {
 		fmt.Printf("Error: -quic-conns must be between 1 and 16, got %d\n", *quicConnsFlag)
@@ -2961,17 +3004,19 @@ func main() {
 		initProfileTLSConfigs(cfg.TLSBase)
 	}
 
-	bufSize := cfg.BufferSize + 14
-	if bufSize < 65536+14+MuxHeaderLen {
-		bufSize = 65536 + 14 + MuxHeaderLen
-	}
-	if bufSize > 12*1024*1024+14+MuxHeaderLen {
-		bufSize = 12*1024*1024 + 14 + MuxHeaderLen
-	}
+	minBufSize := 65536 + 14 + MuxHeaderLen
 	if cipherMode == cipherModeAEAD {
-		// tail room so an in-place [nonce|ct|tag] seal can expand the
-		// relay/MUX region without a second buffer
+		minBufSize += aeadOverhead
+	}
+	bufSize := cfg.BufferSize + 14
+	if cipherMode == cipherModeAEAD {
 		bufSize += aeadOverhead
+	}
+	if bufSize < minBufSize {
+		bufSize = minBufSize
+	}
+	if bufSize > 12*1024*1024+14+MuxHeaderLen+aeadOverhead {
+		bufSize = 12*1024*1024 + 14 + MuxHeaderLen + aeadOverhead
 	}
 	cfg.BufPool = &sync.Pool{
 		New: func() interface{} {
@@ -3176,6 +3221,15 @@ const (
 	muxSmallPayloadCopyLimit = 8192
 )
 
+// muxSmallBufPool provides pooled 8 KiB buffers for small frames to eliminate
+// heap allocations in high-frequency interactive or web requests.
+var muxSmallBufPool = &sync.Pool{
+	New: func() any {
+		b := make([]byte, muxSmallPayloadCopyLimit)
+		return &b
+	},
+}
+
 var (
 	adaptiveMemMiB             int    = 4096
 	adaptiveTierName           string = "High-BDP"
@@ -3212,10 +3266,10 @@ func initAdaptiveMemoryProfile() {
 		debug.SetMemoryLimit(limitBytes)
 	} else if mib <= 2048 {
 		adaptiveTierName = "Balanced"
-		muxInitialWindowKib = 8192
-		muxWindowRefresh = 1024 * 1024
-		muxClientStreamBufferLimit = 10 * 1024 * 1024
-		muxServerStreamBufferLimit = 10 * 1024 * 1024
+		muxInitialWindowKib = 16384
+		muxWindowRefresh = 2 * 1024 * 1024
+		muxClientStreamBufferLimit = 18 * 1024 * 1024
+		muxServerStreamBufferLimit = 18 * 1024 * 1024
 		muxStreamIngressQueue = 768
 		muxStreamAppQueue = 768
 		adaptiveNonMuxPoolSize = 8
@@ -4187,9 +4241,14 @@ func (w *muxOutboundWriter) popLocked() (muxOutboundFrame, bool) {
 			}
 		}
 		if !blocked {
-			copy(w.priority[i:], w.priority[i+1:])
-			w.priority[len(w.priority)-1] = muxOutboundFrame{}
-			w.priority = w.priority[:len(w.priority)-1]
+			if i == 0 && len(w.priority) == 1 {
+				w.priority[0] = muxOutboundFrame{}
+				w.priority = w.priority[:0]
+			} else {
+				copy(w.priority[i:], w.priority[i+1:])
+				w.priority[len(w.priority)-1] = muxOutboundFrame{}
+				w.priority = w.priority[:len(w.priority)-1]
+			}
 			w.total--
 			w.queuedFrames.Store(int64(w.total))
 			if w.waiters > 0 {
@@ -4268,8 +4327,12 @@ func (w *muxOutboundWriter) enqueue(f muxOutboundFrame) bool {
 			w.waiters--
 		}
 	}
+	defer w.mu.Unlock()
+	return w.enqueueLocked(f, isPriority)
+}
+
+func (w *muxOutboundWriter) enqueueLocked(f muxOutboundFrame, isPriority bool) bool {
 	if w.closed {
-		w.mu.Unlock()
 		w.releaseFrame(f)
 		return false
 	}
@@ -4308,7 +4371,6 @@ func (w *muxOutboundWriter) enqueue(f muxOutboundFrame) bool {
 			w.cond.Signal()
 		}
 	}
-	w.mu.Unlock()
 	return true
 }
 
@@ -4715,9 +4777,13 @@ func (s *MuxClientSession) readLoop() {
 		case MuxCmdDATA:
 			if len(payload) > 0 {
 				if len(payload) <= muxSmallPayloadCopyLimit {
-					cp := make([]byte, len(payload))
-					copy(cp, payload)
-					st.enqueueDataFrame(muxDataFrame{data: cp})
+					sPtr := muxSmallBufPool.Get().(*[]byte)
+					copy(*sPtr, payload)
+					st.enqueueDataFrame(muxDataFrame{
+						data: (*sPtr)[:len(payload)],
+						bPtr: sPtr,
+						pool: muxSmallBufPool,
+					})
 				} else {
 					nextBPtr := s.cfg.BufPool.Get().(*[]byte)
 					frame := muxDataFrame{
@@ -5218,6 +5284,7 @@ type MuxServerStream struct {
 	sendGate *creditGate
 	// W3 refund accumulator (bytes written to the target -> WINDOW).
 	refundPending int64
+	eofSent       atomic.Bool
 }
 
 func newMuxServerStream(id uint32, session *MuxServerSession) *MuxServerStream {
@@ -5431,6 +5498,9 @@ func (s *MuxServerStream) Close() {
 		close(s.closed)
 		s.sendGate.Close()
 		s.closeTargetConn()
+		if !s.eofSent.Load() && s.session != nil && s.session.writer != nil {
+			s.session.writer.dropStream(s.id)
+		}
 		s.bufMu.Lock()
 		s.queuedBytes = 0
 		ing := s.ingress
@@ -5478,6 +5548,9 @@ func (s *MuxServerSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 	}
 	if s.writer == nil {
 		return s.sendFrameInline(streamID, cmd, payload)
+	}
+	if cmd == MuxCmdRST {
+		s.writer.dropStream(streamID)
 	}
 	payloadLen := len(payload)
 	if payloadLen > 65535 {
@@ -5776,6 +5849,12 @@ func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 				copy(initialData, payload[2+tLen:])
 			}
 
+			if cfg != nil && cfg.MaxConns > 0 && !tryAcquireConn(int64(cfg.MaxConns)) {
+				logWarn("[SERVER-MUX] MaxConns (%d) reached, rejecting stream %d", cfg.MaxConns, streamID)
+				session.SendFrame(streamID, MuxCmdRST, nil)
+				continue
+			}
+
 			session.streamsMu.Lock()
 			if oldSt, ok := session.streams[streamID]; ok {
 				delete(session.streams, streamID)
@@ -5795,9 +5874,13 @@ func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 			session.streamsMu.RUnlock()
 			if ok && len(payload) > 0 {
 				if len(payload) <= muxSmallPayloadCopyLimit {
-					cp := make([]byte, len(payload))
-					copy(cp, payload)
-					st.enqueueDataFrame(muxDataFrame{data: cp})
+					sPtr := muxSmallBufPool.Get().(*[]byte)
+					copy(*sPtr, payload)
+					st.enqueueDataFrame(muxDataFrame{
+						data: (*sPtr)[:len(payload)],
+						bPtr: sPtr,
+						pool: muxSmallBufPool,
+					})
 				} else {
 					nextBPtr := cfg.BufPool.Get().(*[]byte)
 					frame := muxDataFrame{
@@ -5845,6 +5928,9 @@ func (s *MuxServerSession) handleNewStream(st *MuxServerStream, targetStr string
 		s.streamsMu.Lock()
 		delete(s.streams, st.id)
 		s.streamsMu.Unlock()
+		if s.cfg != nil && s.cfg.MaxConns > 0 {
+			releaseConn()
+		}
 	}()
 
 	if serverTargetBlocked(s.cfg, targetStr) {
@@ -5961,6 +6047,7 @@ func (s *MuxServerSession) handleNewStream(st *MuxServerStream, targetStr string
 		}
 		if errRead != nil {
 			if errRead == io.EOF {
+				st.eofSent.Store(true)
 				s.SendFrame(st.id, MuxCmdFIN, nil)
 			} else {
 				s.SendFrame(st.id, MuxCmdRST, nil)
@@ -6085,12 +6172,12 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 	}
 
 	acc := computeAcceptKey(wsKey)
-	// Pre-allocated prefix + accept key + suffix (avoids Buffer + 3 allocs)
-	respBuf := make([]byte, len(wsUpgradePrefix)+len(acc)+len(wsUpgradeSuffix))
-	copy(respBuf, wsUpgradePrefix)
-	copy(respBuf[len(wsUpgradePrefix):], acc)
-	copy(respBuf[len(wsUpgradePrefix)+len(acc):], wsUpgradeSuffix)
-	if _, err := wsConn.Write(respBuf); err != nil {
+	// Pre-allocated stack buffer for upgrade response (0 allocs)
+	var respBuf [256]byte
+	off := copy(respBuf[:], wsUpgradePrefix)
+	off += copy(respBuf[off:], acc)
+	off += copy(respBuf[off:], wsUpgradeSuffix)
+	if _, err := wsConn.Write(respBuf[:off]); err != nil {
 		return
 	}
 
@@ -6278,11 +6365,17 @@ type udpBatch struct {
 }
 
 func newUDPBatch(conn *net.UDPConn) *udpBatch {
+	slots := udpBatchCount
+	fallback := runtime.GOOS != "linux"
+	if fallback {
+		slots = 1
+	}
 	b := &udpBatch{
-		conn:  conn,
-		pc:    ipv4.NewPacketConn(conn),
-		msgs:  make([]ipv4.Message, udpBatchCount),
-		addrs: make([]net.UDPAddr, udpBatchCount),
+		conn:     conn,
+		pc:       ipv4.NewPacketConn(conn),
+		msgs:     make([]ipv4.Message, slots),
+		addrs:    make([]net.UDPAddr, slots),
+		fallback: fallback,
 	}
 	for i := range b.msgs {
 		b.msgs[i].Buffers = [][]byte{make([]byte, udpBatchBufSize)}
@@ -6321,6 +6414,17 @@ func cloneUDPAddr(a *net.UDPAddr) *net.UDPAddr {
 		cp.IP = append(net.IP(nil), a.IP...)
 	}
 	return &cp
+}
+
+func updateClientUDPAddr(dst *atomic.Pointer[net.UDPAddr], src *net.UDPAddr) {
+	if src == nil {
+		return
+	}
+	cur := dst.Load()
+	if cur != nil && cur.Port == src.Port && cur.Zone == src.Zone && cur.IP.Equal(src.IP) {
+		return
+	}
+	dst.Store(cloneUDPAddr(src))
 }
 
 // udpAddrCache memoizes ResolveUDPAddr results for one UDP relay session —
@@ -6435,11 +6539,13 @@ func newUDPBatchWriter(conn *net.UDPConn, up bool) *udpBatch {
 		wup:       up,
 		wfallback: runtime.GOOS != "linux",
 	}
-	b.wmsgs = make([]ipv4.Message, udpBatchCount)
-	b.wbufs = make([][]byte, udpBatchCount)
-	for i := range b.wmsgs {
-		b.wbufs[i] = make([]byte, udpBatchBufSize)
-		b.wmsgs[i].Buffers = [][]byte{b.wbufs[i][:0]}
+	if !b.wfallback {
+		b.wmsgs = make([]ipv4.Message, udpBatchCount)
+		b.wbufs = make([][]byte, udpBatchCount)
+		for i := range b.wmsgs {
+			b.wbufs[i] = make([]byte, udpBatchBufSize)
+			b.wmsgs[i].Buffers = [][]byte{b.wbufs[i][:0]}
+		}
 	}
 	return b
 }
@@ -6642,6 +6748,12 @@ func handleServerUDP(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 		batch := newUDPBatch(udpConn)
 		var lastWriteSet time.Time
 		writeTimeout := time.Duration(cfg.ConnTimeout) * time.Second
+		var localDown int64
+		defer func() {
+			if localDown > 0 {
+				stats.AddBytes(0, localDown)
+			}
+		}()
 		for {
 			count, errRead := batch.read()
 			if errRead != nil {
@@ -6693,11 +6805,18 @@ func handleServerUDP(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 					err = errWrite
 					return
 				}
-				stats.AddBytes(0, int64(n))
+				localDown += int64(n)
+				if localDown >= 256*1024 {
+					stats.AddBytes(0, localDown)
+					localDown = 0
+				}
 			}
 		}
 	}()
 
+	<-errCh
+	_ = wsConn.Close()
+	_ = udpConn.Close()
 	<-errCh
 }
 
@@ -6705,7 +6824,20 @@ func isLocalIP(ip net.IP) bool {
 	if len(ip) == 0 {
 		return false
 	}
-	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified()
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+		return true
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		// RFC 6598 Carrier-Grade NAT (CGNAT) 100.64.0.0/10
+		if ip4[0] == 100 && (ip4[1]&0xC0) == 64 {
+			return true
+		}
+		// RFC 1122 Current network (0.0.0.0/8)
+		if ip4[0] == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func isLocalTarget(host string) bool {
@@ -6770,6 +6902,7 @@ func dialUpstreamPooledWS(cfg *Config) (*PooledConn, *net.TCPConn, error) {
 	if connPool != nil {
 		if pooledConn := connPool.Get(); pooledConn != nil {
 			logDebug("[CLIENT] Using pooled connection")
+			pooledConn.fromPool = true
 			return pooledConn, extractTCPConn(pooledConn.wsConn), nil
 		}
 	}
@@ -6921,6 +7054,12 @@ func handleClientUDP(localConn net.Conn, cfg *Config) {
 		batch := newUDPBatch(udpListener)
 		var lastWriteSet time.Time
 		writeTimeout := time.Duration(cfg.ConnTimeout) * time.Second
+		var localUp int64
+		defer func() {
+			if localUp > 0 {
+				stats.AddBytes(localUp, 0)
+			}
+		}()
 		for {
 			count, errRead := batch.read()
 			if errRead != nil {
@@ -6934,7 +7073,7 @@ func handleClientUDP(localConn net.Conn, cfg *Config) {
 					logWarn("[CLIENT-UDP] Blocked local UDP datagram")
 					continue
 				}
-				clientUDPAddr.Store(cloneUDPAddr(batch.msgs[i].Addr.(*net.UDPAddr)))
+				updateClientUDPAddr(&clientUDPAddr, batch.msgs[i].Addr.(*net.UDPAddr))
 				copy(buf[14:], pkt)
 				wireLen := n
 				if cfg.Crypto != nil {
@@ -6949,7 +7088,11 @@ func handleClientUDP(localConn net.Conn, cfg *Config) {
 					err = errWrite
 					return
 				}
-				stats.AddBytes(int64(n), 0)
+				localUp += int64(n)
+				if localUp >= 256*1024 {
+					stats.AddBytes(localUp, 0)
+					localUp = 0
+				}
 			}
 		}
 	}()
@@ -7008,6 +7151,7 @@ func handleClientUDP(localConn net.Conn, cfg *Config) {
 	udpListener.Close()
 	wsConn.Close()
 	localConn.Close()
+	<-errCh
 }
 
 type preReader struct {
@@ -7320,33 +7464,66 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		logError("Upstream fail: %v", err)
 		return
 	}
-	wsConn := pooledConn.wsConn
-	br := pooledConn.br
-
-	// In non-Mux mode, each WebSocket connection is dedicated to a single target relay.
-	// The server closes the connection upon relay completion, so post-relay connections
-	// cannot be reused. connPool serves as a pre-warmed 0-RTT dial pool.
-	defer wsConn.Close()
 
 	optimizeSocket(localConn, cfg)
 	localTCPConn := extractTCPConn(localConn)
 
 	targetPayload := []byte(targetAddr + "\n")
 	targetPayload = cfg.Crypto.sealFrame(targetPayload)
-	if err := writeWSFrame(wsConn, targetPayload, 0x2, true); err != nil {
-		return
+	var wsConn net.Conn
+	var br *bufio.Reader
+	if err := writeWSFrame(pooledConn.wsConn, targetPayload, 0x2, true); err != nil {
+		pooledConn.wsConn.Close()
+		// If pooled connection failed, retry once with a fresh dial
+		if pooledConn.fromPool {
+			logDebug("[CLIENT] Pooled connection write failed, retrying fresh dial...")
+			freshPooled, freshTCP, dialErr := dialUpstreamPooledWS(cfg)
+			if dialErr != nil {
+				logError("Upstream fresh retry fail: %v", dialErr)
+				return
+			}
+			pooledConn = freshPooled
+			wsTCPConn = freshTCP
+			if err := writeWSFrame(pooledConn.wsConn, targetPayload, 0x2, true); err != nil {
+				pooledConn.wsConn.Close()
+				return
+			}
+		} else {
+			return
+		}
 	}
 
 	setTCPReadDeadline(wsTCPConn, cfg.ConnTimeout)
-	okFrame, err := readWSFrame(br, wsConn, cfg.Crypto)
-	if err != nil {
-		logError("Read OK failed: %v", err)
-		return
+	okFrame, err := readWSFrame(pooledConn.br, pooledConn.wsConn, cfg.Crypto)
+	if err != nil || !strings.HasPrefix(string(okFrame), "OK") {
+		pooledConn.wsConn.Close()
+		if pooledConn.fromPool {
+			logDebug("[CLIENT] Pooled connection auth/read failed (%v), retrying fresh dial...", err)
+			freshPooled, freshTCP, dialErr := dialUpstreamPooledWS(cfg)
+			if dialErr != nil {
+				logError("Upstream fresh retry fail: %v", dialErr)
+				return
+			}
+			pooledConn = freshPooled
+			wsTCPConn = freshTCP
+			if err := writeWSFrame(pooledConn.wsConn, targetPayload, 0x2, true); err != nil {
+				pooledConn.wsConn.Close()
+				return
+			}
+			setTCPReadDeadline(wsTCPConn, cfg.ConnTimeout)
+			okFrame, err = readWSFrame(pooledConn.br, pooledConn.wsConn, cfg.Crypto)
+		}
+		if err != nil {
+			logError("Read OK failed: %v", err)
+			return
+		}
+		if !strings.HasPrefix(string(okFrame), "OK") {
+			logError("Auth rejected by server")
+			return
+		}
 	}
-	if !strings.HasPrefix(string(okFrame), "OK") {
-		logError("Auth rejected by server")
-		return
-	}
+	wsConn = pooledConn.wsConn
+	br = pooledConn.br
 
 	if ver == 0x05 {
 		if _, err := localConn.Write(socks5OKResp); err != nil {
@@ -7479,10 +7656,10 @@ func handleClient(localConn net.Conn, cfg *Config) {
 var wsGUID = []byte("258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
 
 func computeAcceptKey(challenge string) string {
-	sha1buf := make([]byte, 0, len(challenge)+len(wsGUID))
-	sha1buf = append(sha1buf, challenge...)
-	sha1buf = append(sha1buf, wsGUID...)
-	sum := sha1.Sum(sha1buf)
+	var buf [128]byte
+	n := copy(buf[:], challenge)
+	n += copy(buf[n:], wsGUID)
+	sum := sha1.Sum(buf[:n])
 	// Pre-allocate exact base64 output size (28 bytes for 20-byte SHA1)
 	var b64 [28]byte
 	base64.StdEncoding.Encode(b64[:], sum[:])
@@ -7717,6 +7894,25 @@ func putBufioReader(br *bufio.Reader) {
 	bufioReaderPool.Put(br)
 }
 
+func readBoundedLine(br *bufio.Reader, maxLen int) (string, error) {
+	var buf []byte
+	for {
+		b, err := br.ReadByte()
+		if err != nil {
+			return "", err
+		}
+		if b == '\n' {
+			break
+		}
+		if len(buf) < maxLen {
+			buf = append(buf, b)
+		} else {
+			return "", errors.New("line too long")
+		}
+	}
+	return string(buf), nil
+}
+
 func handleQUICStream(stream quic.Stream, cfg *Config) {
 	defer func() {
 		_ = stream.Close()
@@ -7730,10 +7926,15 @@ func handleQUICStream(stream quic.Stream, cfg *Config) {
 			putBufioReader(br)
 		}
 	}()
-	targetLine, err := br.ReadString('\n')
+	streamTimeout := time.Duration(cfg.ConnTimeout) * time.Second
+	if cfg.ConnTimeout > 0 {
+		_ = stream.SetReadDeadline(time.Now().Add(streamTimeout))
+	}
+	targetLine, err := readBoundedLine(br, 512)
 	if err != nil {
 		return
 	}
+	_ = stream.SetReadDeadline(time.Time{})
 	targetStr := strings.TrimSpace(targetLine)
 
 	// Authentication check if key is set
@@ -7786,6 +7987,7 @@ func handleQUICStream(stream quic.Stream, cfg *Config) {
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
 		var lastWriteSet time.Time
+		var lastReadSet time.Time
 		var localUp int64
 		defer func() {
 			if localUp > 0 {
@@ -7793,6 +7995,7 @@ func handleQUICStream(stream quic.Stream, cfg *Config) {
 			}
 		}()
 		for {
+			refreshReadDeadline(stream, writeTimeout, &lastReadSet)
 			nr, errRead := br.Read(buf)
 			if nr > 0 {
 				refreshWriteDeadline(targetConn, writeTimeout, &lastWriteSet)
@@ -7810,6 +8013,9 @@ func handleQUICStream(stream quic.Stream, cfg *Config) {
 				if tc, ok := targetConn.(*net.TCPConn); ok {
 					_ = tc.CloseWrite()
 				}
+				if cfg.ConnTimeout > 0 {
+					_ = targetConn.SetReadDeadline(time.Now().Add(time.Duration(cfg.ConnTimeout) * time.Second))
+				}
 				if errRead == io.EOF {
 					errCh <- nil
 				} else {
@@ -7826,6 +8032,7 @@ func handleQUICStream(stream quic.Stream, cfg *Config) {
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
 		var lastWriteSet time.Time
+		var lastReadSet time.Time
 		var localDown int64
 		defer func() {
 			if localDown > 0 {
@@ -7833,6 +8040,7 @@ func handleQUICStream(stream quic.Stream, cfg *Config) {
 			}
 		}()
 		for {
+			refreshReadDeadline(targetConn, writeTimeout, &lastReadSet)
 			nr, errRead := targetConn.Read(buf)
 			if nr > 0 {
 				refreshWriteDeadline(stream, writeTimeout, &lastWriteSet)
@@ -7978,10 +8186,18 @@ func handleQUICServerUDP(stream quic.Stream, br *bufio.Reader, cfg *Config) {
 	go func() {
 		// Single buffer [2B len | SOCKS5-UDP hdr | payload] — one stream
 		// Write per datagram instead of the old len-prefix + payload pair.
-		out := make([]byte, 2+65535)
+		bPtr := cfg.BufPool.Get().(*[]byte)
+		defer cfg.BufPool.Put(bPtr)
+		out := *bPtr
 		batch := newUDPBatch(udpConn)
 		var lastWriteSet time.Time
 		writeTimeout := time.Duration(cfg.ConnTimeout) * time.Second
+		var localDown int64
+		defer func() {
+			if localDown > 0 {
+				stats.AddBytes(0, localDown)
+			}
+		}()
 		for {
 			count, errRead := batch.read()
 			if errRead != nil {
@@ -8019,11 +8235,18 @@ func handleQUICServerUDP(stream quic.Stream, br *bufio.Reader, cfg *Config) {
 					errCh <- errWrite
 					return
 				}
-				stats.AddBytes(0, int64(n))
+				localDown += int64(n)
+				if localDown >= 256*1024 {
+					stats.AddBytes(0, localDown)
+					localDown = 0
+				}
 			}
 		}
 	}()
 
+	<-errCh
+	_ = stream.Close()
+	_ = udpConn.Close()
 	<-errCh
 }
 
@@ -8323,11 +8546,16 @@ func relayQUICClient(localConn net.Conn, ver byte, initialPayload []byte, target
 
 	br := getBufioReader(stream)
 	defer putBufioReader(br)
-	resp, err := br.ReadString('\n')
+	writeTimeout := time.Duration(cfg.ConnTimeout) * time.Second
+	if cfg.ConnTimeout > 0 {
+		_ = stream.SetReadDeadline(time.Now().Add(writeTimeout))
+	}
+	resp, err := readBoundedLine(br, 512)
 	if err != nil || !strings.HasPrefix(resp, "OK") {
 		logError("[CLIENT-QUIC] Upstream rejected target: %v, resp: %s", err, resp)
 		return false
 	}
+	_ = stream.SetReadDeadline(time.Time{})
 
 	if ver == 0x05 {
 		if _, err := localConn.Write(socks5OKResp); err != nil {
@@ -8342,13 +8570,13 @@ func relayQUICClient(localConn net.Conn, ver byte, initialPayload []byte, target
 	errCh := make(chan error, 2)
 	// Egress writes get a deadline too (M6): a wedged peer must fail the
 	// write instead of pinning the relay goroutine forever.
-	writeTimeout := time.Duration(cfg.ConnTimeout) * time.Second
 
 	go func() {
 		bPtr := cfg.BufPool.Get().(*[]byte)
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
 		var lastWriteSet time.Time
+		var lastReadSet time.Time
 		var localUp int64
 		defer func() {
 			if localUp > 0 {
@@ -8356,6 +8584,7 @@ func relayQUICClient(localConn net.Conn, ver byte, initialPayload []byte, target
 			}
 		}()
 		for {
+			refreshReadDeadline(localConn, writeTimeout, &lastReadSet)
 			nr, errRead := localConn.Read(buf)
 			if nr > 0 {
 				refreshWriteDeadline(stream, writeTimeout, &lastWriteSet)
@@ -8372,6 +8601,9 @@ func relayQUICClient(localConn net.Conn, ver byte, initialPayload []byte, target
 			if errRead != nil {
 				if errRead == io.EOF {
 					_ = stream.Close()
+					if cfg.ConnTimeout > 0 {
+						_ = stream.SetReadDeadline(time.Now().Add(writeTimeout))
+					}
 					errCh <- nil
 				} else {
 					stream.CancelWrite(0)
@@ -8387,6 +8619,7 @@ func relayQUICClient(localConn net.Conn, ver byte, initialPayload []byte, target
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
 		var lastWriteSet time.Time
+		var lastReadSet time.Time
 		var localDown int64
 		defer func() {
 			if localDown > 0 {
@@ -8394,6 +8627,7 @@ func relayQUICClient(localConn net.Conn, ver byte, initialPayload []byte, target
 			}
 		}()
 		for {
+			refreshReadDeadline(stream, writeTimeout, &lastReadSet)
 			nr, errRead := br.Read(buf)
 			if nr > 0 {
 				refreshWriteDeadline(localConn, writeTimeout, &lastWriteSet)
@@ -8451,11 +8685,16 @@ func handleClientUDPQUIC(localConn net.Conn, boundAddr *net.UDPAddr, udpListener
 
 	br := getBufioReader(stream)
 	defer putBufioReader(br)
-	resp, err := br.ReadString('\n')
+	writeTimeout := time.Duration(cfg.ConnTimeout) * time.Second
+	if cfg.ConnTimeout > 0 {
+		_ = stream.SetReadDeadline(time.Now().Add(writeTimeout))
+	}
+	resp, err := readBoundedLine(br, 512)
 	if err != nil || !strings.HasPrefix(resp, "OK") {
 		logError("[CLIENT-QUIC-UDP] Auth rejected by server: %s", resp)
 		return
 	}
+	_ = stream.SetReadDeadline(time.Time{})
 
 	logInfo("[CLIENT-QUIC-UDP] Tunnel established on port %d", boundAddr.Port)
 
@@ -8468,7 +8707,12 @@ func handleClientUDPQUIC(localConn net.Conn, boundAddr *net.UDPAddr, udpListener
 		buf := *bPtr
 		batch := newUDPBatch(udpListener)
 		var lastWriteSet time.Time
-		writeTimeout := time.Duration(cfg.ConnTimeout) * time.Second
+		var localUp int64
+		defer func() {
+			if localUp > 0 {
+				stats.AddBytes(localUp, 0)
+			}
+		}()
 		for {
 			count, errRead := batch.read()
 			if errRead != nil {
@@ -8482,7 +8726,7 @@ func handleClientUDPQUIC(localConn net.Conn, boundAddr *net.UDPAddr, udpListener
 					logWarn("[CLIENT-QUIC-UDP] Blocked local UDP datagram")
 					continue
 				}
-				clientUDPAddr.Store(cloneUDPAddr(batch.msgs[i].Addr.(*net.UDPAddr)))
+				updateClientUDPAddr(&clientUDPAddr, batch.msgs[i].Addr.(*net.UDPAddr))
 				// [2B len | payload] in one buffer — one stream Write per
 				// datagram instead of the old len-prefix + payload pair.
 				binary.BigEndian.PutUint16(buf[:2], uint16(n))
@@ -8492,7 +8736,11 @@ func handleClientUDPQUIC(localConn net.Conn, boundAddr *net.UDPAddr, udpListener
 					errCh <- errWrite
 					return
 				}
-				stats.AddBytes(int64(n), 0)
+				localUp += int64(n)
+				if localUp >= 256*1024 {
+					stats.AddBytes(localUp, 0)
+					localUp = 0
+				}
 			}
 		}
 	}()
@@ -8550,4 +8798,5 @@ func handleClientUDPQUIC(localConn net.Conn, boundAddr *net.UDPAddr, udpListener
 	udpListener.Close()
 	stream.Close()
 	localConn.Close()
+	<-errCh
 }

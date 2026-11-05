@@ -6,6 +6,32 @@ All notable changes to the **Way Proxy** project (Goway & Pyway) are documented 
 
 ---
 
+## [v1.8.32] - 2026-11-05
+
+### 千兆网络流控窗口升级、MUX 小帧池化零分配、UDP 批处理零分配优化、连接池透明重试与超时防泄漏加固
+
+- **Balanced 档位流控窗口升级 (16MiB) 与 `-mux-window` 标志**: 1~2GB 内存 VPS（`Balanced` 档）初始 MUX 窗口从 8MiB 提升至 16MiB（刷新阈值 2MiB，流缓冲上限 18MiB），使 130ms 跨国延迟下仍可单流跑满 1000Mbps 千兆带宽；新增 `-mux-window <KiB>` 命令行参数支持手动调优窗口大小。
+- **MUX 小数据帧池化零堆分配 (`muxSmallBufPool`)**: 针对 `<= 8KiB` 的 MUX 数据帧引入专用 8KB `sync.Pool` 并在消费后自动归还，消除高频小包每帧 `make([]byte)` 堆分配与 GC 压力，同时避免小包钉死 128KB `BufPool` 缓冲。
+- **非 Linux 平台 UDP 批量读写缓冲裁剪**: 在非 Linux 系统（Windows/macOS/FreeBSD）`newUDPBatch` 仅分配单槽位且 `newUDPBatchWriter` 跳过 512KiB `wbufs` 初始化，每个 UDP 会话节省 960KiB 内存。
+- **UDP 客户端地址零分配更新与统计批量聚合**: 新增 `updateClientUDPAddr` 仅在客户端源地址变化时克隆更新，并在 4 处 UDP 转发循环中按 256KiB 阈值批量刷新 `stats.AddBytes`；`handleQUICServerUDP` 改用 `cfg.BufPool` 复用缓冲。
+- **WebSocket 握手栈化与动态头缓冲**: `computeAcceptKey` 与 `handleServer` 升级响应改用栈数组（`[128]byte` / `[256]byte`），`readUntilCRLFCRLF` 移除 8KB 预扩容，单次握手内存降低 93%。
+- **MUX 服务端流正常 EOF 保尾帧与异常关闭即时清队**: `MuxServerStream` 引入 `eofSent` 标记，正常 `io.EOF` 结束保留在途尾帧直至 `FIN` 送达，异常断开或 `RST` 立即调用 `writer.dropStream` 回收缓冲。
+- **全链路超时、配额与重连加固**: QUIC 与 UDP 转发循环全面补齐滚动 `refreshReadDeadline` 与双端 `<-errCh` 排空；1:1 连接池失效连接支持单次透明重连；`handleServerMux` 纳入 `MaxConns` 配额保护；QUIC 握手行读取限制 512B；`isLocalIP` 扩展拦截 CGNAT (`100.64.0.0/10`) 与 `0.0.0.0/8`。
+- **认证**: `cmd/bench` 交错配对 A/B 基准认证（`n=10`，`c=1, 8, 32`）**15/15 PASS（0 回归）**，数据记录于 `goway/AI_HANDOFF.md`。
+
+---
+
+## [v1.8.31] - 2026-11-01
+
+### MUX 慢路径按需惰性分配、UDP 零分配缓存与本地检测、流量统计批量聚合及全链路健壮性加固
+
+- **MUX 慢路径队列与投递协程惰性按需初始化**: `MuxStream` 与 `MuxServerStream` 延迟分配 1024 槽位 `ingress` 通道及 `deliveryLoop` 协程，常规快路径单流创建分配下降 44%（`74,640 B/op -> 41,776 B/op`）。
+- **UDP IP 快路径零分配缓存与本地 IP 直接判定**: 新增 `isLocalIP(net.IP)` 与 `udpAddrCache.getIP(rawIP, port)`，实现 `0 B/op, 0 allocs/op` 地址解析与本地拦截。
+- **转发热路径 `stats.AddBytes` 批量原子累加**: 在 TCP/MUX/QUIC 转发热循环中按 256KiB 阈值及退出 `defer` 批量刷新统计。
+- **安全与健壮性修复**: 新增 `validateServerAuthTarget` 结构化校验、修复 1:1 非 MUX AEAD 满帧边界、握手路径全面改用无锁 `maskPRNG`、合并测试套件至单一 `goway_test.go`。
+
+---
+
 ## [v1.8.30] - 2026-10-19
 
 ### 服务端默认开启内网与回环拦截、UDP 全链路本地防御强化与 DNS 重绑定根除

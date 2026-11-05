@@ -2068,21 +2068,17 @@ func TestMuxOutboundWriterFairness(t *testing.T) {
 		w := newMuxOutboundWriter(client, prng, nil, true, 0)
 		defer w.close()
 		br := bufio.NewReader(server)
-		if !w.enqueue(mkframe(1, MuxCmdDATA, 32768)) {
+		w.mu.Lock()
+		if !w.enqueueLocked(mkframe(1, MuxCmdDATA, 32768), false) {
+			w.mu.Unlock()
 			t.Fatal("bulk enqueue rejected")
 		}
-		// Drain the in-flight bulk frame first: this pins the writer to a
-		// known state (idle, empty queues) so the assertions below are
-		// deterministic regardless of goroutine scheduling.
-		if id, _ := readMux(br, server); id != 1 {
-			t.Fatalf("first frame not bulk: %d", id)
-		}
-		if !w.enqueue(mkframe(1, MuxCmdDATA, 32768)) {
-			t.Fatal("bulk enqueue rejected")
-		}
-		if !w.enqueue(mkframe(2, MuxCmdFIN, 0)) {
+		if !w.enqueueLocked(mkframe(2, MuxCmdFIN, 0), true) {
+			w.mu.Unlock()
 			t.Fatal("FIN enqueue rejected")
 		}
+		w.mu.Unlock()
+
 		var cmds []byte
 		var ids []uint32
 		for i := 0; i < 2; i++ {
@@ -2090,7 +2086,7 @@ func TestMuxOutboundWriterFairness(t *testing.T) {
 			ids = append(ids, id)
 			cmds = append(cmds, cmd)
 		}
-		// Expected: FIN via the priority lane, then bulk#2.
+		// Expected: FIN via the priority lane, then bulk#1.
 		// Without the priority lane the FIN would come last.
 		if len(cmds) != 2 || cmds[0] != MuxCmdFIN || ids[0] != 2 {
 			t.Fatalf("FIN did not jump queue: ids=%v cmds=%v", ids, cmds)

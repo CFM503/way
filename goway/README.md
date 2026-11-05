@@ -1,4 +1,4 @@
-# GOWAY v1.8.31
+# GOWAY v1.8.32
 
 GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具，支持 HTTP 和完整 SOCKS5 (TCP + UDP) 协议，具备浏览器指纹伪装、0-RTT 多路复用 (Mux)、QUIC 弱网抗丢包传输、Cloudflare CDN 边缘接入与 PGO 机器码级性能优化。
 
@@ -7,6 +7,25 @@ GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具�
 > 接手本项目的 AI 必须先读 `goway/AI_HANDOFF.md` 顶部同名规则并原样保留；每个性能改动必须在 `AI_HANDOFF.md` 记录前后数据，**没有数据不算完成**。
 
 ## 版本历史
+
+### v1.8.32 (2026-11-05) - 千兆网络流控窗口升级、MUX 小帧池化零分配、UDP 批处理零分配优化、连接池透明重试与超时防泄漏加固
+
+#### 核心优化与协议加固
+
+| 优化/修复项 | 说明 | 收益与特性 |
+|---|---|---|
+| **Balanced 档位流控窗口升级 (16MiB) 与 `-mux-window` 标志** | 1~2GB 内存 VPS（`Balanced` 档）初始 MUX 窗口从 8MiB 提升至 16MiB（刷新阈值 2MiB，缓冲上限 18MiB），并新增 `-mux-window` 手动覆盖标志 | **1~2GB 主流 VPS 单流 BDP 吞吐上限翻倍（130ms 跨国延迟下仍可单流跑满 1000Mbps 千兆带宽）** |
+| **小数据帧池化零堆分配 (`muxSmallBufPool`)** | 针对 `<= 8KiB` 的 MUX 数据帧引入专用 8KB `sync.Pool` 并在消费后即时归还，替代原有的每帧 `make([]byte)` | **彻底消除 Web 网页、TLS 握手、DNS 及交互请求每秒数万个小包的堆分配与 GC 压力，同时避免钉死 128KB 大缓冲** |
+| **非 Linux 平台 UDP 批量读写缓冲内存零开销** | 在非 Linux 系统（Windows/macOS/FreeBSD）`newUDPBatch` 仅分配单槽位，`newUDPBatchWriter` 直接跳过 512KiB `wbufs` 切片初始化 | **每个 UDP 会话即刻节省 960KiB（`448KiB + 512KiB`）无用内存分配与 GC 扫描开销** |
+| **UDP 客户端地址零分配更新与统计批量聚合** | 新增 `updateClientUDPAddr` 仅在源地址变化时克隆更新，并在 4 处 UDP 转发热循环中按 256KiB 阈值批量刷新 `stats.AddBytes` | **消除高频 UDP 转发（QUIC/游戏/语音）每包堆分配与多核原子计数器 Cache-line 争用** |
+| **QUIC 服务端 UDP 缓冲复用池化 (`BufPool`)** | 将 `handleQUICServerUDP` 单次连接动态 `make([]byte, 65537)` 替换为 `cfg.BufPool` 复用 | **消除 QUIC UDP 会话建连 65KiB 堆分配并确保退出时无泄漏安全归还** |
+| **WebSocket 握手响应栈化与动态头尺寸** | `computeAcceptKey` 与 `handleServer` 升级为栈分配数组（`[128]byte` 与 `[256]byte`）；`readUntilCRLFCRLF` 移除 8KB 强行预扩容 | **建连单次握手内存开销从 8.5KB 降至约 512B（降低 93%），实现握手路径 0 堆分配** |
+| **MUX 服务端流异常关闭即时清队与正常 EOF 保尾帧** | `MuxServerStream` 引入 `eofSent` 标记：正常 `io.EOF` 结束保留在途尾帧直至 `FIN` 送达，异常断开或 `RST` 立即调用 `dropStream` | **兼顾正常短连接零丢包截断与异常断流时立即释放池化缓冲区内存** |
+| **QUIC 与 UDP 读循环超时与协程排空加固** | 在 `handleQUICStream`、`relayQUICClient`、`handleServerUDP` 等加入滚动 read deadline 并确保两端协程退出时排空 channel | **防止慢速连接或恶意单向阻塞造成协程及池化缓冲永久泄漏（7×24 小时稳定运行保障）** |
+| **连接池失效连接单次透明重试** | `PooledConn` 标记连接来源，首次写入或鉴权探测失败时透明进行一次实时重连 | **消除 1:1 连接池中静默断开的空闲连接导致的偶发性请求失败** |
+| **服务端 MUX 流连接数配额保护、QUIC 行截断与 CGNAT 过滤** | `handleServerMux` 引入 `tryAcquireConn`/`releaseConn` 控制并发流；QUIC 握手读取添加 512B 边界限制；`isLocalIP` 补齐 `100.64.0.0/10` 与 `0.0.0.0/8` | **杜绝恶意单会话无限刷流耗尽 VPS 资源、超长行内存 DoS 及 CGNAT 网段 SSRF 隐患** |
+
+---
 
 ### v1.8.31 (2026-11-01) - MUX 慢路径按需惰性分配、UDP 零分配缓存与本地检测、流量统计批量聚合及全链路健壮性加固
 

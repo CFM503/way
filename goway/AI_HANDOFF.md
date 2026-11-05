@@ -12,6 +12,45 @@
 - User mandate, 2026-09-23. 违反此规则的改动一律不得合入：只允许正向优化，永远禁止反向优化。
 
 
+## v1.8.32 cycle: Gigabit BDP Window Upgrade, Zero-Alloc MUX SmallBufPool, Non-Linux UDP Batch Trim, Connection Retry & Timeout Hardening (2026-11-05)
+
+### Status & Release Summary
+- **Version**: Bumped to `1.8.32` in `goway.go` (`Version = "1.8.32"`), `README.md`, `AI_HANDOFF.md`, and root `CHANGELOG.md`.
+- **Core Vectors Shipped**:
+  1. **OPT-1 — Pooled Small Frame Buffer (`muxSmallBufPool`)**: Introduced `muxSmallBufPool` (`sync.Pool` of 8 KiB buffers) in client `MuxClientSession.readLoop()` and server `handleServerMux`, eliminating per-frame `make([]byte, len(payload))` heap allocations for all frames `<= 8 KiB` (HTTP headers, TLS handshakes, DNS, and interactive payloads) while still releasing the large 128 KiB+ `BufPool` buffer immediately.
+  2. **OPT-2 — Gigabit `Balanced` Window Upgrade (16 MiB) & `-mux-window` CLI Flag**: Upgraded the `Balanced` adaptive memory tier (`641..2048 MiB` VPS) from `8 MiB` (`muxInitialWindowKib = 8192`) to `16 MiB` (`16384`, `muxWindowRefresh = 2 MiB`, stream buffer limit `18 MiB`), doubling single-stream BDP capacity on 1–2 GB Gigabit VPS links (supporting full 1000 Mbps at up to ~130 ms RTT). Added `-mux-window <KiB>` (`64..65535`, default `0` = auto adaptive) for explicit operator tuning on high-RTT Gigabit links.
+  3. **OPT-3 — Non-Linux UDP Batch Reader/Writer Memory Trim**: In `newUDPBatch` and `newUDPBatchWriter`, skipped allocating 8-slot `recvmmsg`/`sendmmsg` batch buffers on non-Linux platforms (`runtime.GOOS != "linux"`), saving `448 KiB + 512 KiB = 960 KiB` of unused heap allocation per UDP associate session on Windows, macOS, and FreeBSD.
+  4. **OPT-4 — Zero-Alloc UDP Client Address Update & Batched UDP Stats**: Added `updateClientUDPAddr` in `handleClientUDP` and `handleClientUDPQUIC` so `cloneUDPAddr` only allocates when the local client's UDP source IP/port changes (`0 allocs/pkt` steady state), and batched `stats.AddBytes` at 256 KiB across all 4 UDP relay loops (`handleServerUDP`, `handleClientUDP`, `handleQUICServerUDP`, `handleClientUDPQUIC`).
+  5. **OPT-5 — QUIC Server UDP `BufPool` Reuse**: Replaced `out := make([]byte, 2+65535)` with `bPtr := cfg.BufPool.Get().(*[]byte)` in `handleQUICServerUDP`, saving 65 KiB heap allocation per QUIC UDP session.
+  6. **OPT-6 — Zero-Alloc WebSocket Handshake & Dynamic Header Parsing**: Replaced heap slice allocations in `computeAcceptKey` and `handleServer` upgrade responses with stack-allocated buffers (`[128]byte` and `[256]byte`), removed eager `buf.Grow(MaxHeaderSize)` in `readUntilCRLFCRLF`, and added 1-element fast-pop in `muxOutboundWriter.popLocked`.
+  7. **BUG-1 — MUX Server Stream Outbound Drop on Abrupt Close / RST (`eofSent` Guard)**: Added `s.writer.dropStream(streamID)` when sending `MuxCmdRST` and in `MuxServerStream.Close()` when `!s.eofSent.Load()`, immediately freeing queued `BufPool` frames on aborted/reset streams while preserving in-flight tail `MuxCmdDATA` frames on clean `io.EOF` (`MuxCmdFIN`).
+  8. **BUG-2 — Read Deadline & Goroutine Drain Protection in QUIC / UDP Relays**: Added rolling read deadlines with throttled updates (`refreshReadDeadline`) and unblocked `<-errCh` drain in `handleQUICStream`, `relayQUICClient`, `handleServerUDP`, `handleQUICServerUDP`, `handleClientUDP`, and `handleClientUDPQUIC`.
+  9. **BUG-3 — `BufPool` Minimum Allocation Alignment**: Raised the `bufSize` floor in `main()` to `65536 + 14 + MuxHeaderLen + aeadOverhead` (`65,581 B`) so small `-W` values (`-W 1..64`) never fail 64 KiB MUX/UDP frame bounds checks.
+  10. **BUG-4 — Transparent 1-Time Re-dial on Stale Pooled 1:1 Connections**: Marked pooled connections (`fromPool = true`) and added a transparent real-time re-dial fallback in `handleClient` when a pooled idle WebSocket connection fails its initial target write or `"OK"` read.
+  11. **BUG-5 — MUX Server Stream `MaxConns` Quota, Bounded QUIC Handshake Line & Extended Local IP Filter**: Enforced `tryAcquireConn` / `releaseConn` on inbound server MUX streams (`handleServerMux`), bounded QUIC TCP/UDP handshake response lines to 512 bytes with read deadlines (`readBoundedLine`), and added CGNAT (`100.64.0.0/10`) and `0.0.0.0/8` to `isLocalIP`.
+
+### Interleaved Paired A/B Certification (`v1.8.32` vs `v1.8.31` baseline, `n=10`)
+Protocol: `cmd/bench` interleaved paired runner, order flipped per sample, `n=10` per arm per concurrency (`1, 8, 32`), release-stripped binaries (`-trimpath -ldflags="-s -w"`, baseline `7,297,536 B`, candidate `7,306,240 B`), sign test `crit=9`. Verdict: **15/15 PASS (0 regressions)**.
+
+| conc | metric | base_med | cand_med | med-delta | bad/good/tie | verdict |
+|------|--------|----------|----------|-----------|--------------|---------|
+| 1 | up_mbps | 463.03 | 464.70 | -0.6% (-2.59) | 5/5/0 | NOISE |
+| 1 | down_mbps | 466.71 | 463.28 | -3.1% (-14.28) | 6/4/0 | NOISE |
+| 1 | cpu_s | 21.27 | 21.95 | +3.9% (+0.83) | 8/2/0 | NOISE |
+| 1 | rss_mb | 69.08 | 62.92 | -6.2% (-4.30) | 2/8/0 | NOISE |
+| 1 | setup_ms | 109.25 | 108.64 | -0.4% (-0.43) | 3/7/0 | NOISE |
+| 8 | up_mbps | 368.18 | 367.39 | -1.2% (-4.49) | 6/4/0 | NOISE |
+| 8 | down_mbps | 375.66 | 374.41 | -0.7% (-2.47) | 8/2/0 | NOISE |
+| 8 | cpu_s | 23.23 | 22.98 | +0.1% (+0.02) | 6/4/0 | NOISE |
+| 8 | rss_mb | 119.21 | 118.58 | -1.5% (-1.83) | 4/6/0 | NOISE |
+| 8 | setup_ms | 109.03 | 109.71 | +0.2% (+0.26) | 6/4/0 | NOISE |
+| 32 | up_mbps | 366.05 | 368.15 | +0.8% (+2.82) | 4/6/0 | NOISE |
+| 32 | down_mbps | 366.44 | 368.53 | -1.2% (-4.52) | 5/5/0 | NOISE |
+| 32 | cpu_s | 23.98 | 23.86 | +1.0% (+0.24) | 7/3/0 | NOISE |
+| 32 | rss_mb | 209.33 | 212.71 | -1.4% (-3.01) | 5/5/0 | NOISE |
+| 32 | setup_ms | 108.91 | 109.47 | +0.7% (+0.72) | 7/3/0 | NOISE |
+
+
 ## v1.8.31 cycle: Lazy MUX Stream Ingress, Zero-Alloc UDP IP Cache, Batched Stats, Auth/AEAD/RST Fixes & Test Consolidation (2026-11-01)
 
 ### Status & Release Summary
