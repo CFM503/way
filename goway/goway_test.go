@@ -4001,7 +4001,6 @@ func TestMuxV2CoalescedSuperPacketUnpack(t *testing.T) {
 		closed:  make(chan struct{}),
 		prng:    prng,
 	}
-	sess.peerVersion.Store(2)
 	sess.writer = newMuxOutboundWriter(c1, prng, nil, true, 5*time.Second)
 	defer sess.Close()
 
@@ -4050,20 +4049,16 @@ func TestMuxV2VersionAnd32BitWindowExtension(t *testing.T) {
 		streams: make(map[uint32]*MuxStream),
 		closed:  make(chan struct{}),
 	}
-	sess.peerVersion.Store(1)
 	st := newMuxStream(1, sess)
 	sess.streams[1] = st
 
 	bufLen := maxMuxV2Chunk + 14 + MuxHeaderLen
-	if got := sess.maxDataChunkLen(bufLen); got != muxDataChunkLimit {
-		t.Fatalf("v1 peer maxDataChunkLen = %d, want %d", got, muxDataChunkLimit)
+	if got := sess.maxDataChunkLen(bufLen); got != maxMuxV2Chunk {
+		t.Fatalf("0-RTT v2 maxDataChunkLen = %d, want %d", got, maxMuxV2Chunk)
 	}
 
 	// Apply MUX v2 VERSION frame (v2, 65535 KiB initial 16-bit window)
 	sess.applyPeerVersion([]byte{2, 0xFF, 0xFF})
-	if sess.peerVersion.Load() != 2 {
-		t.Fatalf("expected peerVersion = 2, got %d", sess.peerVersion.Load())
-	}
 	if got := sess.maxDataChunkLen(bufLen); got != maxMuxV2Chunk {
 		t.Fatalf("v2 peer maxDataChunkLen = %d, want %d", got, maxMuxV2Chunk)
 	}

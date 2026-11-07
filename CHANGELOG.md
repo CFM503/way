@@ -6,6 +6,15 @@ All notable changes to the **Way Proxy** project (Goway & Pyway) are documented 
 
 ---
 
+## [v1.8.34] - 2026-11-07
+
+### 纯净 MUX v2 架构：移除 MUX v1 兼容分支与 0-RTT 首包巨型帧直通
+
+- **移除 MUX v1 兼容回退与 `peerVersion` 原子状态 (`MuxClientSession` / `MuxServerSession`)**: 移除客户端与服务端会话中的 `peerVersion` 原子字段及全局可变 `muxDataChunkLimit`，将非 `DATA` 控制帧长度常量语义化为 `maxMuxControlPayload = 65535`。
+- **0-RTT 首包即刻启用 `maxMuxV2Chunk (129,600B)` 巨型帧 (`maxDataChunkLen`)**: 消除新建 MUX 会话在等待对端 `MuxCmdVERSION` 帧返回期间（0-RTT 窗口期）默认回退到 `64KiB` 分片的限制，从第 0 毫秒起全程启用 `129.6KB` 巨型数据帧，并省去每次 `Read()` 循环中的原子读取与分支判断。
+
+---
+
 ## [v1.8.33] - 2026-11-05
 
 ### MUX v2 协议无上限吞吐升级：23-Bit 巨型帧、多帧超包解包与 32-Bit 流控窗口扩展

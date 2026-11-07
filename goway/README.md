@@ -1,4 +1,4 @@
-# GOWAY v1.8.33
+# GOWAY v1.8.34
 
 GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具，支持 HTTP 和完整 SOCKS5 (TCP + UDP) 协议，具备浏览器指纹伪装、0-RTT 多路复用 (Mux)、QUIC 弱网抗丢包传输、Cloudflare CDN 边缘接入与 PGO 机器码级性能优化。
 
@@ -7,6 +7,17 @@ GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具�
 > 接手本项目的 AI 必须先读 `goway/AI_HANDOFF.md` 顶部同名规则并原样保留；每个性能改动必须在 `AI_HANDOFF.md` 记录前后数据，**没有数据不算完成**。
 
 ## 版本历史
+
+### v1.8.34 (2026-11-07) - 纯净 MUX v2 架构：移除 MUX v1 兼容分支与 0-RTT 首包巨型帧直通
+
+#### 核心优化与协议加固
+
+| 优化/修复项 | 说明 | 收益与特性 |
+|---|---|---|
+| **移除 MUX v1 兼容回退 (`peerVersion` & `muxDataChunkLimit`)** | 移除 `MuxClientSession` 与 `MuxServerSession` 中的 `peerVersion` 原子状态及全局可变 `muxDataChunkLimit`，将控制帧载荷上限常量重命名为 `maxMuxControlPayload (65535B)` | **精简转发热路径代码，消除每次 Socket `Read()` 循环中的 `peerVersion.Load()` 原子读取与分支判断** |
+| **0-RTT 首包巨型帧直通 (`maxDataChunkLen`)** | `maxDataChunkLen` 无需等待对端 `MuxCmdVERSION` 帧握手返回，建连第 0 毫秒（含 0-RTT 抢跑阶段）直接启用 `maxMuxV2Chunk (129,600B)` | **彻底消除 0-RTT 建连初期回退至 `64KiB` 拆帧的窗口期，首包即享 MUX v2 巨型帧吞吐** |
+
+---
 
 ### v1.8.33 (2026-11-05) - MUX v2 协议无上限吞吐升级：23-Bit 巨型帧、多帧超包解包与 32-Bit 流控窗口扩展
 

@@ -59,7 +59,7 @@ import (
 // ============================================================================
 // GOWAY 版本号定义 (发布新版本时在此修改)
 // ============================================================================
-const Version = "1.8.33"
+const Version = "1.8.34"
 
 const (
 	// MaxWSFrameSize matches the largest frame the sender side can build
@@ -2881,9 +2881,6 @@ func main() {
 		cipherMode = cipherModeAEAD
 	}
 	cfg.Crypto = NewCryptoMode(cfg.Key, cipherMode)
-	if cipherMode == cipherModeAEAD {
-		muxDataChunkLimit = 65535 - aeadOverhead
-	}
 
 	// Parse upstream URL once at startup — avoids per-connection url.Parse alloc.
 	if cfg.Upstream != "" {
@@ -3216,9 +3213,9 @@ const (
 	muxPushStallTimeout      = 15 * time.Second
 	muxProtoVersion     byte = 2
 	muxWindowMinKib          = 64
-	muxJumboFlag        byte = 0x80
-	maxMuxPayloadV1          = 65535
-	maxMuxPayloadV2          = 512 * 1024
+	muxJumboFlag         byte = 0x80
+	maxMuxControlPayload      = 65535
+	maxMuxPayloadV2           = 512 * 1024
 	maxMuxV2Chunk            = 129600
 	maxMuxV2WindowKiB        = 1024 * 1024
 	// Small MUX frames (<= 8 KiB) copy into exact-sized slices so they never
@@ -3226,12 +3223,12 @@ const (
 	muxSmallPayloadCopyLimit = 8192
 )
 
-// encodeMuxHeader writes a 7-byte MUX v1/v2 frame header into dst[:7].
+// encodeMuxHeader writes a 7-byte MUX v2 frame header into dst[:7].
 // For MuxCmdDATA frames with wireLen > 65535, byte 4 encodes 0x80 | (wireLen >> 16)
 // and bytes 5..7 encode uint16(wireLen & 0xFFFF) (23-bit Jumbo length).
 func encodeMuxHeader(dst []byte, streamID uint32, cmd byte, wireLen int) {
 	binary.BigEndian.PutUint32(dst[0:4], streamID)
-	if cmd == MuxCmdDATA && wireLen > maxMuxPayloadV1 {
+	if cmd == MuxCmdDATA && wireLen > maxMuxControlPayload {
 		dst[4] = muxJumboFlag | byte((wireLen>>16)&0x7F)
 		binary.BigEndian.PutUint16(dst[5:7], uint16(wireLen&0xFFFF))
 	} else {
@@ -3240,7 +3237,7 @@ func encodeMuxHeader(dst []byte, streamID uint32, cmd byte, wireLen int) {
 	}
 }
 
-// decodeMuxHeader parses a 7-byte MUX v1/v2 header from src.
+// decodeMuxHeader parses a 7-byte MUX v2 header from src.
 func decodeMuxHeader(src []byte) (streamID uint32, cmd byte, payloadLen int, ok bool) {
 	if len(src) < MuxHeaderLen {
 		return 0, 0, 0, false
@@ -3408,12 +3405,6 @@ func detectSystemMemoryMiB() int {
 	}
 	return mib
 }
-
-// muxDataChunkLimit caps one MUX DATA frame's PLAINTEXT payload. Legacy
-// mode allows the full uint16 range (65535); AEAD mode must leave room for
-// the inline [nonce|tag] overhead so the sealed frame still fits a uint16
-// MUX length. main() lowers it to 65535-aeadOverhead under -cipher aead.
-var muxDataChunkLimit = 65535
 
 // creditGate throttles sends on one stream once the peer's VERSION frame
 // has been observed. Before negotiation it is Unbounded (v1 behavior);
@@ -3876,15 +3867,12 @@ func (s *MuxStream) Write(p []byte) (n int, err error) {
 		return 0, errors.New("stream closed")
 	default:
 	}
-	const maxChunkCap = 65528
+	const maxChunkCap = maxMuxControlPayload - aeadOverhead
 	total := len(p)
 	for len(p) > 0 {
 		chunk := len(p)
 		if chunk > maxChunkCap {
 			chunk = maxChunkCap
-		}
-		if chunk > muxDataChunkLimit {
-			chunk = muxDataChunkLimit
 		}
 		// W3 upload gate: bounded once the peer's VERSION arrived.
 		if !s.sendGate.Acquire(chunk, s.closed) {
@@ -4519,8 +4507,7 @@ type MuxClientSession struct {
 	writer        *muxOutboundWriter
 	activeStreams atomic.Int64
 	// W3: peer-advertised receive window in bytes (0 = not negotiated).
-	peerWindow  atomic.Int64
-	peerVersion atomic.Uint32
+	peerWindow atomic.Int64
 }
 
 func (s *MuxClientSession) maxDataChunkLen(bufLen int) int {
@@ -4529,12 +4516,9 @@ func (s *MuxClientSession) maxDataChunkLen(bufLen int) int {
 	if s.cfg != nil && s.cfg.Crypto != nil && !s.cfg.Crypto.isXOR() {
 		limit -= aeadOverhead
 	}
-	maxChunk := muxDataChunkLimit
-	if s.peerVersion.Load() >= 2 {
-		maxChunk = maxMuxV2Chunk
-		if s.cfg != nil && s.cfg.Crypto != nil && !s.cfg.Crypto.isXOR() && maxChunk > maxMuxPayloadV2-aeadOverhead {
-			maxChunk = maxMuxPayloadV2 - aeadOverhead
-		}
+	maxChunk := maxMuxV2Chunk
+	if s.cfg != nil && s.cfg.Crypto != nil && !s.cfg.Crypto.isXOR() && maxChunk > maxMuxPayloadV2-aeadOverhead {
+		maxChunk = maxMuxPayloadV2 - aeadOverhead
 	}
 	if limit > maxChunk {
 		limit = maxChunk
@@ -4580,7 +4564,6 @@ func (s *MuxClientSession) decrementActiveStreams() {
 func newMuxClientSession(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, cfg *Config, setupDur time.Duration) *MuxClientSession {
 	prng := maskPool.Get().(*maskPRNG)
 	s := &MuxClientSession{wsConn: wsConn, br: br, wsTCPConn: wsTCPConn, cfg: cfg, streams: make(map[uint32]*MuxStream), closed: make(chan struct{}), prng: prng}
-	s.peerVersion.Store(1)
 	s.writer = newMuxOutboundWriterBatched(wsConn, prng, cfg.Crypto, true, time.Duration(cfg.ConnTimeout)*time.Second, writevBatchFor(setupDur))
 	// W3 / MUX v2 version negotiation: advertise our version + initial receive
 	// window right after the session handshake. Old servers skip the
@@ -4606,7 +4589,6 @@ func (s *MuxClientSession) applyPeerVersion(payload []byte) {
 	if len(payload) != 3 || payload[0] < 1 || s.peerWindow.Load() != 0 {
 		return
 	}
-	s.peerVersion.Store(uint32(payload[0]))
 	kib := int(binary.BigEndian.Uint16(payload[1:3]))
 	if kib < muxWindowMinKib {
 		kib = muxWindowMinKib
@@ -4740,7 +4722,7 @@ func (s *MuxClientSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 	if aead && payloadLen > 0 {
 		wireLen += aeadOverhead
 	}
-	maxWire := maxMuxPayloadV1
+	maxWire := maxMuxControlPayload
 	if cmd == MuxCmdDATA {
 		maxWire = maxMuxPayloadV2
 	}
@@ -5244,7 +5226,11 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 		logError("[CLIENT-MUX] Target address length %d exceeds max protocol limit", tLen)
 		return false
 	}
-	maxInitialInSYN := muxDataChunkLimit - 2 - tLen
+	maxSynPayload := maxMuxControlPayload
+	if cfg != nil && cfg.Crypto != nil && !cfg.Crypto.isXOR() {
+		maxSynPayload -= aeadOverhead
+	}
+	maxInitialInSYN := maxSynPayload - 2 - tLen
 	var synInitial []byte
 	var remainingInitial []byte
 	if len(initialPayload) > maxInitialInSYN {
@@ -5427,8 +5413,7 @@ type MuxServerSession struct {
 	closed    chan struct{}
 	closeOnce sync.Once
 	// W3: peer-advertised receive window in bytes (0 = not negotiated).
-	peerWindow  atomic.Int64
-	peerVersion atomic.Uint32
+	peerWindow atomic.Int64
 }
 
 func (s *MuxServerSession) maxDataChunkLen(bufLen int) int {
@@ -5437,12 +5422,9 @@ func (s *MuxServerSession) maxDataChunkLen(bufLen int) int {
 	if s.cfg != nil && s.cfg.Crypto != nil && !s.cfg.Crypto.isXOR() {
 		limit -= aeadOverhead
 	}
-	maxChunk := muxDataChunkLimit
-	if s.peerVersion.Load() >= 2 {
-		maxChunk = maxMuxV2Chunk
-		if s.cfg != nil && s.cfg.Crypto != nil && !s.cfg.Crypto.isXOR() && maxChunk > maxMuxPayloadV2-aeadOverhead {
-			maxChunk = maxMuxPayloadV2 - aeadOverhead
-		}
+	maxChunk := maxMuxV2Chunk
+	if s.cfg != nil && s.cfg.Crypto != nil && !s.cfg.Crypto.isXOR() && maxChunk > maxMuxPayloadV2-aeadOverhead {
+		maxChunk = maxMuxPayloadV2 - aeadOverhead
 	}
 	if limit > maxChunk {
 		limit = maxChunk
@@ -5747,7 +5729,7 @@ func (s *MuxServerSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 	if aead && payloadLen > 0 {
 		wireLen += aeadOverhead
 	}
-	maxWire := maxMuxPayloadV1
+	maxWire := maxMuxControlPayload
 	if cmd == MuxCmdDATA {
 		maxWire = maxMuxPayloadV2
 	}
@@ -5868,7 +5850,7 @@ func (s *MuxServerSession) sendFrameInline(streamID uint32, cmd byte, payload []
 		return errors.New("sendFrameInline does not support aead mode")
 	}
 	payloadLen := len(payload)
-	maxWire := maxMuxPayloadV1
+	maxWire := maxMuxControlPayload
 	if cmd == MuxCmdDATA {
 		maxWire = maxMuxPayloadV2
 	}
@@ -5930,7 +5912,6 @@ func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 		streams:   make(map[uint32]*MuxServerStream),
 		closed:    make(chan struct{}),
 	}
-	session.peerVersion.Store(1)
 	// Server never masks; prng unused by the unmasked write path.
 	session.writer = newMuxOutboundWriterBatched(wsConn, nil, cfg.Crypto, false, time.Duration(cfg.ConnTimeout)*time.Second, writevBatchFor(setupDur))
 	defer session.Close()
@@ -6014,7 +5995,6 @@ func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 			// WINDOW credits a specific stream's upload gate or extends session window.
 			if cmd == MuxCmdVERSION {
 				if len(payload) == 3 && payload[0] >= 1 && session.peerWindow.Load() == 0 {
-					session.peerVersion.Store(uint32(payload[0]))
 					kib := int(binary.BigEndian.Uint16(payload[1:3]))
 					if kib < muxWindowMinKib {
 						kib = muxWindowMinKib

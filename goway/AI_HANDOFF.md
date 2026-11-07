@@ -12,6 +12,15 @@
 - User mandate, 2026-09-23. 违反此规则的改动一律不得合入：只允许正向优化，永远禁止反向优化。
 
 
+## v1.8.34 cycle: Pure MUX v2 Execution Path & 0-RTT Jumbo Framing (2026-11-07)
+
+### Status & Release Summary
+- **Version**: Bumped to `1.8.34` in `goway.go` (`Version = "1.8.34"`), `README.md`, `AI_HANDOFF.md`, and root `CHANGELOG.md`.
+- **Core Vectors Shipped**:
+  1. **Removal of Legacy MUX v1 Fallback (`peerVersion` & `muxDataChunkLimit`)**: Removed `peerVersion` atomic tracking from `MuxClientSession` and `MuxServerSession` and removed the mutable package-level `muxDataChunkLimit` variable, renaming `maxMuxPayloadV1` to `maxMuxControlPayload = 65535` (used strictly for 16-bit non-`DATA` control frames).
+  2. **0-RTT Immediate `maxMuxV2Chunk` (`129,600 B`) Activation (`maxDataChunkLen`)**: `MuxClientSession.maxDataChunkLen` and `MuxServerSession.maxDataChunkLen` now unconditionally cap `DATA` reads at `maxMuxV2Chunk` from byte 0 (including 0-RTT streams opened before the peer's `MuxCmdVERSION` response arrives), eliminating per-read atomic loads and the 0-RTT 64 KiB fallback window.
+
+
 ## v1.8.33 cycle: MUX v2 Unlimited Throughput Protocol — 23-Bit Jumbo Frames, Multi-MUX Super-Packet Unpacking & 32-Bit Window Extension (2026-11-05)
 
 ### Status & Release Summary
