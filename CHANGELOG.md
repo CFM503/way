@@ -6,6 +6,16 @@ All notable changes to the **Way Proxy** project (Goway & Pyway) are documented 
 
 ---
 
+## [v1.8.35] - 2026-11-09
+
+### MUX v2 架构代码净化：移除失效 `-obfs` 填充分支、升级 `MuxStream.Write` 巨型帧分片与对称 `RST` 清队
+
+- **移除失效 `-obfs` 参数及随机尾填充分支（对齐 RushWay `v0.0.81`）**: 移除命令行参数 `-obfs`、`Config.Obfs`、`obfsPadMax`、死代码方法 `(*maskPRNG).fillRandom` 以及客户端/服务端发送热路径中全部尾填充逻辑；`readLoop` 与 `handleServerMux` 无条件支持 MUX v2 多帧超包解包，彻底消除每帧 PRNG 随机填充开销与多帧超包解包冲突。
+- **`MuxStream.Write` 升级至 MUX v2 巨型帧分片 (`maxMuxV2Chunk`)**: 将 `(*MuxStream).Write` 的单帧分片上限从 MUX v1 遗留的 `maxMuxControlPayload (65535B)` 升级为 `maxMuxV2Chunk (129,600B)`，并在 `SendFrame` 中兼容小尺寸测试缓冲池自适应扩容。
+- **客户端 `MuxCmdRST` 待发队列对称即时清理**: 在 `(*MuxClientSession).SendFrame` 发送 `MuxCmdRST` 时同步调用 `s.writer.dropStream(streamID)`（与服务端对称），确保流异常重置时立即丢弃输出队列中积压的废弃 `DATA` 帧并回收 `BufPool` 缓冲。
+
+---
+
 ## [v1.8.34] - 2026-11-07
 
 ### 纯净 MUX v2 架构：移除 MUX v1 兼容分支与 0-RTT 首包巨型帧直通

@@ -1,4 +1,4 @@
-# GOWAY v1.8.34
+# GOWAY v1.8.35
 
 GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具，支持 HTTP 和完整 SOCKS5 (TCP + UDP) 协议，具备浏览器指纹伪装、0-RTT 多路复用 (Mux)、QUIC 弱网抗丢包传输、Cloudflare CDN 边缘接入与 PGO 机器码级性能优化。
 
@@ -7,6 +7,18 @@ GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具�
 > 接手本项目的 AI 必须先读 `goway/AI_HANDOFF.md` 顶部同名规则并原样保留；每个性能改动必须在 `AI_HANDOFF.md` 记录前后数据，**没有数据不算完成**。
 
 ## 版本历史
+
+### v1.8.35 (2026-11-09) - MUX v2 架构代码净化：移除失效 `-obfs` 填充分支、升级 `MuxStream.Write` 巨型帧分片与对称 `RST` 清队
+
+#### 核心优化与协议加固
+
+| 优化/修复项 | 说明 | 收益与特性 |
+|---|---|---|
+| **移除失效 `-obfs` 参数及随机尾填充分支** | 移除 `-obfs` 命令行参数、`Config.Obfs`、`obfsPadMax`、`(*maskPRNG).fillRandom` 以及客户端/服务端发送热路径中全部尾填充分支；`readLoop` 与 `handleServerMux` 无条件支持多帧超包解包 | **对齐 RushWay `v0.0.81`，彻底消除每帧 PRNG 随机填充开销及尾随填充与 MUX v2 多帧超包（Super-Packet）的协议冲突，精简 200+ 行冗余代码** |
+| **`MuxStream.Write` 升级至 MUX v2 巨型帧分片 (`maxMuxV2Chunk`)** | 将 `(*MuxStream).Write` 的单帧分片上限从 MUX v1 遗留的 `maxMuxControlPayload (65535B)` 升级为 `maxMuxV2Chunk (129,600B)`，并在 `SendFrame` 中支持超小缓冲池自适应扩容 | **超大首包剩余载荷 (`remainingInitial`) 及流式 `Write` 调用直接享受 MUX v2 129.6KB 巨型帧直通，不再被拆分为 64KB 小帧** |
+| **客户端 `MuxCmdRST` 待发队列对称即时清理** | 在 `(*MuxClientSession).SendFrame` 发送 `MuxCmdRST` 时同步调用 `s.writer.dropStream(streamID)`（与服务端对称） | **确保客户端流异常重置时立即丢弃输出队列中积压的废弃 `DATA` 帧并回收 `BufPool` 缓冲，防止 `RST` 被自身积压数据阻塞** |
+
+---
 
 ### v1.8.34 (2026-11-07) - 纯净 MUX v2 架构：移除 MUX v1 兼容分支与 0-RTT 首包巨型帧直通
 

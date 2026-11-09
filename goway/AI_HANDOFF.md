@@ -12,6 +12,16 @@
 - User mandate, 2026-09-23. 违反此规则的改动一律不得合入：只允许正向优化，永远禁止反向优化。
 
 
+## v1.8.35 cycle: Post-MUX-v2 Cleanup — Remove `-obfs` Padding, Upgrade `MuxStream.Write` to `maxMuxV2Chunk` & Symmetric Client `RST` Queue Drop (2026-11-09)
+
+### Status & Release Summary
+- **Version**: Bumped to `1.8.35` in `goway.go` (`Version = "1.8.35"`), `README.md`, `AI_HANDOFF.md`, and root `CHANGELOG.md`.
+- **Core Vectors Shipped**:
+  1. **Removal of Obsolete `-obfs` Parameter & Padding Logic (Aligned with RushWay `v0.0.81`)**: Removed the `-obfs` CLI flag, `Config.Obfs`, `obfsPadMax`, dead helper `(*maskPRNG).fillRandom`, and all random trailing-padding branches in `(*MuxClientSession).SendFrame`, `(*MuxClientSession).SendDataFramePreallocated`, `(*MuxServerSession).SendFrame`, `(*MuxServerSession).SendDataFramePreallocated`, and `(*MuxServerSession).sendFrameInline`. Unconditionally enabled coalesced MUX v2 super-packet unpacking in `(*MuxClientSession).readLoop` and `handleServerMux`.
+  2. **Upgrade `(*MuxStream).Write` to MUX v2 Jumbo Chunking (`maxMuxV2Chunk`)**: Updated `(*MuxStream).Write` from the leftover MUX v1 `maxMuxControlPayload - aeadOverhead` (`65,507 B`) cap to `maxMuxV2Chunk - aeadOverhead` (`129,572 B`), with fallback allocation in `SendFrame` for small unit-test buffer pools.
+  3. **Symmetric Client `MuxCmdRST` Queue Drop**: Added `s.writer.dropStream(streamID)` when `cmd == MuxCmdRST` in `(*MuxClientSession).SendFrame` (matching `(*MuxServerSession).SendFrame`), ensuring aborted client streams immediately purge queued `DATA` frames and never stall `RST` behind doomed data.
+
+
 ## v1.8.34 cycle: Pure MUX v2 Execution Path & 0-RTT Jumbo Framing (2026-11-07)
 
 ### Status & Release Summary

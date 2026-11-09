@@ -59,7 +59,7 @@ import (
 // ============================================================================
 // GOWAY 版本号定义 (发布新版本时在此修改)
 // ============================================================================
-const Version = "1.8.34"
+const Version = "1.8.35"
 
 const (
 	// MaxWSFrameSize matches the largest frame the sender side can build
@@ -131,21 +131,6 @@ func (p *maskPRNG) randIntn(n int) int {
 		return 0
 	}
 	return int(p.next32() % uint32(n))
-}
-
-// fillRandom fills dst with fast pseudorandom bytes (zero locks).
-func (p *maskPRNG) fillRandom(dst []byte) {
-	i := 0
-	for ; i+4 <= len(dst); i += 4 {
-		binary.NativeEndian.PutUint32(dst[i:], p.next32())
-	}
-	if i < len(dst) {
-		v := p.next32()
-		for j := i; j < len(dst); j++ {
-			dst[j] = byte(v)
-			v >>= 8
-		}
-	}
 }
 
 // Small-frame stack threshold for readWSFrame pool optimization
@@ -817,7 +802,6 @@ type Config struct {
 	TUI              bool
 	Mux              bool
 	MuxSessions      int
-	Obfs             bool
 	QUICConns        int
 	ServerBlockLocal bool
 	Cipher           string
@@ -1669,8 +1653,7 @@ func writeWSFramePreallocatedFast(w io.Writer, buf []byte, payloadOffset int, pa
 // (Crypto.TransformInPlace at enqueue + mask-only write here) on the client
 // MUX hot path, halving bulk memory traffic. Offset semantics are identical
 // to the two-pass version (region-relative, matching TransformInPlace), so
-// wire bytes after receiver-side invert are bit-identical; the obfs tail,
-// if any, is inside the region and ignored by declared-length slicing.
+// wire bytes after receiver-side invert are bit-identical.
 // crypto == nil degrades to the mask-only fast path.
 func encodeMuxFrameFused(buf []byte, payloadOffset int, payloadLen int, opcode byte, prng *maskPRNG, crypto *Crypto) ([]byte, error) {
 	hdrLen := 2
@@ -1740,10 +1723,8 @@ func writeMuxFrameFused(w io.Writer, buf []byte, payloadOffset int, payloadLen i
 // frame while applying the cipher keystream in a single pass — the server
 // egress counterpart of writeMuxFrameFused. Server→client frames are never
 // masked, so there is no mask key; XOR is region-relative and matches
-// Crypto.TransformInPlace (offset resets per call region). The obfs tail,
-// if any, sits inside the declared-length region and is ignored by
-// receivers that slice by the MUX header length. crypto == nil is a pure
-// header assembly pass.
+// Crypto.TransformInPlace (offset resets per call region). crypto == nil is
+// a pure header assembly pass.
 func encodeMuxFrameUnmasked(buf []byte, payloadOffset int, payloadLen int, opcode byte, crypto *Crypto) ([]byte, error) {
 	hdrLen := 2
 	if payloadLen >= 65536 {
@@ -2615,7 +2596,6 @@ func main() {
 	noMuxFlag := flag.Bool("no-mux", false, "Disable 0-RTT Connection Multiplexing (fallback to 1:1 pool)")
 	muxSessionsFlag := flag.Int("mux-sessions", 8, "Number of parallel physical Mux sessions (default 8, max 64)")
 	muxWindowFlag := flag.Int("mux-window", 0, "MUX per-stream receive window in KiB (64..1048576, default 0 = auto adaptive)")
-	obfsFlag := flag.Bool("obfs", false, "Pad MUX DATA frames with random lengths to resist packet-size fingerprinting")
 	wFlag := flag.Int("W", 128, "App Buffer Size in KB (default 128KB, recommend 256-1024 for high-throughput streaming)")
 	sockBufFlag := flag.Int("socket-buffer", 0, "Kernel Socket Buffer in KB (default 0 = OS auto-tuning)")
 	noDelayFlag := flag.Bool("no-tcp-nodelay", false, "Disable TCP_NODELAY (disable Nagle bypass)")
@@ -2832,7 +2812,6 @@ func main() {
 		AllowOpen:        *allowOpenFlag,
 		Mux:              *muxFlag && !*noMuxFlag,
 		MuxSessions:      *muxSessionsFlag,
-		Obfs:             *obfsFlag,
 		QUICConns:        *quicConnsFlag,
 		ServerBlockLocal: *serverBlockLocalFlag && !*noBlockLocalFlag && !*noServerBlockLocalFlag,
 		Cipher:           strings.ToLower(strings.TrimSpace(*cipherFlag)),
@@ -3210,14 +3189,14 @@ const (
 	MuxCmdWINDOW  byte = 0x06 // W3: [CreditBytes uint32 BE]
 	MuxHeaderLen       = 7    // 4B StreamID + 1B Cmd + 2B PayloadLen
 
-	muxPushStallTimeout      = 15 * time.Second
-	muxProtoVersion     byte = 2
-	muxWindowMinKib          = 64
+	muxPushStallTimeout       = 15 * time.Second
+	muxProtoVersion      byte = 2
+	muxWindowMinKib           = 64
 	muxJumboFlag         byte = 0x80
 	maxMuxControlPayload      = 65535
 	maxMuxPayloadV2           = 512 * 1024
-	maxMuxV2Chunk            = 129600
-	maxMuxV2WindowKiB        = 1024 * 1024
+	maxMuxV2Chunk             = 129600
+	maxMuxV2WindowKiB         = 1024 * 1024
 	// Small MUX frames (<= 8 KiB) copy into exact-sized slices so they never
 	// pin a 128 KiB+ BufPool buffer inside stream queues on low-RAM VPS.
 	muxSmallPayloadCopyLimit = 8192
@@ -3867,7 +3846,7 @@ func (s *MuxStream) Write(p []byte) (n int, err error) {
 		return 0, errors.New("stream closed")
 	default:
 	}
-	const maxChunkCap = maxMuxControlPayload - aeadOverhead
+	const maxChunkCap = maxMuxV2Chunk - aeadOverhead
 	total := len(p)
 	for len(p) > 0 {
 		chunk := len(p)
@@ -4027,14 +4006,11 @@ const (
 	// so bulk streams may use deeper backlog (~4MB worst case at 64KB).
 	muxOutboundQueueDepth = 128
 	// Per-stream byte credit added each deficit round.
-	// Set to 144KB so that even MUX v2 Jumbo frames (129.6KB) with -obfs padding
-	// and AEAD overhead can be dispatched in a single round without deficit underflow stall.
+	// Set to 144KB so that MUX v2 Jumbo frames (129.6KB) with AEAD overhead
+	// can be dispatched in a single round without deficit underflow stall.
 	muxDRRQuantum = 144 * 1024
 	// Cap accumulated credit so a long-idle stream cannot hog the link.
 	muxDRRMaxDeficit = 512 * 1024
-	// Max random padding appended to MUX DATA frames when -obfs is on.
-	// Sized near MTU so padded lengths spread across the full range.
-	obfsPadMax = 1400
 	// Phase 4 writev: coalesce scheduled frames per egress syscall.
 	// Adaptive cap by handshake classification: loopback/low-RTT links
 	// regress -3~12% c32 throughput with multi-frame batches (writev burst
@@ -4716,6 +4692,9 @@ func (s *MuxClientSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 	if s.wsConn == nil || s.cfg == nil || s.cfg.BufPool == nil || s.writer == nil {
 		return nil
 	}
+	if cmd == MuxCmdRST {
+		s.writer.dropStream(streamID)
+	}
 	payloadLen := len(payload)
 	aead := s.cfg.Crypto != nil && !s.cfg.Crypto.isXOR()
 	wireLen := payloadLen
@@ -4738,7 +4717,12 @@ func (s *MuxClientSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 	buf := *bPtr
 	if frameLen+14 > len(buf) {
 		pool.Put(bPtr)
-		return errors.New("mux frame exceeds buffer size")
+		if cmd != MuxCmdDATA {
+			return errors.New("mux frame exceeds buffer size")
+		}
+		buf = make([]byte, frameLen+14)
+		bPtr = &buf
+		pool = nil
 	}
 	frameStart := 14
 	encodeMuxHeader(buf[frameStart:frameStart+MuxHeaderLen], streamID, cmd, wireLen)
@@ -4752,19 +4736,7 @@ func (s *MuxClientSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 	}
 	// NB: cipher is applied at write time by writeMuxFrameFused (single
 	// cipher+mask pass); do NOT TransformInPlace here.
-	padLen := 0
-	if cmd == MuxCmdDATA && s.cfg.Obfs {
-		if room := len(buf) - 14 - frameLen; room > 0 {
-			if room > obfsPadMax {
-				room = obfsPadMax
-			}
-			prng := maskPool.Get().(*maskPRNG)
-			padLen = prng.randIntn(room + 1)
-			prng.fillRandom(buf[frameStart+frameLen : frameStart+frameLen+padLen])
-			maskPool.Put(prng)
-		}
-	}
-	frame := muxOutboundFrame{bPtr: bPtr, pool: pool, payloadOff: frameStart, payloadLen: frameLen + padLen, opcode: 0x2, streamID: streamID, cmd: cmd}
+	frame := muxOutboundFrame{bPtr: bPtr, pool: pool, payloadOff: frameStart, payloadLen: frameLen, opcode: 0x2, streamID: streamID, cmd: cmd}
 	if !s.writer.enqueue(frame) {
 		return errors.New("mux session writer closed")
 	}
@@ -4809,19 +4781,7 @@ func (s *MuxClientSession) SendDataFramePreallocated(streamID uint32, bPtr *[]by
 	if aead && payloadLen > 0 {
 		s.cfg.Crypto.SealRegion(buf[frameStart+7:], payloadLen)
 	}
-	padLen := 0
-	if s.cfg.Obfs {
-		if room := len(buf) - 14 - frameLen; room > 0 {
-			if room > obfsPadMax {
-				room = obfsPadMax
-			}
-			prng := maskPool.Get().(*maskPRNG)
-			padLen = prng.randIntn(room + 1)
-			prng.fillRandom(buf[frameStart+frameLen : frameStart+frameLen+padLen])
-			maskPool.Put(prng)
-		}
-	}
-	frame := muxOutboundFrame{bPtr: bPtr, pool: s.cfg.BufPool, payloadOff: frameStart, payloadLen: frameLen + padLen, opcode: 0x2, streamID: streamID, cmd: MuxCmdDATA}
+	frame := muxOutboundFrame{bPtr: bPtr, pool: s.cfg.BufPool, payloadOff: frameStart, payloadLen: frameLen, opcode: 0x2, streamID: streamID, cmd: MuxCmdDATA}
 	if !s.writer.enqueue(frame) {
 		return errors.New("mux session writer closed")
 	}
@@ -4854,7 +4814,7 @@ func (s *MuxClientSession) readLoop() {
 			continue
 		}
 		frameLimit := MuxHeaderLen + payloadLen
-		if !s.cfg.Obfs && frameLimit < len(data) && isValidCoalescedMuxTail(data[frameLimit:]) {
+		if frameLimit < len(data) && isValidCoalescedMuxTail(data[frameLimit:]) {
 			frameLimit = len(data)
 		}
 
@@ -5745,7 +5705,12 @@ func (s *MuxServerSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 	buf := *bPtr
 	if frameLen+14 > len(buf) {
 		pool.Put(bPtr)
-		return errors.New("mux server frame exceeds buffer")
+		if cmd != MuxCmdDATA {
+			return errors.New("mux server frame exceeds buffer")
+		}
+		buf = make([]byte, frameLen+14)
+		bPtr = &buf
+		pool = nil
 	}
 	frameStart := 14
 	encodeMuxHeader(buf[frameStart:frameStart+MuxHeaderLen], streamID, cmd, wireLen)
@@ -5757,19 +5722,7 @@ func (s *MuxServerSession) SendFrame(streamID uint32, cmd byte, payload []byte) 
 	}
 	// NB: cipher is applied at write time by writeMuxFrameUnmasked (single
 	// pass, unmasked server frames); do NOT TransformInPlace here.
-	padLen := 0
-	if cmd == MuxCmdDATA && s.cfg.Obfs {
-		if room := len(buf) - 14 - frameLen; room > 0 {
-			if room > obfsPadMax {
-				room = obfsPadMax
-			}
-			prng := maskPool.Get().(*maskPRNG)
-			padLen = prng.randIntn(room + 1)
-			prng.fillRandom(buf[frameStart+frameLen : frameStart+frameLen+padLen])
-			maskPool.Put(prng)
-		}
-	}
-	frame := muxOutboundFrame{bPtr: bPtr, pool: pool, payloadOff: frameStart, payloadLen: frameLen + padLen, opcode: 0x2, streamID: streamID, cmd: cmd}
+	frame := muxOutboundFrame{bPtr: bPtr, pool: pool, payloadOff: frameStart, payloadLen: frameLen, opcode: 0x2, streamID: streamID, cmd: cmd}
 	if !s.writer.enqueue(frame) {
 		return errors.New("mux server session writer closed")
 	}
@@ -5819,19 +5772,7 @@ func (s *MuxServerSession) SendDataFramePreallocated(streamID uint32, bPtr *[]by
 	if aead && payloadLen > 0 {
 		s.cfg.Crypto.SealRegion(buf[frameStart+7:], payloadLen)
 	}
-	padLen := 0
-	if s.cfg.Obfs {
-		if room := len(buf) - 14 - frameLen; room > 0 {
-			if room > obfsPadMax {
-				room = obfsPadMax
-			}
-			prng := maskPool.Get().(*maskPRNG)
-			padLen = prng.randIntn(room + 1)
-			prng.fillRandom(buf[frameStart+frameLen : frameStart+frameLen+padLen])
-			maskPool.Put(prng)
-		}
-	}
-	frame := muxOutboundFrame{bPtr: bPtr, pool: s.cfg.BufPool, payloadOff: frameStart, payloadLen: frameLen + padLen, opcode: 0x2, streamID: streamID, cmd: MuxCmdDATA}
+	frame := muxOutboundFrame{bPtr: bPtr, pool: s.cfg.BufPool, payloadOff: frameStart, payloadLen: frameLen, opcode: 0x2, streamID: streamID, cmd: MuxCmdDATA}
 	if !s.writer.enqueue(frame) {
 		return errors.New("mux server session writer closed")
 	}
@@ -5877,23 +5818,7 @@ func (s *MuxServerSession) sendFrameInline(streamID uint32, cmd byte, payload []
 		s.cfg.Crypto.TransformInPlace(buf[frameStart : frameStart+frameLen])
 	}
 
-	// Unilateral obfuscation, server side: same random-pad semantics as the
-	// client path; receivers slice by the declared MUX length.
-	writeLen := frameLen
-	if cmd == MuxCmdDATA && s.cfg.Obfs {
-		if room := len(buf) - 14 - frameLen; room > 0 {
-			if room > obfsPadMax {
-				room = obfsPadMax
-			}
-			prng := maskPool.Get().(*maskPRNG)
-			padLen := prng.randIntn(room + 1)
-			prng.fillRandom(buf[frameStart+frameLen : frameStart+frameLen+padLen])
-			maskPool.Put(prng)
-			writeLen = frameLen + padLen
-		}
-	}
-
-	return writeWSFramePreallocated(s.wsConn, buf, frameStart, writeLen, 0x2, false)
+	return writeWSFramePreallocated(s.wsConn, buf, frameStart, frameLen, 0x2, false)
 }
 
 func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, cfg *Config, setupDur time.Duration) {
@@ -5956,7 +5881,7 @@ func handleServerMux(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 			continue
 		}
 		frameLimit := MuxHeaderLen + payloadLen
-		if !cfg.Obfs && frameLimit < len(data) && isValidCoalescedMuxTail(data[frameLimit:]) {
+		if frameLimit < len(data) && isValidCoalescedMuxTail(data[frameLimit:]) {
 			frameLimit = len(data)
 		}
 
