@@ -3915,8 +3915,6 @@ func (s *MuxStream) resetWithRST(sendRST bool) {
 		s.sendGate.Close()
 		if sendRST {
 			s.session.SendFrame(s.id, MuxCmdRST, nil)
-		} else if s.session != nil && s.session.writer != nil {
-			s.session.writer.dropStream(s.id)
 		}
 		s.session.RemoveStream(s.id)
 		s.cleanup()
@@ -4867,6 +4865,9 @@ func (s *MuxClientSession) readLoop() {
 			s.streamsMu.RUnlock()
 
 			if !ok {
+				if cmd == MuxCmdRST && s.writer != nil {
+					s.writer.dropStream(streamID)
+				}
 				continue
 			}
 
