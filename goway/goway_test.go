@@ -209,6 +209,19 @@ func testBinaryForSubprocess(t *testing.T) string {
 	return name
 }
 
+func pickFreeLowPort(t *testing.T, base int) int {
+	t.Helper()
+	for p := base; p < base+500; p++ {
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+		if err == nil {
+			_ = ln.Close()
+			return p
+		}
+	}
+	t.Fatalf("no free port found in range [%d, %d)", base, base+500)
+	return base
+}
+
 func TestEndToEndSubprocessIntegration(t *testing.T) {
 	// 1. Start target TCP echo server
 	targetListener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -232,7 +245,7 @@ func TestEndToEndSubprocessIntegration(t *testing.T) {
 	}()
 
 	// 2. Start GOWAY Server subprocess
-	serverPort := 18880
+	serverPort := pickFreeLowPort(t, 18880)
 	serverCmd := exec.Command(testBinaryForSubprocess(t),
 		"-p", fmt.Sprintf("127.0.0.1:%d", serverPort),
 		"-k", "testKey2026",
@@ -251,7 +264,7 @@ func TestEndToEndSubprocessIntegration(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	// 3. Start GOWAY Client subprocess
-	clientPort := 11080
+	clientPort := pickFreeLowPort(t, 11080)
 	clientCmd := exec.Command(testBinaryForSubprocess(t),
 		"-p", fmt.Sprintf("127.0.0.1:%d", clientPort),
 		"-up", fmt.Sprintf("ws://127.0.0.1:%d", serverPort),
@@ -442,7 +455,7 @@ func TestViolentStressSimulation(t *testing.T) {
 	}()
 
 	// 2. Start GOWAY Server (v1.7.5)
-	serverPort := 28880
+	serverPort := pickFreeLowPort(t, 24880)
 	serverCmd := exec.Command(testBinaryForSubprocess(t),
 		"-p", fmt.Sprintf("127.0.0.1:%d", serverPort),
 		"-k", "violentStressKey999",
@@ -459,7 +472,7 @@ func TestViolentStressSimulation(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	// 3. Start GOWAY Client (v1.7.5, Mux enabled)
-	clientPort := 21080
+	clientPort := pickFreeLowPort(t, 21080)
 	clientCmd := exec.Command(testBinaryForSubprocess(t),
 		"-p", fmt.Sprintf("127.0.0.1:%d", clientPort),
 		"-up", fmt.Sprintf("ws://127.0.0.1:%d", serverPort),
@@ -2892,7 +2905,7 @@ func Test2000ConcurrentEndToEndSOCKS5(t *testing.T) {
 	binPath := testBinaryForSubprocess(t)
 
 	// 2. Start GOWAY Server (allow 5000 conns)
-	serverPort := 38980
+	serverPort := pickFreeLowPort(t, 19880)
 	serverCmd := exec.Command(binPath,
 		"-p", fmt.Sprintf("127.0.0.1:%d", serverPort),
 		"-k", "stressKey2000",
@@ -2913,7 +2926,7 @@ func Test2000ConcurrentEndToEndSOCKS5(t *testing.T) {
 	time.Sleep(600 * time.Millisecond)
 
 	// 3. Start GOWAY Client (allow 5000 conns, 8 mux sessions)
-	clientPort := 31980
+	clientPort := pickFreeLowPort(t, 15980)
 	clientCmd := exec.Command(binPath,
 		"-p", fmt.Sprintf("127.0.0.1:%d", clientPort),
 		"-up", fmt.Sprintf("ws://127.0.0.1:%d", serverPort),
