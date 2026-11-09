@@ -59,7 +59,7 @@ import (
 // ============================================================================
 // GOWAY 版本号定义 (发布新版本时在此修改)
 // ============================================================================
-const Version = "1.8.35"
+const Version = "1.8.36"
 
 const (
 	// MaxWSFrameSize matches the largest frame the sender side can build
@@ -3915,6 +3915,8 @@ func (s *MuxStream) resetWithRST(sendRST bool) {
 		s.sendGate.Close()
 		if sendRST {
 			s.session.SendFrame(s.id, MuxCmdRST, nil)
+		} else if s.session != nil && s.session.writer != nil {
+			s.session.writer.dropStream(s.id)
 		}
 		s.session.RemoveStream(s.id)
 		s.cleanup()
@@ -4006,9 +4008,10 @@ const (
 	// so bulk streams may use deeper backlog (~4MB worst case at 64KB).
 	muxOutboundQueueDepth = 128
 	// Per-stream byte credit added each deficit round.
-	// Set to 144KB so that MUX v2 Jumbo frames (129.6KB) with AEAD overhead
-	// can be dispatched in a single round without deficit underflow stall.
-	muxDRRQuantum = 144 * 1024
+	// Set to 128 KiB (131,072 B, aligned with RushWay DRR_QUANTUM) because
+	// maxMuxV2Chunk (129,600 B) + 7 B MUX + 28 B AEAD = 129,635 B <= 131,072 B,
+	// dispatching 1 full Jumbo frame per round with minimal (1.1%) residual deficit.
+	muxDRRQuantum = 128 * 1024
 	// Cap accumulated credit so a long-idle stream cannot hog the link.
 	muxDRRMaxDeficit = 512 * 1024
 	// Phase 4 writev: coalesce scheduled frames per egress syscall.

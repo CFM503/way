@@ -12,6 +12,15 @@
 - User mandate, 2026-09-23. 违反此规则的改动一律不得合入：只允许正向优化，永远禁止反向优化。
 
 
+## v1.8.36 cycle: Exact DRR Quantum Alignment (`muxDRRQuantum = 128 KiB`) & Client Inbound `RST` (`ResetLocal`) Outbound Queue Drop (2026-11-09)
+
+### Status & Release Summary
+- **Version**: Bumped to `1.8.36` in `goway.go` (`Version = "1.8.36"`), `README.md`, `AI_HANDOFF.md`, and root `CHANGELOG.md` (interoperable baseline with `RushWay v0.0.83`).
+- **Core Vectors Shipped**:
+  1. **Exact DRR Quantum Alignment (`muxDRRQuantum = 128 * 1024`)**: With `-obfs` trailing padding permanently removed in `v1.8.35`, the maximum `MUX v2` Jumbo `DATA` payload (`maxMuxV2Chunk = 129,600 B`) plus `7 B` MUX header and up to `28 B` AEAD overhead totals `129,635 B <= 131,072 B` (`128 KiB`). Restored `muxDRRQuantum` from `144 * 1024` (`147,456 B`) back to `128 * 1024` (`131,072 B`, matching RushWay `v0.0.83` `DRR_QUANTUM = 128 * 1024`), reducing per-round residual deficit from `17,849 B` (`13.8%`, which allowed bulk streams to burst 2 Jumbo frames every 7 rounds) to `1,465 B` (`1.1%`, 90 rounds), improving multi-stream fairness and interactive P99 latency.
+  2. **Client `ResetLocal` Outbound Queue Purge (`s.session.writer.dropStream(s.id)`)**: In `(*MuxStream).resetWithRST(sendRST bool)`, added `else if s.session != nil && s.session.writer != nil { s.session.writer.dropStream(s.id) }` when `!sendRST` (invoked by `ResetLocal()` when client `readLoop` receives `MuxCmdRST` from the server or on SYN failure), immediately discarding queued outbound `DATA` frames and returning `BufPool` buffers (matching RushWay `v0.0.83`).
+
+
 ## v1.8.35 cycle: Post-MUX-v2 Cleanup — Remove `-obfs` Padding, Upgrade `MuxStream.Write` to `maxMuxV2Chunk` & Symmetric Client `RST` Queue Drop (2026-11-09)
 
 ### Status & Release Summary
