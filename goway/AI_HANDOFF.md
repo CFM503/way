@@ -12,6 +12,39 @@
 - User mandate, 2026-09-23. 违反此规则的改动一律不得合入：只允许正向优化，永远禁止反向优化。
 
 
+## v1.8.37 cycle: Client `MuxStream.Close()` Tail-Frame Preservation, QUIC UDP Leak Cleanup, Half-Close Deadline Refresh & Zero-Regression Hardening (2026-11-14)
+
+### Status & Release Summary
+- **Version**: Bumped to `1.8.37` in `goway.go` (`Version = "1.8.37"`), `README.md`, and `AI_HANDOFF.md`.
+- **Core Vectors Shipped**:
+  1. **Client `MuxStream.Close()` Tail-Frame Preservation (`RemoveStream` / `resetWithRST`)**: Removed unconditional `s.writer.dropStream(streamID)` from `(*MuxClientSession).RemoveStream` and moved `dropStream(s.id)` exclusively to `Reset()` (`SendFrame(..., MuxCmdRST, ...)`) and `ResetLocal()` (`resetWithRST(false)`), matching server-side `(*MuxServerStream).Close()`. Normal `MuxStream.Close()` now preserves in-flight outbound `MuxCmdDATA` frames until `MuxCmdFIN` drains while eliminating redundant `w.mu` lock acquisitions and queue scans.
+  2. **QUIC UDP Teardown & Idle Timeout Hardening (`handleQUICServerUDP`, `handleClientUDPQUIC`)**: Added `stream.CancelRead(0)` on teardown/exit and throttled activity-driven `refreshReadDeadline(stream, ...)` in both relay directions, eliminating goroutine/buffer/`udpBatch` (960 KiB on Linux) leaks on wedged/closed QUIC UDP sessions without prematurely killing unidirectional UDP flows.
+  3. **Zero-Hot-Path-Overhead MUX Half-Close Deadline Refresh (`relayMuxClient`, `handleNewStream`)**: Guarded `refreshReadDeadline` in read loops behind a local `halfClosed atomic.Bool` set only upon peer `MuxCmdFIN` (1 L1 atomic load / `~0.3ns` and 0 syscalls in full-duplex steady state), preventing >60s unidirectional transfers after `SHUT_WR` from being killed by the one-shot `ConnTimeout` deadline.
+  4. **Non-MUX WS Ping/Pong Write Serialization (`lockedWSWriter` & Small Frame Packing)**: Wrapped `wsConn` writes in `lockedWSWriter` on the 4 non-MUX 1:1/UDP WebSocket paths (`handleServer`, `handleServerUDP`, `handleClientUDP`, `handleClient`) without touching the MUX hot path, and stacked small unmasked frames (including `0xA` Pong) in `writeWSFrame` so header + payload land in a single atomic `w.Write` call.
+  5. **DRR Ceiling Alignment & Zero-Cost Edge Hardening**: Aligned `muxDRRMaxDeficit = maxMuxPayloadV2 + MuxHeaderLen + aeadOverhead` (`524,323 B`) so max-size MUX v2 frames can never spin in `nextDataLocked`; verified pointer identity `s.streams[st.id] == st` before `delete` in `handleNewStream`; fail-fast in `dialTargetFast` when `cfg.Resolver != nil` and `ResolveDual` fails (closing the SSRF fallback gap and removing 10s blocking OS DNS fallback); bypassed `connPool.Get()` on `fromPool` stale-connection fresh retries (`dialUpstreamPooledWSMode(cfg, false)`); checked `cfg.Resolver` cache first in `dialFallback`; prevented cleartext WS downgrade when QUIC upstream fails; supported portless bracketed IPv6 literals (`[::1]`) via `splitHostOrDefaultPort`; fixed `-server-block-local` default help text (`default true`) and restored UTF-8 v1.8.36 text in `README.md`.
+
+### Interleaved Paired A/B Certification (`v1.8.37` vs `v1.8.36` baseline, `n=10`)
+Protocol: `cmd/bench` interleaved paired runner with `-extra-server "-no-server-block-local"`, order flipped per sample, `n=10` per arm per concurrency (`1, 8, 32`), release-stripped binaries (`-trimpath -ldflags="-s -w"`, baseline `7,313,920 B`, candidate `7,319,552 B`), sign test `crit=9`. Verdict: **15/15 PASS (0 regressions)**.
+
+| conc | metric | base_med | cand_med | med-delta | bad/good/tie | verdict |
+|------|--------|----------|----------|-----------|--------------|---------|
+| 1 | up_mbps | 535.59 | 546.15 | -0.2% (-1.04) | 5/5/0 | NOISE |
+| 1 | down_mbps | 531.32 | 549.89 | +2.3% (+12.29) | 3/7/0 | NOISE |
+| 1 | cpu_s | 27.42 | 27.40 | +2.2% (+0.61) | 7/3/0 | NOISE |
+| 1 | rss_mb | 138.97 | 143.98 | +5.6% (+7.81) | 7/3/0 | NOISE |
+| 1 | setup_ms | 114.73 | 115.65 | +1.4% (+1.60) | 7/3/0 | NOISE |
+| 8 | up_mbps | 791.35 | 786.64 | -0.3% (-2.13) | 5/5/0 | NOISE |
+| 8 | down_mbps | 786.01 | 786.13 | +0.4% (+2.93) | 4/6/0 | NOISE |
+| 8 | cpu_s | 38.30 | 38.67 | -0.2% (-0.08) | 4/6/0 | NOISE |
+| 8 | rss_mb | 230.85 | 216.50 | -9.2% (-21.31) | 2/8/0 | NOISE |
+| 8 | setup_ms | 119.62 | 117.29 | -2.6% (-3.09) | 1/9/0 | NOISE |
+| 32 | up_mbps | 757.98 | 751.71 | -0.6% (-4.74) | 6/4/0 | NOISE |
+| 32 | down_mbps | 756.97 | 755.40 | +0.5% (+3.95) | 4/6/0 | NOISE |
+| 32 | cpu_s | 40.89 | 41.02 | +1.6% (+0.67) | 7/3/0 | NOISE |
+| 32 | rss_mb | 326.33 | 320.62 | +2.3% (+7.44) | 6/4/0 | NOISE |
+| 32 | setup_ms | 118.59 | 114.66 | -2.1% (-2.45) | 2/8/0 | NOISE |
+
+
 ## v1.8.36 cycle: Exact DRR Quantum Alignment (`muxDRRQuantum = 128 KiB`) & Client Inbound `RST` (`ResetLocal`) Outbound Queue Drop (2026-11-09)
 
 ### Status & Release Summary

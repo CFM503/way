@@ -6,12 +6,24 @@ All notable changes to the **Way Proxy** project (Goway & Pyway) are documented 
 
 ---
 
+## [v1.8.37] - 2026-11-14
+
+### 客户端 `MuxStream.Close()` 尾帧保护、QUIC UDP 泄漏清理、MUX 半关闭超时修复及零开销安全/稳定性加固
+
+- **客户端 `MuxStream.Close()` 保留在途尾帧 (`dropStream` 移至 `RST/ResetLocal`)**: 从 `(*MuxClientSession).RemoveStream` 移除无条件 `s.writer.dropStream(streamID)`，仅在 `SendFrame(..., MuxCmdRST, ...)` 与 `(*MuxStream).resetWithRST(false)`（`ResetLocal`）时清理出站队列（与服务端 `(*MuxServerStream).Close()` 对称），根除正常关闭丢尾包截断并减少短连接 `w.mu` 锁与扫描开销。
+- **QUIC UDP 会话 `CancelRead(0)` 与活动感知读超时 (`refreshReadDeadline`)**: 在 `handleQUICServerUDP` 与 `handleClientUDPQUIC` 退出路径补齐 `stream.CancelRead(0)`，并在读写双方向节流续期 `stream` 的 `ConnTimeout` 读截止时间，彻底回收异常/闲置会话的协程、`BufPool` 与 Linux 960 KiB `udpBatch` 内存，同时不误杀单向 UDP 流。
+- **MUX 半关闭后持续单向大流防误杀 (`halfClosed atomic.Bool`)**: 在 `relayMuxClient` 与 `handleNewStream` 读取循环用局部 `halfClosed atomic.Bool` 门控 `refreshReadDeadline`（全双工稳态仅 ~0.3ns 原子读、0 系统调用），避免 >60s 单向传输被 `ConnTimeout` 误杀。
+- **非 MUX WS Ping/Pong 并发写保护与小控帧单次原子写 (`lockedWSWriter` / `writeWSFrame`)**: 仅在 4 处非 MUX 1:1/UDP WS 路径（`handleServer`、`handleServerUDP`、`handleClientUDP`、`handleClient`）用 `lockedWSWriter` 序列化控制帧与数据帧写入，并在 `writeWSFrame` 中将小尺寸非掩码帧（含 `0xA` Pong）栈打包单次 `Write`，MUX 主路径零影响。
+- **零开销边界与安全加固 (`muxDRRMaxDeficit` / `dialTargetFast` / `dialFallback` / QUIC / IPv6 / 文档)**: 将 `muxDRRMaxDeficit` 常量对齐为 `524,323 B` 防满帧 DRR 死循环；`handleNewStream` 清理校验指针相等；`dialTargetFast` 在 `Resolver` 失败时直接快退防 SSRF 与 10s 无效阻塞；`fromPool` 重试改走 `dialUpstreamPooledWSMode(cfg, false)` 直拨；`dialFallback` 优先查询 `Resolver` 缓存；`handleClient` 在 QUIC 失败后不再降级明文 WS；支持无端口 `[::1]` HTTP 代理 Host；修正 `-server-block-local` 默认帮助文本与 `cmd/bench` `n=10` `15/15` 全指标零回退认证。
+
+---
+
 ## [v1.8.36] - 2026-11-09
 
-### DRR ?????????? (`muxDRRQuantum = 128 KiB`) ?????? `RST` (`ResetLocal`) ????????? RushWay `v0.0.83`?
+### DRR 精确量化对齐 (`muxDRRQuantum = 128 KiB`) 与客户端 `ResetLocal` 出站清队（对齐 RushWay `v0.0.83`）
 
-- **DRR ?????????? `128 KiB` (`muxDRRQuantum = 128 * 1024`)**: ??? `-obfs` ?????`maxMuxV2Chunk (129,600 B) + 7 B (MUX ?) + 28 B (AEAD ??) = 129,635 B <= 131,072 B (128 KiB)`?? `muxDRRQuantum` ? `144 KiB` ????? `128 KiB`?? RushWay `v0.0.83` `DRR_QUANTUM = 128 KiB` ???????? DRR ?? 1 ???????? `1,437~1,465 B`?`1.1%`????????? 7 ??? 2 ????????????
-- **??? `ResetLocal`?????? `MuxCmdRST`????????? (`writer.dropStream`)**: ? `(*MuxStream).resetWithRST` ??? `sendRST == false`????? `readLoop` ????? `MuxCmdRST` ?? `ResetLocal`?????? `s.session.writer.dropStream(s.id)`????? `muxOutboundWriter` ???????? `DATA` ???? `BufPool` ??????????/?? `RST` ?? 100% ?????? RushWay `v0.0.83` ????
+- **DRR 精确量化对齐 `128 KiB` (`muxDRRQuantum = 128 * 1024`)**: 在移除 `-obfs` 随机填充后，`maxMuxV2Chunk (129,600 B) + 7 B (MUX 头) + 28 B (AEAD 认证) = 129,635 B <= 131,072 B (128 KiB)`，将 `muxDRRQuantum` 从 `144 KiB` 精确恢复为 `128 KiB`（与 RushWay `v0.0.83` `DRR_QUANTUM = 128 KiB` 完全一致），每轮 DRR 发送 1 个巨型帧后仅残余 `1,437~1,465 B`（`1.1%`），消除此前每 7 轮多发 2 帧造成的突发排队。
+- **客户端 `ResetLocal`（收到对端 `MuxCmdRST`）出站待发队列清理 (`writer.dropStream`)**: 在 `(*MuxStream).resetWithRST` 处于 `sendRST == false`（即客户端 `readLoop` 收到服务端 `MuxCmdRST` 调用 `ResetLocal`）分支中追加 `s.session.writer.dropStream(s.id)`，立即释放 `muxOutboundWriter` 中积压的废弃 `DATA` 帧及 `BufPool` 缓冲，实现客户端/服务端/双向 `RST` 清理 100% 对称（与 RushWay `v0.0.83` 一致）。
 
 ---
 

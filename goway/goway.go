@@ -59,7 +59,7 @@ import (
 // ============================================================================
 // GOWAY 版本号定义 (发布新版本时在此修改)
 // ============================================================================
-const Version = "1.8.36"
+const Version = "1.8.37"
 
 const (
 	// MaxWSFrameSize matches the largest frame the sender side can build
@@ -1076,24 +1076,27 @@ func resolveTargetAddr(resolver *RemoteResolver, target string) string {
 }
 
 // resolveTargetAddrDual returns primary and optional backup host:port pairs.
-func resolveTargetAddrDual(resolver *RemoteResolver, target string) (string, string) {
+func resolveTargetAddrDual(resolver *RemoteResolver, target string) (string, string, error) {
 	if resolver == nil {
-		return target, ""
+		return target, "", nil
 	}
 	host, port, splitErr := net.SplitHostPort(target)
 	if splitErr != nil {
-		return target, ""
+		return target, "", splitErr
 	}
 	primaryIP, backupIP, err := resolver.ResolveDual(host)
-	if err != nil || primaryIP == "" {
-		return target, ""
+	if err != nil {
+		return target, "", err
+	}
+	if primaryIP == "" {
+		return target, "", errors.New("DNS resolution returned empty address")
 	}
 	primaryAddr := net.JoinHostPort(primaryIP, port)
 	var backupAddr string
 	if backupIP != "" {
 		backupAddr = net.JoinHostPort(backupIP, port)
 	}
-	return primaryAddr, backupAddr
+	return primaryAddr, backupAddr, nil
 }
 
 // dialTargetFast dials a target with bounded connect timeout and fast secondary IP fallback.
@@ -1106,7 +1109,10 @@ func dialTargetFast(cfg *Config, targetStr string) (net.Conn, string, error) {
 			totalTimeout = time.Duration(cfg.ConnTimeout) * time.Second
 		}
 	}
-	primaryAddr, backupAddr := resolveTargetAddrDual(resolver, targetStr)
+	primaryAddr, backupAddr, resolveErr := resolveTargetAddrDual(resolver, targetStr)
+	if resolveErr != nil {
+		return nil, primaryAddr, resolveErr
+	}
 	if serverTargetBlocked(cfg, primaryAddr) || (backupAddr != "" && serverTargetBlocked(cfg, backupAddr)) {
 		return nil, primaryAddr, errors.New("blocked local target")
 	}
@@ -1767,9 +1773,33 @@ func writeMuxFrameUnmasked(w io.Writer, buf []byte, payloadOffset int, payloadLe
 	return err
 }
 
+// lockedWSWriter serializes Ping/Pong replies from the read goroutine against
+// data frame writes from the write goroutine on non-MUX 1:1 and UDP WS relays.
+type lockedWSWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (lw *lockedWSWriter) Write(p []byte) (int, error) {
+	lw.mu.Lock()
+	n, err := lw.w.Write(p)
+	lw.mu.Unlock()
+	return n, err
+}
+
 func writeWSFrame(w io.Writer, data []byte, opcode byte, masked bool) error {
 	if !masked {
 		header := getWSHeader(len(data), opcode, false)
+		// Pack small unmasked frames (handshakes, OK responses, and all <=125B
+		// control/Pong frames) on the stack so the frame lands in a single
+		// atomic w.Write call without splitting header and payload.
+		if total := len(header) + len(data); total <= smallFrameSize+14 {
+			var stackBuf [smallFrameSize + 14]byte
+			copy(stackBuf[:len(header)], header)
+			copy(stackBuf[len(header):total], data)
+			_, err := w.Write(stackBuf[:total])
+			return err
+		}
 		bufs := net.Buffers{header, data}
 		_, err := bufs.WriteTo(w)
 		return err
@@ -2099,37 +2129,56 @@ func performWSHandshakeWithProfile(wsConn net.Conn, br *bufio.Reader, cfg *Confi
 	return nil
 }
 
+func dialFallbackIP(dialer *net.Dialer, ip net.IP, wsHost, wsPort, sniHostname string, cfg *Config) net.Conn {
+	if ip == nil || ip.To4() == nil {
+		return nil
+	}
+	fallbackAddr := net.JoinHostPort(ip.String(), wsPort)
+	if fallbackAddr == net.JoinHostPort(wsHost, wsPort) {
+		return nil
+	}
+	logInfo("[DNS] Trying fallback Cloudflare edge: %s (fakehost: %s)", fallbackAddr, sniHostname)
+	var conn net.Conn
+	var err error
+	if cfg != nil && cfg.UpstreamIsWSS {
+		conf := getProfileTLSConfigForHost(pickBrowserProfileIndex(), sniHostname)
+		conn, err = tls.DialWithDialer(dialer, "tcp", fallbackAddr, conf)
+	} else {
+		conn, err = dialer.Dial("tcp", fallbackAddr)
+	}
+	if err != nil {
+		logDebug("[DNS] Fallback dial %s failed: %v", fallbackAddr, err)
+		return nil
+	}
+	return conn
+}
+
 // dialFallback attempts to resolve the fakehost domain to get alternative
 // Cloudflare edge IPs when the primary upstream IP is unreachable.
 func dialFallback(dialer *net.Dialer, wsHost, wsPort, sniHostname string, cfg *Config) net.Conn {
 	if net.ParseIP(wsHost) == nil {
 		return nil
 	}
+	if cfg != nil && cfg.Resolver != nil {
+		if primaryIP, backupIP, err := cfg.Resolver.ResolveDual(sniHostname); err == nil {
+			if conn := dialFallbackIP(dialer, net.ParseIP(primaryIP), wsHost, wsPort, sniHostname, cfg); conn != nil {
+				return conn
+			}
+			if backupIP != "" && backupIP != primaryIP {
+				if conn := dialFallbackIP(dialer, net.ParseIP(backupIP), wsHost, wsPort, sniHostname, cfg); conn != nil {
+					return conn
+				}
+			}
+		}
+	}
 	ips, err := net.LookupIP(sniHostname)
 	if err != nil || len(ips) == 0 {
 		return nil
 	}
 	for _, ip := range ips {
-		if ip4 := ip.To4(); ip4 == nil {
-			continue
+		if conn := dialFallbackIP(dialer, ip, wsHost, wsPort, sniHostname, cfg); conn != nil {
+			return conn
 		}
-		fallbackAddr := net.JoinHostPort(ip.String(), wsPort)
-		if fallbackAddr == net.JoinHostPort(wsHost, wsPort) {
-			continue
-		}
-		logInfo("[DNS] Trying fallback Cloudflare edge: %s (fakehost: %s)", fallbackAddr, sniHostname)
-		var conn net.Conn
-		if cfg.UpstreamIsWSS {
-			conf := getProfileTLSConfigForHost(pickBrowserProfileIndex(), sniHostname)
-			conn, err = tls.DialWithDialer(dialer, "tcp", fallbackAddr, conf)
-		} else {
-			conn, err = dialer.Dial("tcp", fallbackAddr)
-		}
-		if err != nil {
-			logDebug("[DNS] Fallback dial %s failed: %v", fallbackAddr, err)
-			continue
-		}
-		return conn
 	}
 	return nil
 }
@@ -2674,7 +2723,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  -quic-conns int\n")
 		fmt.Fprintf(os.Stderr, "        Number of parallel QUIC connections (default 1, max 16)\n")
 		fmt.Fprintf(os.Stderr, "  -server-block-local\n")
-		fmt.Fprintf(os.Stderr, "        Server mode: reject target hosts on local/LAN addresses (default false)\n")
+		fmt.Fprintf(os.Stderr, "        Server mode: reject target hosts on local/LAN addresses (default true)\n")
 		fmt.Fprintf(os.Stderr, "  -cipher string\n")
 		fmt.Fprintf(os.Stderr, "        Application-layer cipher mode: \"aead\" = AES-256-GCM per frame\n")
 		fmt.Fprintf(os.Stderr, "        (BOTH ends must match; default \"\" = legacy XOR stream)\n")
@@ -3915,6 +3964,8 @@ func (s *MuxStream) resetWithRST(sendRST bool) {
 		s.sendGate.Close()
 		if sendRST {
 			s.session.SendFrame(s.id, MuxCmdRST, nil)
+		} else if ms, ok := s.session.(*MuxClientSession); ok && ms.writer != nil {
+			ms.writer.dropStream(s.id)
 		}
 		s.session.RemoveStream(s.id)
 		s.cleanup()
@@ -4011,7 +4062,9 @@ const (
 	// dispatching 1 full Jumbo frame per round with minimal (1.1%) residual deficit.
 	muxDRRQuantum = 128 * 1024
 	// Cap accumulated credit so a long-idle stream cannot hog the link.
-	muxDRRMaxDeficit = 512 * 1024
+	// Must be >= maxMuxPayloadV2 + MuxHeaderLen + aeadOverhead (524,323 B)
+	// so a max-size MUX v2 frame can always be dispatched by nextDataLocked.
+	muxDRRMaxDeficit = maxMuxPayloadV2 + MuxHeaderLen + aeadOverhead
 	// Phase 4 writev: coalesce scheduled frames per egress syscall.
 	// Adaptive cap by handshake classification: loopback/low-RTT links
 	// regress -3~12% c32 throughput with multi-frame batches (writev burst
@@ -4679,9 +4732,6 @@ func (s *MuxClientSession) RemoveStream(streamID uint32) {
 	s.streamsMu.Lock()
 	delete(s.streams, streamID)
 	s.streamsMu.Unlock()
-	if s.writer != nil {
-		s.writer.dropStream(streamID)
-	}
 }
 
 func (s *MuxClientSession) SendFrame(streamID uint32, cmd byte, payload []byte) error {
@@ -5245,11 +5295,14 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 
 	logDebug("[CLIENT-MUX] Stream %d -> %s (0-RTT)", streamID, targetAddr)
 
+	var halfClosed atomic.Bool
 	errCh := make(chan error, 2)
 
 	go func() {
 		const payloadStart = 14 + MuxHeaderLen
 		var localUp int64
+		var lastReadSet time.Time
+		readTimeout := time.Duration(cfg.ConnTimeout) * time.Second
 		defer func() {
 			if localUp > 0 {
 				stats.AddBytes(localUp, 0)
@@ -5259,6 +5312,9 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 			bPtr := cfg.BufPool.Get().(*[]byte)
 			buf := *bPtr
 			limit := session.maxDataChunkLen(len(buf))
+			if halfClosed.Load() {
+				refreshReadDeadline(localConn, readTimeout, &lastReadSet)
+			}
 			nr, errRead := localConn.Read(buf[payloadStart : payloadStart+limit])
 			if nr > 0 {
 				if !stream.sendGate.Acquire(nr, stream.closed) {
@@ -5315,6 +5371,7 @@ func relayMuxClient(localConn net.Conn, ver byte, initialPayload []byte, targetA
 					}
 					if cfg.ConnTimeout > 0 {
 						_ = localConn.SetReadDeadline(time.Now().Add(time.Duration(cfg.ConnTimeout) * time.Second))
+						halfClosed.Store(true)
 					}
 					errCh <- nil
 				} else {
@@ -6077,7 +6134,9 @@ func (s *MuxServerSession) handleNewStream(st *MuxServerStream, targetStr string
 		}
 		st.Close()
 		s.streamsMu.Lock()
-		delete(s.streams, st.id)
+		if s.streams[st.id] == st {
+			delete(s.streams, st.id)
+		}
 		s.streamsMu.Unlock()
 		if s.cfg != nil && s.cfg.MaxConns > 0 {
 			releaseConn()
@@ -6116,6 +6175,7 @@ func (s *MuxServerSession) handleNewStream(st *MuxServerStream, targetStr string
 
 	logDebug("[SERVER-MUX] Stream %d -> %s", st.id, targetStr)
 
+	var halfClosed atomic.Bool
 	go func() {
 		var lastWriteSet time.Time
 		writeTimeout := time.Duration(s.cfg.ConnTimeout) * time.Second
@@ -6136,6 +6196,7 @@ func (s *MuxServerSession) handleNewStream(st *MuxServerStream, targetStr string
 					}
 					if s.cfg.ConnTimeout > 0 {
 						_ = targetConn.SetReadDeadline(time.Now().Add(time.Duration(s.cfg.ConnTimeout) * time.Second))
+						halfClosed.Store(true)
 					}
 					return
 				}
@@ -6163,6 +6224,8 @@ func (s *MuxServerSession) handleNewStream(st *MuxServerStream, targetStr string
 
 	const payloadStart = 14 + MuxHeaderLen
 	var localDown int64
+	var lastReadSet time.Time
+	readTimeout := time.Duration(s.cfg.ConnTimeout) * time.Second
 	defer func() {
 		if localDown > 0 {
 			stats.AddBytes(0, localDown)
@@ -6172,6 +6235,9 @@ func (s *MuxServerSession) handleNewStream(st *MuxServerStream, targetStr string
 		bPtr := s.cfg.BufPool.Get().(*[]byte)
 		buf := *bPtr
 		limit := s.maxDataChunkLen(len(buf))
+		if halfClosed.Load() {
+			refreshReadDeadline(targetConn, readTimeout, &lastReadSet)
+		}
 		nr, errRead := targetConn.Read(buf[payloadStart : payloadStart+limit])
 		if nr > 0 {
 			// W3 server->client send gate: credit granted by the client's
@@ -6388,6 +6454,7 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 	// Egress writes get a deadline too (M6): a client or target that stops
 	// draining must fail the write instead of wedging the relay forever.
 	writeTimeout := time.Duration(cfg.ConnTimeout) * time.Second
+	wsWriter := &lockedWSWriter{w: wsConn}
 
 	// WS -> TCP (server receives masked frames from client, unmasks, writes to target)
 	// No mask generation needed here — server never masks outbound TCP data.
@@ -6408,7 +6475,7 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 					localUp = 0
 				}
 			}
-			data, errRead := readWSFrameInto(br, wsConn, buf[14:], relayCrypto(cfg))
+			data, errRead := readWSFrameInto(br, wsWriter, buf[14:], relayCrypto(cfg))
 			if errRead != nil {
 				if localUp > 0 {
 					stats.AddBytes(localUp, 0)
@@ -6467,7 +6534,7 @@ func handleServer(wsConn net.Conn, cfg *Config) {
 				wireLen = rc.SealRegion(buf[14:], nr)
 			}
 			refreshWriteDeadline(wsConn, writeTimeout, &lastWriteSet)
-			if errWrite := writeWSFramePreallocated(wsConn, buf, 14, wireLen, 0x2, false); errWrite != nil {
+			if errWrite := writeWSFramePreallocated(wsWriter, buf, 14, wireLen, 0x2, false); errWrite != nil {
 				if localDown > 0 {
 					stats.AddBytes(0, localDown)
 				}
@@ -6794,6 +6861,7 @@ func handleServerUDP(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 	logInfo("[SERVER] UDP Tunnel active")
 
 	errCh := make(chan error, 2)
+	wsWriter := &lockedWSWriter{w: wsConn}
 
 	// WS -> UDP (Server receives WS frames containing SOCKS5 UDP packets from client)
 	go func() {
@@ -6815,7 +6883,7 @@ func handleServerUDP(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 					logDebug("[SERVER-UDP] batch flush failed: %v", errF)
 				}
 			}
-			data, errRead := readWSFrameIntoFused(br, wsConn, buf[14:], cfg.Crypto)
+			data, errRead := readWSFrameIntoFused(br, wsWriter, buf[14:], cfg.Crypto)
 			if errRead != nil {
 				err = errRead
 				return
@@ -6949,7 +7017,7 @@ func handleServerUDP(wsConn net.Conn, br *bufio.Reader, wsTCPConn *net.TCPConn, 
 				}
 
 				refreshWriteDeadline(wsConn, writeTimeout, &lastWriteSet)
-				if errWrite := writeWSFramePreallocated(wsConn, rawBuf, 14, wireLen, 0x2, false); errWrite != nil {
+				if errWrite := writeWSFramePreallocated(wsWriter, rawBuf, 14, wireLen, 0x2, false); errWrite != nil {
 					err = errWrite
 					return
 				}
@@ -7046,8 +7114,19 @@ func serverTargetBlocked(cfg *Config, target string) bool {
 	return isLocalTarget(host)
 }
 
+func splitHostOrDefaultPort(hostPort string) (string, string, error) {
+	if strings.Contains(hostPort, ":") && !strings.HasSuffix(hostPort, "]") {
+		return net.SplitHostPort(hostPort)
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(hostPort, "["), "]"), "80", nil
+}
+
 func dialUpstreamPooledWS(cfg *Config) (*PooledConn, *net.TCPConn, error) {
-	if connPool != nil {
+	return dialUpstreamPooledWSMode(cfg, true)
+}
+
+func dialUpstreamPooledWSMode(cfg *Config, allowPool bool) (*PooledConn, *net.TCPConn, error) {
+	if allowPool && connPool != nil {
 		if pooledConn := connPool.Get(); pooledConn != nil {
 			logDebug("[CLIENT] Using pooled connection")
 			pooledConn.fromPool = true
@@ -7189,6 +7268,7 @@ func handleClientUDP(localConn net.Conn, cfg *Config) {
 
 	var clientUDPAddr atomic.Pointer[net.UDPAddr]
 	errCh := make(chan error, 2)
+	wsWriter := &lockedWSWriter{w: wsConn}
 
 	// UDP -> WS (Client sends UDP packets to udpListener, forward as WS frames)
 	go func() {
@@ -7232,7 +7312,7 @@ func handleClientUDP(localConn net.Conn, cfg *Config) {
 					}
 				}
 				refreshWriteDeadline(wsConn, writeTimeout, &lastWriteSet)
-				if errWrite := writeWSFramePreallocatedFast(wsConn, buf, 14, wireLen, 0x2, prng); errWrite != nil {
+				if errWrite := writeWSFramePreallocatedFast(wsWriter, buf, 14, wireLen, 0x2, prng); errWrite != nil {
 					err = errWrite
 					return
 				}
@@ -7264,7 +7344,7 @@ func handleClientUDP(localConn net.Conn, cfg *Config) {
 					logDebug("[CLIENT-UDP] batch flush failed: %v", errF)
 				}
 			}
-			data, errRead := readWSFrameIntoFused(br, wsConn, buf[14:], cfg.Crypto)
+			data, errRead := readWSFrameIntoFused(br, wsWriter, buf[14:], cfg.Crypto)
 			if errRead != nil {
 				err = errRead
 				return
@@ -7537,17 +7617,12 @@ func handleClient(localConn net.Conn, cfg *Config) {
 
 			u, err := url.Parse(urlPart)
 			if err == nil && u.Host != "" {
-				if strings.Contains(u.Host, ":") {
-					h, p, splitErr := net.SplitHostPort(u.Host)
-					if splitErr != nil {
-						return
-					}
-					targetHost = h
-					targetPort = p
-				} else {
-					targetHost = u.Host
-					targetPort = "80"
+				h, p, splitErr := splitHostOrDefaultPort(u.Host)
+				if splitErr != nil {
+					return
 				}
+				targetHost = h
+				targetPort = p
 			} else {
 				// Search Host header at byte level
 				searchData := fullData[firstLineEnd+1:]
@@ -7563,17 +7638,12 @@ func handleClient(localConn net.Conn, cfg *Config) {
 					}
 					if len(line) > 5 && indexFold(line[:5], "host:") == 0 {
 						val := strings.TrimSpace(string(line[5:]))
-						if strings.Contains(val, ":") {
-							h, p, splitErr := net.SplitHostPort(val)
-							if splitErr != nil {
-								return
-							}
-							targetHost = h
-							targetPort = p
-						} else {
-							targetHost = val
-							targetPort = "80"
+						h, p, splitErr := splitHostOrDefaultPort(val)
+						if splitErr != nil {
+							return
 						}
+						targetHost = h
+						targetPort = p
 						break
 					}
 				}
@@ -7593,11 +7663,10 @@ func handleClient(localConn net.Conn, cfg *Config) {
 	targetAddr := net.JoinHostPort(targetHost, targetPort)
 	_ = localConn.SetDeadline(time.Time{})
 
-	// If QUIC upstream is configured, relay via QUIC
+	// If QUIC upstream is configured, relay via QUIC (no downgrade to cleartext WS)
 	if cfg.IsQUICUpstream && cfg.QUICPool != nil {
-		if relayQUICClient(localConn, ver, initialPayload, targetAddr, cfg) {
-			return
-		}
+		relayQUICClient(localConn, ver, initialPayload, targetAddr, cfg)
+		return
 	}
 
 	if cfg.Mux && cfg.MuxPool != nil {
@@ -7622,10 +7691,10 @@ func handleClient(localConn net.Conn, cfg *Config) {
 	var br *bufio.Reader
 	if err := writeWSFrame(pooledConn.wsConn, targetPayload, 0x2, true); err != nil {
 		pooledConn.wsConn.Close()
-		// If pooled connection failed, retry once with a fresh dial
+		// If pooled connection failed, retry once with a fresh direct dial
 		if pooledConn.fromPool {
 			logDebug("[CLIENT] Pooled connection write failed, retrying fresh dial...")
-			freshPooled, freshTCP, dialErr := dialUpstreamPooledWS(cfg)
+			freshPooled, freshTCP, dialErr := dialUpstreamPooledWSMode(cfg, false)
 			if dialErr != nil {
 				logError("Upstream fresh retry fail: %v", dialErr)
 				return
@@ -7647,7 +7716,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 		pooledConn.wsConn.Close()
 		if pooledConn.fromPool {
 			logDebug("[CLIENT] Pooled connection auth/read failed (%v), retrying fresh dial...", err)
-			freshPooled, freshTCP, dialErr := dialUpstreamPooledWS(cfg)
+			freshPooled, freshTCP, dialErr := dialUpstreamPooledWSMode(cfg, false)
 			if dialErr != nil {
 				logError("Upstream fresh retry fail: %v", dialErr)
 				return
@@ -7699,6 +7768,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 	// Egress writes get a deadline too (M6): a server that stops reading
 	// (or a local app that stops draining) must fail, not wedge us.
 	writeTimeout := time.Duration(cfg.ConnTimeout) * time.Second
+	wsWriter := &lockedWSWriter{w: wsConn}
 
 	// Local -> WS (UPLOAD) — client-to-server frames must be masked (RFC 6455)
 	// Use per-goroutine maskPRNG from pool to avoid crypto/rand syscall per frame.
@@ -7742,7 +7812,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 				wireLen = rc.SealRegion(buf[14:], nr)
 			}
 			refreshWriteDeadline(wsConn, writeTimeout, &lastWriteSet)
-			if errWrite := writeWSFramePreallocatedFast(wsConn, buf, 14, wireLen, 0x2, prng); errWrite != nil {
+			if errWrite := writeWSFramePreallocatedFast(wsWriter, buf, 14, wireLen, 0x2, prng); errWrite != nil {
 				if localUp > 0 {
 					stats.AddBytes(localUp, 0)
 				}
@@ -7771,7 +7841,7 @@ func handleClient(localConn net.Conn, cfg *Config) {
 					localDown = 0
 				}
 			}
-			data, errRead := readWSFrameInto(br, wsConn, buf[14:], relayCrypto(cfg))
+			data, errRead := readWSFrameInto(br, wsWriter, buf[14:], relayCrypto(cfg))
 			if errRead != nil {
 				if localDown > 0 {
 					stats.AddBytes(0, localDown)
@@ -8240,6 +8310,7 @@ func handleQUICServerUDP(stream quic.Stream, br *bufio.Reader, cfg *Config) {
 	defer udpConn.Close()
 
 	errCh := make(chan error, 2)
+	readTimeout := time.Duration(cfg.ConnTimeout) * time.Second
 
 	brReleased = true
 	// Stream -> UDP
@@ -8249,6 +8320,7 @@ func handleQUICServerUDP(stream quic.Stream, br *bufio.Reader, cfg *Config) {
 		defer cfg.BufPool.Put(bPtr)
 		buf := *bPtr
 		var lenBuf [2]byte
+		var lastReadSet time.Time
 		wb := newUDPBatchWriter(udpConn, true)
 		var addrCache udpAddrCache
 		defer func() { _ = wb.flushWrites() }()
@@ -8256,6 +8328,7 @@ func handleQUICServerUDP(stream quic.Stream, br *bufio.Reader, cfg *Config) {
 			if br.Buffered() == 0 {
 				_ = wb.flushWrites()
 			}
+			refreshReadDeadline(stream, readTimeout, &lastReadSet)
 			if _, err := io.ReadFull(br, lenBuf[:]); err != nil {
 				errCh <- err
 				return
@@ -8339,6 +8412,7 @@ func handleQUICServerUDP(stream quic.Stream, br *bufio.Reader, cfg *Config) {
 		out := *bPtr
 		batch := newUDPBatch(udpConn)
 		var lastWriteSet time.Time
+		var lastReadSet time.Time
 		writeTimeout := time.Duration(cfg.ConnTimeout) * time.Second
 		var localDown int64
 		defer func() {
@@ -8352,6 +8426,7 @@ func handleQUICServerUDP(stream quic.Stream, br *bufio.Reader, cfg *Config) {
 				errCh <- errRead
 				return
 			}
+			refreshReadDeadline(stream, writeTimeout, &lastReadSet)
 			for i := 0; i < count; i++ {
 				n := batch.msgs[i].N
 				raddr := batch.msgs[i].Addr.(*net.UDPAddr)
@@ -8394,6 +8469,7 @@ func handleQUICServerUDP(stream quic.Stream, br *bufio.Reader, cfg *Config) {
 
 	<-errCh
 	_ = stream.Close()
+	stream.CancelRead(0)
 	_ = udpConn.Close()
 	<-errCh
 }
@@ -8819,7 +8895,10 @@ func handleClientUDPQUIC(localConn net.Conn, boundAddr *net.UDPAddr, udpListener
 		logError("[CLIENT-QUIC-UDP] GetStream failed: %v", err)
 		return
 	}
-	defer stream.Close()
+	defer func() {
+		_ = stream.Close()
+		stream.CancelRead(0)
+	}()
 
 	header := "UDP"
 	if cfg.Key != "" {
@@ -8855,6 +8934,7 @@ func handleClientUDPQUIC(localConn net.Conn, boundAddr *net.UDPAddr, udpListener
 		buf := *bPtr
 		batch := newUDPBatch(udpListener)
 		var lastWriteSet time.Time
+		var lastReadSet time.Time
 		var localUp int64
 		defer func() {
 			if localUp > 0 {
@@ -8867,6 +8947,7 @@ func handleClientUDPQUIC(localConn net.Conn, boundAddr *net.UDPAddr, udpListener
 				errCh <- errRead
 				return
 			}
+			refreshReadDeadline(stream, writeTimeout, &lastReadSet)
 			for i := 0; i < count; i++ {
 				n := batch.msgs[i].N
 				pkt := batch.msgs[i].Buffers[0][:n]
@@ -8898,12 +8979,14 @@ func handleClientUDPQUIC(localConn net.Conn, boundAddr *net.UDPAddr, udpListener
 		defer cfg.BufPool.Put(bPtr)
 		rawBuf := *bPtr
 		var lenBuf [2]byte
+		var lastReadSet time.Time
 		wb := newUDPBatchWriter(udpListener, false)
 		defer func() { _ = wb.flushWrites() }()
 		for {
 			if br.Buffered() == 0 {
 				_ = wb.flushWrites()
 			}
+			refreshReadDeadline(stream, writeTimeout, &lastReadSet)
 			if _, err := io.ReadFull(br, lenBuf[:]); err != nil {
 				errCh <- err
 				return
@@ -8944,7 +9027,8 @@ func handleClientUDPQUIC(localConn net.Conn, boundAddr *net.UDPAddr, udpListener
 	}
 
 	udpListener.Close()
-	stream.Close()
+	_ = stream.Close()
+	stream.CancelRead(0)
 	localConn.Close()
 	<-errCh
 }

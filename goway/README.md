@@ -1,4 +1,4 @@
-# GOWAY v1.8.36
+# GOWAY v1.8.37
 
 GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具，支持 HTTP 和完整 SOCKS5 (TCP + UDP) 协议，具备浏览器指纹伪装、0-RTT 多路复用 (Mux)、QUIC 弱网抗丢包传输、Cloudflare CDN 边缘接入与 PGO 机器码级性能优化。
 
@@ -8,14 +8,28 @@ GOWAY 是一个基于 WebSocket / QUIC 双协议隧道的高性能代理工具�
 
 ## 版本历史
 
-### v1.8.36 (2026-11-09) - DRR ?????????? (`muxDRRQuantum = 128 KiB`) ?????? `RST` ????????? RushWay `v0.0.83`?
+### v1.8.37 (2026-11-14) - 客户端 `MuxStream.Close()` 尾帧保护、QUIC UDP 泄漏清理、MUX 半关闭超时修复及零开销安全/稳定性加固
 
-#### ?????????
+#### 核心优化与协议加固
 
-| ??/??? | ?? | ????? |
+| 优化/修复项 | 说明 | 收益与特性 |
 |---|---|---|
-| **DRR ?????????? (`muxDRRQuantum = 128 KiB`)** | ?? `-obfs` ??`maxMuxV2Chunk (129,600 B) + 7 B (MUX) + 28 B (AEAD) = 129,635 B <= 131,072 B (128 KiB)`?? `muxDRRQuantum` ? `144 KiB` ????? `128 * 1024`?? RushWay `v0.0.83` `DRR_QUANTUM` ????? | **?????? 1 ? 129.6KB ??????????? 1.1%?`1,437~1,465B`??????????? 7 ????? 2 ???????????????** |
-| **??? `ResetLocal` ???????? (`writer.dropStream`)** | ? `(*MuxStream).resetWithRST` ? `!sendRST` ?????????? `MuxCmdRST` ?? `ResetLocal`??? `s.session.writer.dropStream(s.id)` | **? RushWay `v0.0.83` ?????????????? `RST` ????????? `RST`?????? `muxOutboundWriter` ???????? `DATA` ???? `BufPool` ??** |
+| **客户端 `MuxStream.Close()` 保留在途尾帧 (`dropStream` 移至 `RST/ResetLocal`)** | 从 `MuxClientSession.RemoveStream` 移除无条件 `s.writer.dropStream(streamID)`，仅在 `SendFrame(..., MuxCmdRST, ...)` 与 `MuxStream.resetWithRST(!sendRST)`（`ResetLocal`）时清理未发队列，与服务端 `MuxServerStream.Close()` 对称 | **彻底消除正常关闭时在途 `MuxCmdDATA` 尾包被误丢导致的截断，同时减少正常短连接关闭时 `w.mu` 锁争用与队列扫描开销** |
+| **QUIC UDP 退出 `CancelRead(0)` 与活动感知读超时 (`refreshReadDeadline`)** | 在 `handleQUICServerUDP` 与 `handleClientUDPQUIC` 退出路径补齐 `stream.CancelRead(0)`，并在读写双方向通过节流器同步续期 `stream` 的 `ConnTimeout` 读截止时间 | **彻底释放异常/闲置 QUIC UDP 会话挂死协程、`BufPool` 与 Linux 下 960 KiB `udpBatch` 内存；单向 UDP 传输不被误杀** |
+| **MUX 半关闭后持续单向大流防误杀（`atomic.Bool` 零热路径门控）** | 在 `relayMuxClient` 与 `handleNewStream` 中用局部变量 `halfClosed atomic.Bool` 门控读循环中的 `refreshReadDeadline` | **全双工稳态仅 1 次 L1 原子读（`~0.3ns`，0 系统调用），收到对端 `FIN` 后自动按 500ms 节流续期，防止 >60s 长下载/上传被误杀** |
+| **非 MUX WS Ping/Pong 并发写保护与单次原子控帧写** | 仅在非 MUX 1:1 / UDP WS 路径（`handleServer`、`handleServerUDP`、`handleClientUDP`、`handleClient`）用 `lockedWSWriter` 序列化控制帧与数据帧写入，并在 `writeWSFrame` 中将小尺寸非掩码帧（含 Pong）栈打包单次 `Write` | **完全不触碰 MUX 主路径，零运行时通道/协程调度开销，彻底消除非 MUX 路径 Ping/Pong 并发写竞态** |
+| **DRR 上限对齐、DNS 失败快退与池化/HTTP/QUIC 边界修复** | 将 `muxDRRMaxDeficit` 对齐 `maxMuxPayloadV2 + MuxHeaderLen + aeadOverhead`（`524,323 B`）；`handleNewStream` 清理校验指针相等；`dialTargetFast` DNS 失败直接快退防 SSRF 与 10s 无效阻塞；`fromPool` 失效重试改为直拨；`dialFallback` 优先查 `Resolver` 缓存；`QUIC` 失败不降级明文 WS；HTTP 代理兼容 `[::1]` 无端口 Host 与修正 `-server-block-local` 默认值帮助文本 | **全量 69 项单测 100% 通过；`cmd/bench` `n=10` 双盲配对 A/B 验证 `15/15` 指标零回退** |
+
+---
+
+### v1.8.36 (2026-11-09) - DRR 精确量化对齐 (`muxDRRQuantum = 128 KiB`) 与客户端 `ResetLocal` 出站清队（对齐 RushWay `v0.0.83`）
+
+#### 核心优化与协议加固
+
+| 优化/修复项 | 说明 | 收益与特性 |
+|---|---|---|
+| **DRR 精确量化对齐 (`muxDRRQuantum = 128 KiB`)** | 移除 `-obfs` 后，`maxMuxV2Chunk (129,600 B) + 7 B (MUX) + 28 B (AEAD) = 129,635 B <= 131,072 B (128 KiB)`，将 `muxDRRQuantum` 从 `144 KiB` 精确恢复为 `128 * 1024`，与 RushWay `v0.0.83` `DRR_QUANTUM` 完全一致 | **每轮调度每流精准发送 1 个 129.6KB 巨型帧，残余赤字降至 1.1%（`1,437~1,465B`），消除此前每 7 轮多发 2 帧造成的突发排队，改善多流公平性与延迟** |
+| **客户端 `ResetLocal` 出站待发队列清理 (`writer.dropStream`)** | 在 `(*MuxStream).resetWithRST` 的 `!sendRST` 分支（对端下发 `MuxCmdRST` 或流建连失败调用 `ResetLocal`）追加 `s.session.writer.dropStream(s.id)` | **与 RushWay `v0.0.83` 完全同步：不仅本端主动 `RST` 时清队，收到对端 `RST` 时也立即丢弃 `muxOutboundWriter` 中积压的废弃 `DATA` 帧并归还 `BufPool` 缓冲** |
 
 ---
 

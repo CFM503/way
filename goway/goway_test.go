@@ -4000,3 +4000,215 @@ func TestMuxV2VersionAnd32BitWindowExtension(t *testing.T) {
 		t.Fatalf("expected stream sendGate window = %d, got %d", wantBytes, st.sendGate.window.Load())
 	}
 }
+
+type singleWriteCounter struct {
+	mu     sync.Mutex
+	calls  int
+	chunks [][]byte
+}
+
+func (c *singleWriteCounter) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	c.calls++
+	c.chunks = append(c.chunks, append([]byte(nil), p...))
+	c.mu.Unlock()
+	return len(p), nil
+}
+
+type blockingTestWriter struct {
+	net.Conn
+	firstStarted chan struct{}
+	once         sync.Once
+	release      chan struct{}
+	mu           sync.Mutex
+	buf          bytes.Buffer
+}
+
+func (w *blockingTestWriter) Write(p []byte) (int, error) {
+	w.once.Do(func() {
+		close(w.firstStarted)
+		<-w.release
+	})
+	w.mu.Lock()
+	w.buf.Write(p)
+	w.mu.Unlock()
+	return len(p), nil
+}
+
+func (w *blockingTestWriter) Close() error                       { return nil }
+func (w *blockingTestWriter) SetDeadline(t time.Time) error      { return nil }
+func (w *blockingTestWriter) SetReadDeadline(t time.Time) error  { return nil }
+func (w *blockingTestWriter) SetWriteDeadline(t time.Time) error { return nil }
+
+func TestMuxStreamClosePreservesQueuedTailAndResetDrops(t *testing.T) {
+	bw := &blockingTestWriter{
+		firstStarted: make(chan struct{}),
+		release:      make(chan struct{}),
+	}
+
+	cfg := &Config{
+		ConnTimeout: 5,
+		BufPool: &sync.Pool{
+			New: func() interface{} {
+				b := make([]byte, maxMuxV2Chunk+14+MuxHeaderLen)
+				return &b
+			},
+		},
+	}
+	sess := &MuxClientSession{
+		wsConn:  bw,
+		cfg:     cfg,
+		streams: make(map[uint32]*MuxStream),
+		closed:  make(chan struct{}),
+		writer:  newMuxOutboundWriter(bw, nil, nil, false, 5*time.Second),
+	}
+	defer func() {
+		select {
+		case <-bw.release:
+		default:
+			close(bw.release)
+		}
+		sess.writer.close()
+	}()
+
+	// Pin writerLoop on first Write so subsequent enqueues stay in the queues.
+	if !sess.writer.enqueue(muxOutboundFrame{ping: true}) {
+		t.Fatal("failed to enqueue blocker frame")
+	}
+	select {
+	case <-bw.firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for writerLoop to start blocker Write")
+	}
+
+	st1 := newMuxStream(1, sess)
+	sess.streams[1] = st1
+	tail := []byte("important-tail-payload")
+	if err := sess.SendFrame(1, MuxCmdDATA, tail); err != nil {
+		t.Fatalf("SendFrame(1, DATA) failed: %v", err)
+	}
+	if err := st1.Close(); err != nil {
+		t.Fatalf("st1.Close() failed: %v", err)
+	}
+
+	// Stream 1's queued DATA frame must NOT be dropped on clean Close().
+	sess.writer.mu.Lock()
+	q1 := sess.writer.streams[1]
+	hasData1 := q1 != nil && len(q1.frames) > q1.head
+	sess.writer.mu.Unlock()
+	if !hasData1 {
+		t.Fatal("MuxStream.Close() dropped queued tail DATA frame before FIN")
+	}
+
+	// Stream 2: ResetLocal() MUST drop queued DATA frames immediately.
+	st2 := newMuxStream(2, sess)
+	sess.streams[2] = st2
+	if err := sess.SendFrame(2, MuxCmdDATA, tail); err != nil {
+		t.Fatalf("SendFrame(2, DATA) failed: %v", err)
+	}
+	st2.ResetLocal()
+
+	sess.writer.mu.Lock()
+	q2 := sess.writer.streams[2]
+	hasData2 := q2 != nil && len(q2.frames) > q2.head
+	sess.writer.mu.Unlock()
+	if hasData2 {
+		t.Fatal("MuxStream.ResetLocal() failed to purge queued DATA frame")
+	}
+
+	// Release writerLoop and confirm wire bytes contain stream 1's tail payload.
+	close(bw.release)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		bw.mu.Lock()
+		hasTail := bytes.Contains(bw.buf.Bytes(), tail)
+		bw.mu.Unlock()
+		if hasTail {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for stream 1 tail payload to flush after Close()")
+}
+
+func TestMuxDRRMaxDeficitAccommodatesMaxMuxV2Frame(t *testing.T) {
+	if muxDRRMaxDeficit < maxMuxPayloadV2+MuxHeaderLen+aeadOverhead {
+		t.Fatalf("muxDRRMaxDeficit (%d) < max MUX v2 wire frame (%d)", muxDRRMaxDeficit, maxMuxPayloadV2+MuxHeaderLen+aeadOverhead)
+	}
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	w := newMuxOutboundWriter(c1, nil, nil, false, 5*time.Second)
+	defer w.close()
+
+	w.mu.Lock()
+	w.streams[9] = &muxStreamQueue{
+		frames: []muxOutboundFrame{{
+			payloadLen: maxMuxPayloadV2 + MuxHeaderLen + aeadOverhead,
+			streamID:   9,
+			cmd:        MuxCmdDATA,
+		}},
+	}
+	w.rotation = append(w.rotation, 9)
+	w.total = 1
+	f, ok := w.nextDataLocked()
+	w.mu.Unlock()
+	if !ok || f.streamID != 9 {
+		t.Fatalf("nextDataLocked failed to pop max-size MUX v2 frame (ok=%v)", ok)
+	}
+}
+
+func TestLockedWSWriterAndSmallUnmaskedFrame(t *testing.T) {
+	rec := &singleWriteCounter{}
+	lw := &lockedWSWriter{w: rec}
+	pong := []byte("pong-test")
+	if err := writeWSFrame(lw, pong, 0xA, false); err != nil {
+		t.Fatalf("writeWSFrame(pong) failed: %v", err)
+	}
+	if rec.calls != 1 {
+		t.Fatalf("expected 1 atomic Write call for small unmasked frame, got %d", rec.calls)
+	}
+	if len(rec.chunks[0]) != 2+len(pong) || rec.chunks[0][0] != 0x8A {
+		t.Fatalf("unexpected encoded pong frame: %x", rec.chunks[0])
+	}
+}
+
+func TestDialTargetFastFailsOnDNSFailureWithResolver(t *testing.T) {
+	cfg := &Config{
+		ConnTimeout:      2,
+		ServerBlockLocal: true,
+		Resolver:         NewRemoteResolver(""),
+	}
+	conn, _, err := dialTargetFast(cfg, "nonexistent.invalid.goway.test:80")
+	if conn != nil {
+		conn.Close()
+	}
+	if err == nil {
+		t.Fatal("expected dialTargetFast to fail fast when Resolver fails")
+	}
+}
+
+func TestSplitHostOrDefaultPortIPv6Literal(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantHost string
+		wantPort string
+		wantErr  bool
+	}{
+		{"[::1]", "::1", "80", false},
+		{"[::1]:8443", "::1", "8443", false},
+		{"example.com", "example.com", "80", false},
+		{"example.com:443", "example.com", "443", false},
+		{"::1", "", "", true},
+	}
+	for _, tc := range cases {
+		h, p, err := splitHostOrDefaultPort(tc.in)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("splitHostOrDefaultPort(%q) err=%v, wantErr=%v", tc.in, err, tc.wantErr)
+			continue
+		}
+		if !tc.wantErr && (h != tc.wantHost || p != tc.wantPort) {
+			t.Errorf("splitHostOrDefaultPort(%q) = (%q, %q), want (%q, %q)", tc.in, h, p, tc.wantHost, tc.wantPort)
+		}
+	}
+}
